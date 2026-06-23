@@ -1,0 +1,42 @@
+{
+  "name": "dopdb-client",
+  "version": "0.1.0",
+  "description": "WASM-backed API runtime + remote caller for the dopdb framework (TypeScript/JavaScript)",
+  "type": "module",
+  "main": "dist/index.js",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./wasm/dopdb.wasm": "./wasm/dopdb.wasm",
+    "./wasm/wasm_exec.js": "./wasm/wasm_exec.js"
+  },
+  "files": [
+    "dist",
+    "wasm",
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "dopdb",
+    "doptime",
+    "wasm",
+    "api",
+    "mongodb",
+    "typescript",
+    "javascript"
+  ],
+  "author": "doptime",
+  "license": "BSD-2-Clause",
+  "devDependencies": {
+    "@types/node": "^20.11.24",
+    "typescript": "^5.4.0"
+  }
+}

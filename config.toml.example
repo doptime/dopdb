@@ -1,0 +1,21 @@
+# dopdb 配置示例 —— 复制为 config.toml 后按需修改。
+# 密钥与带凭据的连接串绝不写进本文件,只写「持有它的环境变量名」(RL4)。
+
+[http]
+addr           = ":8080"                 # HTTP 监听地址
+jwt_secret_env = "DOPTIME_JWT_SECRET"    # 持有 HS256 密钥 / RS256 PEM 公钥的环境变量名
+auto_auth      = false                   # 仅开发期可设 true(首用即授权);生产必须 false
+cors_origins   = ["https://app.example.com"]
+
+# 至少要有一个 name = "default" 的数据源(框架默认数据源)。
+[[mongo]]
+name    = "default"
+uri_env = "DOPTIME_MONGO_URI"            # 持有连接串的环境变量名(可含账号密码);env 优先
+uri     = "mongodb://localhost:27017"    # 字面回退,仅开发期用;env 未设时才采用
+db      = "appdb"
+
+# 可选:迁移期的第二数据源(WithDB("analytics") 选用)。
+[[mongo]]
+name = "analytics"
+uri  = "mongodb://localhost:27017"
+db   = "analytics"
