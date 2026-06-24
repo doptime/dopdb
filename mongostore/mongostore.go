@@ -115,6 +115,33 @@ func (s *Store) Put(ctx context.Context, coll, id string, doc []byte) error {
 	return err
 }
 
+// PutScoped does an atomic filtered upsert. The filter {_id, ownerField:ownerVal}
+// matches only the caller's own document; on a match it $sets the fields, on no
+// match it upserts a fresh doc owned by the caller. If a document with this _id
+// exists but is owned by someone else, the filter misses and the upsert attempts
+// an insert of a duplicate _id -> E11000, which maps to ErrForbidden. This closes
+// the TOCTOU window the check-then-act guard had.
+func (s *Store) PutScoped(ctx context.Context, coll, id string, doc []byte, ownerField, ownerVal string) error {
+	m := bson.M{}
+	if len(doc) > 0 {
+		if err := bson.Unmarshal(doc, &m); err != nil {
+			return err
+		}
+	}
+	delete(m, "_id") // _id is immutable; the filter supplies it on insert
+	m[ownerField] = ownerVal // force owner (non-forgeable); matches the filter
+	filter := bson.M{"_id": id, ownerField: ownerVal}
+	_, err := s.c(coll).UpdateOne(ctx, filter,
+		bson.M{"$set": m}, options.UpdateOne().SetUpsert(true))
+	if err != nil {
+		if mongo.IsDuplicateKeyError(err) {
+			return dopdb.ErrForbidden // _id exists but owned by someone else
+		}
+		return err
+	}
+	return nil
+}
+
 func (s *Store) PutIfAbsent(ctx context.Context, coll, id string, doc []byte) (bool, error) {
 	m, err := withID(id, doc)
 	if err != nil {

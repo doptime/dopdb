@@ -164,7 +164,8 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 
 	case "HKEYS":
 		if scoped {
-			writeErr(w, http.StatusForbidden, errors.New("HKEYS not allowed on a row-scoped collection"))
+			v, err := acc.HttpKeysScoped(ctx, scope)
+			writeResult(w, v, err)
 			return
 		}
 		v, err := acc.HttpKeys(ctx)
@@ -172,7 +173,8 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 
 	case "HLEN":
 		if scoped {
-			writeErr(w, http.StatusForbidden, errors.New("HLEN not allowed on a row-scoped collection"))
+			n, err := acc.HttpLenScoped(ctx, scope)
+			writeResult(w, map[string]any{"len": n}, err)
 			return
 		}
 		n, err := acc.HttpLen(ctx)

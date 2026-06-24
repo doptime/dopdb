@@ -88,6 +88,15 @@ type Store interface {
 	// PutMany upserts a batch. ids[i] pairs with docs[i].
 	PutMany(ctx context.Context, coll string, ids []string, docs [][]byte) error
 
+	// PutScoped atomically upserts (coll, id) iff the existing document is owned
+	// by ownerVal (its ownerField == ownerVal) OR no document exists. doc is
+	// Codec bytes; the adapter forces _id=id (and ownerField=ownerVal is carried
+	// in doc). If a document with this id exists but is owned by someone else,
+	// it returns ErrForbidden WITHOUT writing. This is the race-free form of the
+	// scoped per-key write guard (it replaces the check-then-act in the HTTP
+	// accessor, which had a TOCTOU window against a concurrent owner change).
+	PutScoped(ctx context.Context, coll, id string, doc []byte, ownerField, ownerVal string) error
+
 	// Get returns the Codec bytes for (coll, id), or ErrNoDoc.
 	Get(ctx context.Context, coll, id string) (doc []byte, err error)
 

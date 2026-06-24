@@ -81,6 +81,28 @@ func (s *Store) PutMany(_ context.Context, coll string, ids []string, docs [][]b
 	return nil
 }
 
+func (s *Store) PutScoped(_ context.Context, coll, id string, doc []byte, ownerField, ownerVal string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c := s.col(coll)
+	if existing, ok := c[id]; ok {
+		var em map[string]any
+		_ = json.Unmarshal(existing, &em)
+		if ov, _ := em[ownerField].(string); ov != ownerVal {
+			return dopdb.ErrForbidden // exists, owned by someone else
+		}
+	}
+	m := map[string]any{}
+	if len(doc) > 0 {
+		_ = json.Unmarshal(doc, &m)
+	}
+	m["_id"] = id
+	m[ownerField] = ownerVal // force owner (non-forgeable), mirrors mongostore
+	b, _ := json.Marshal(m)
+	c[id] = b
+	return nil
+}
+
 func (s *Store) Get(_ context.Context, coll, id string) ([]byte, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

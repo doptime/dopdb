@@ -221,6 +221,21 @@ func (c *Collection[K, V]) HSet(key K, value V) error {
 	return c.store.Put(context.Background(), c.coll, id, doc)
 }
 
+// HSetScoped atomically writes value under key only if the stored document is
+// owned by ownerVal (its ownerField == ownerVal) or absent; a document owned by
+// someone else yields ErrForbidden. This is the race-free scoped write.
+func (c *Collection[K, V]) HSetScoped(key K, value V, ownerField, ownerVal string) error {
+	id, err := c.serializeKey(key)
+	if err != nil {
+		return err
+	}
+	doc, err := c.encode(value)
+	if err != nil {
+		return err
+	}
+	return c.store.PutScoped(context.Background(), c.coll, id, doc, ownerField, ownerVal)
+}
+
 // HSetNX inserts only if the key is absent. Returns true if it was inserted.
 func (c *Collection[K, V]) HSetNX(key K, value V) (bool, error) {
 	id, err := c.serializeKey(key)

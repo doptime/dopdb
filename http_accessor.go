@@ -3,6 +3,7 @@ package dopdb
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"sync"
 )
@@ -38,6 +39,12 @@ type HttpAccessor interface {
 	HttpKeys(ctx context.Context) (any, error)
 	HttpLen(ctx context.Context) (int64, error)
 	HttpIncrBy(ctx context.Context, key, field string, delta float64) error
+
+	// HttpKeysScoped / HttpLenScoped return only the caller's own keys / count
+	// for a row-scoped collection (the safe replacement for the former blanket
+	// 403 on HKEYS/HLEN over scoped collections).
+	HttpKeysScoped(ctx context.Context, scope M) (any, error)
+	HttpLenScoped(ctx context.Context, scope M) (int64, error)
 
 	// HttpFind ANDs scope (if any) with the caller filter, then sanitizes.
 	HttpFind(ctx context.Context, filter M, scope M, opt FindOpt) (any, error)
@@ -161,6 +168,39 @@ func (c *Collection[K, V]) HttpLen(_ context.Context) (int64, error) {
 	return c.HLen()
 }
 
+// keysByScope returns the keys of documents matching the owner predicate, used
+// by the scoped HKEYS/HLEN. scope is server-derived (trusted) but sanitized for
+// uniformity with every other Find path.
+func (c *Collection[K, V]) keysByScope(scope M) ([]K, error) {
+	safe, err := SanitizeFilter(scope)
+	if err != nil {
+		return nil, err
+	}
+	ids, _, err := c.store.Find(context.Background(), c.coll, safe, FindOpt{})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]K, len(ids))
+	for i, id := range ids {
+		if out[i], err = c.deserializeKey(id); err != nil {
+			return nil, fmt.Errorf("dopdb: bad key %q in %s: %w", id, c.coll, err)
+		}
+	}
+	return out, nil
+}
+
+func (c *Collection[K, V]) HttpKeysScoped(_ context.Context, scope M) (any, error) {
+	return c.keysByScope(scope)
+}
+
+func (c *Collection[K, V]) HttpLenScoped(_ context.Context, scope M) (int64, error) {
+	ks, err := c.keysByScope(scope)
+	if err != nil {
+		return 0, err
+	}
+	return int64(len(ks)), nil
+}
+
 func (c *Collection[K, V]) HttpIncrBy(_ context.Context, key, field string, delta float64) error {
 	k, err := c.deserializeKey(key)
 	if err != nil {
@@ -222,27 +262,25 @@ func (c *Collection[K, V]) HttpExistsScoped(_ context.Context, key string, scope
 }
 
 func (c *Collection[K, V]) HttpSetScoped(ctx context.Context, key string, params M, scope M) error {
-	// Does a document with this id exist that the caller does NOT own?
-	all, err := c.Find(M{"_id": key}, FindOpt{Limit: 1})
+	// scope is the server-derived owner predicate {ownerField: ownerVal}, taken
+	// from the verified JWT. Force it onto the document (non-forgeable: it
+	// overwrites anything the client supplied), then write atomically: PutScoped
+	// upserts only the caller's own row and rejects a foreign-owned id with
+	// ErrForbidden — no check-then-act window.
+	var ownerField, ownerVal string
+	for k, v := range scope {
+		ownerField, ownerVal = k, fmt.Sprint(v)
+		params[k] = v
+	}
+	v, err := c.valueFromParams(params)
 	if err != nil {
 		return err
 	}
-	if len(all) > 0 {
-		mine, err := c.Find(mergeScope(M{"_id": key}, scope), FindOpt{Limit: 1})
-		if err != nil {
-			return err
-		}
-		if len(mine) == 0 {
-			return ErrForbidden // exists, owned by someone else
-		}
+	k, err := c.deserializeKey(key)
+	if err != nil {
+		return err
 	}
-	// Force the owner field(s) from the scope so the stored document is always
-	// owned by the caller. This is non-forgeable: scope is derived from the
-	// verified JWT, and these keys overwrite anything the client supplied.
-	for k, v := range scope {
-		params[k] = v
-	}
-	return c.HttpSet(ctx, key, params)
+	return c.HSetScoped(k, v, ownerField, ownerVal)
 }
 
 func (c *Collection[K, V]) HttpDelScoped(ctx context.Context, key string, scope M) error {
