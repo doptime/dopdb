@@ -13,3 +13,5 @@ node_modules/
 # Editors
 *.sw[pa]
 *~
+*.zip
+*.tar.gz
