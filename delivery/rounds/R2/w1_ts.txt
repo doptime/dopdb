@@ -1,0 +1,10 @@
+GOOS=js GOARCH=wasm go build -o clients/ts/wasm/dopdb.wasm ./wasm
+copied wasm_exec.js from /usr/local/go/lib/wasm/wasm_exec.js
+wasm -> clients/ts/wasm/dopdb.wasm (keeping committed wasm_exec.js if none found)
+cd clients/ts && npm install --no-audit --no-fund && npm run build
+
+added 3 packages in 1s
+
+> dopdb-client@0.1.0 build
+> tsc -p tsconfig.json
+

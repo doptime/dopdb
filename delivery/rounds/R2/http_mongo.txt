@@ -1,0 +1,18 @@
+=== RUN   TestHTTPMongo
+=== RUN   TestHTTPMongo/1-jwt
+=== RUN   TestHTTPMongo/2-at-binding-forgery
+=== RUN   TestHTTPMongo/3-permission
+=== RUN   TestHTTPMongo/4-data-commands
+=== RUN   TestHTTPMongo/5-api-at-mongo
+=== RUN   TestHTTPMongo/6-codec-mapping
+=== NAME  TestHTTPMongo
+    http_integration_test.go:275: INTEGRATION OK against mongodb://localhost:27017/dopdb_http_it_20260624T032637
+--- PASS: TestHTTPMongo (0.25s)
+    --- PASS: TestHTTPMongo/1-jwt (0.04s)
+    --- PASS: TestHTTPMongo/2-at-binding-forgery (0.01s)
+    --- PASS: TestHTTPMongo/3-permission (0.00s)
+    --- PASS: TestHTTPMongo/4-data-commands (0.01s)
+    --- PASS: TestHTTPMongo/5-api-at-mongo (0.12s)
+    --- PASS: TestHTTPMongo/6-codec-mapping (0.03s)
+PASS
+ok  	github.com/doptime/dopdb/httpserve	2.330s
