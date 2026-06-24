@@ -75,3 +75,11 @@ gofmt -l .                  # 期望空输出
 ## 7 收尾
 
 按协议 §3 写回执;**关键数字**抄:构建是否一次过 / 改了几处签名。「异常发现」必写:① mongostore 需要的修正超出「签名适配」范畴(改到了逻辑);② 接口缺方法;③ 驱动版本与适配器假设差异较大;④ 任何让你想动 Store 接口或测试的诱因。
+
+## 8 调和补注(R1 reconcile · 2026-06-23)
+
+仓库新增了 **`wasm/`** 包(`main.go` 带 `//go:build js && wasm`;`stub.go` 带 `//go:build !(js && wasm)`)。因此:
+
+- `go build ./...` / `go vet ./...` 现在也会覆盖 `./wasm`。在本地(darwin,非 js/wasm)只编 `wasm/stub.go`(空 `main`),**正常通过**,不需任何处理;`main.go` 因构建标签被自动跳过。
+- **wasm 模块本体**(`GOOS=js GOARCH=wasm go build ./wasm`)**不在本包范围**,属 R2 的 W1 轨。本包只管 `go build ./...` 退出 0(含 mongostore 签名适配)。
+- 若 `go build ./...` 因 `./wasm` 报错(理论上不应),记异常一行;不要去改 `wasm/` 下文件(非本包可写范围)。

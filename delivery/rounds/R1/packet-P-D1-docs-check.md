@@ -6,11 +6,11 @@
 
 全景: STATUS.md 甘特 D1,本回合的**并行安全轨**——V0/V1/V3 卡在网络或没 Mongo 时,转来干这条,不空转。
 
-任务一句话: 核对 `docs/` 五篇里写到的命令、路径、包名、测试数与仓库现状一致,只修文档里与现实不符之处。
+任务一句话: 核对 `docs/` 六篇里写到的命令、路径、包名、测试数与仓库现状一致,只修文档里与现实不符之处。
 
 ## 1 背景 · 现在是什么情况
 
-`docs/` 有 `00-overview.md`、`01-data.md`、`02-http.md`、`03-config.md`、`RUNBOOK.md`。它们引用了具体路径(如 `httpserve/context.go`)、命令(如 `go test . ./api ./httpserve ./config ./memstore`)、包名、以及测试数基线(数据 10 / api 7 / httpserve 11 / config 6 = 34)。文档可能与真实仓库有细微漂移(改名、数目变动)。本包只做核对与文档级修正,**不动代码**。
+`docs/` 有 `00-overview.md`、`01-data.md`、`02-http.md`、`03-config.md`、`04-wasm-ts.md`、`RUNBOOK.md`(共**六篇**;`04-wasm-ts.md` 为本轮新增)。它们引用了具体路径(如 `httpserve/context.go`、`wasm/main.go`)、命令(如 `go test . ./api ./httpserve ./config ./memstore`、`make wasm`/`make ts`)、包名、以及测试数基线(数据 10 / api 7 / httpserve 11 / config 6 = 34)。文档可能与真实仓库有细微漂移(改名、数目变动)。本包只做核对与文档级修正,**不动代码、不跑构建/安装**。
 
 ## 2 意图 · 为什么做、什么算好
 
@@ -53,6 +53,17 @@ done | tee delivery/rounds/R1/docs_counts.txt
 
 与文档写的(数据 10 / api 7 / httpserve 11 / config 6)逐一比对。**若实际数字与文档不符**:数字是文档里的客观断言,按实际值改文档(00-overview.md、RUNBOOK.md、project 卡里出现 34 的地方),并在回执记明改了哪几处。
 
+### 单元 3.5 · Makefile 目标核对(docs/04 引用 make wasm / make ts)
+
+`04-wasm-ts.md` 与 README 引用了 `make wasm`、`make ts`。只核对**目标存在**,**不执行**(`make ts` 会 `npm install`,属 R2 验证环境):
+
+```bash
+grep -E '^(wasm|ts|build|test):' Makefile | tee delivery/rounds/R1/docs_make_targets.txt
+# 期望同时出现 wasm: 与 ts:(以及 build:/test:)
+```
+
+缺目标 → 文档引用了不存在的命令:在文档里改正或记异常(若确属文档错则改文档)。**本单元不跑 `make wasm`/`make ts`/`npm`。**
+
 ### 单元 4 · 文档级修正
 
 对单元 1–3 发现的不符,**仅在 `docs/` 内**改正(路径、命令、数字)。不改代码、不改测试、不改 delivery/ 里的契约件(项目卡/简报/包)。改完重跑单元 1 确认无 `MISS`。
@@ -70,7 +81,7 @@ done | tee delivery/rounds/R1/docs_counts.txt
 ## 5 边界 · 不要做什么
 
 可写:`docs/*.md`、`delivery/rounds/R1/`。
-禁改:任何 `*.go`、任何测试、`delivery/project/` 与 `delivery/rounds/R1/packet-*`/`brief.md`(契约件)、L0 冻结件。**文档与代码冲突时,只改文档侧;若疑似代码错,记异常发现,不动代码。** 越界登记 `delivery/rounds/R1/oob.md`。
+禁改:任何 `*.go`、任何测试、`delivery/project/` 与 `delivery/rounds/R1/packet-*`/`brief.md`(契约件)、L0 冻结件。**文档与代码冲突时,只改文档侧;若疑似代码错,记异常发现,不动代码。** 本包**不执行** `npm install` / `make ts` / `make wasm`(那属 R2);只做 grep 与无驱动回归。越界登记 `delivery/rounds/R1/oob.md`。
 
 ## 6 预算与换法
 
