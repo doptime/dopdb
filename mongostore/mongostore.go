@@ -122,7 +122,7 @@ func (s *Store) PutIfAbsent(ctx context.Context, coll, id string, doc []byte) (b
 	}
 	delete(m, "_id") // _id supplied via filter on insert
 	res, err := s.c(coll).UpdateOne(ctx, bson.M{"_id": id},
-		bson.M{"$setOnInsert": m}, options.Update().SetUpsert(true))
+		bson.M{"$setOnInsert": m}, options.UpdateOne().SetUpsert(true))
 	if err != nil {
 		return false, err
 	}
@@ -228,7 +228,7 @@ func (s *Store) Count(ctx context.Context, coll string) (int64, error) {
 
 func (s *Store) Incr(ctx context.Context, coll, id, fieldPath string, delta float64) error {
 	_, err := s.c(coll).UpdateOne(ctx, bson.M{"_id": id},
-		bson.M{"$inc": bson.M{fieldPath: delta}}, options.Update().SetUpsert(true))
+		bson.M{"$inc": bson.M{fieldPath: delta}}, options.UpdateOne().SetUpsert(true))
 	return err
 }
 

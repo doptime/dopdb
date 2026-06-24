@@ -1,0 +1,9 @@
+OK   api/api.go
+OK   httpserve/api_dispatch_test.go
+OK   httpserve/context.go
+OK   httpserve/permission.go
+OK   httpserve/serve_test.go
+OK   httpserve/serve.go
+OK   mongostore/mongostore.go
+OK   wasm/main.go
+OK   wasm/stub.go
