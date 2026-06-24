@@ -128,7 +128,7 @@ func (s *Store) PutScoped(ctx context.Context, coll, id string, doc []byte, owne
 			return err
 		}
 	}
-	delete(m, "_id") // _id is immutable; the filter supplies it on insert
+	delete(m, "_id")         // _id is immutable; the filter supplies it on insert
 	m[ownerField] = ownerVal // force owner (non-forgeable); matches the filter
 	filter := bson.M{"_id": id, ownerField: ownerVal}
 	_, err := s.c(coll).UpdateOne(ctx, filter,

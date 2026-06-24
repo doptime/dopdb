@@ -97,3 +97,120 @@ export function createApi<I = any, O = any>(name: string, options: RequestOption
     return (await parse(res)) as O;
   };
 }
+
+// ----------------------------------------------------------------------------
+// Data-command client — talks to /CMD-<coll> routes (HGET, HSET, FIND, …).
+// ----------------------------------------------------------------------------
+
+/** A client for dopdb data commands on one collection. */
+export class DataClient {
+  readonly coll: string;
+  readonly opt: RequestOptions;
+
+  constructor(coll: string, opt: RequestOptions) {
+    this.coll = coll;
+    this.opt = opt;
+  }
+
+  /** HGET-<coll>?f=<field> */
+  async hget(field: string): Promise<unknown> {
+    const headers = await authHeaders(this.opt);
+    const res = await fetch(buildUrl(this.opt, `/HGET-${encodeURIComponent(this.coll)}?f=${encodeURIComponent(field)}`), {
+      method: "GET",
+      headers,
+    });
+    return parse(res);
+  }
+
+  /** HSET-<coll>?f=<field> body JSON */
+  async hset(field: string, value: unknown): Promise<void> {
+    const headers = await authHeaders(this.opt);
+    headers["Content-Type"] = "application/json";
+    const res = await fetch(buildUrl(this.opt, `/HSET-${encodeURIComponent(this.coll)}?f=${encodeURIComponent(field)}`), {
+      method: "POST",
+      headers,
+      body: JSON.stringify(value),
+    });
+    await parse(res);
+  }
+
+  /** HSETNX-<coll>?f=<field> body JSON */
+  async hsetnx(field: string, value: unknown): Promise<unknown> {
+    const headers = await authHeaders(this.opt);
+    headers["Content-Type"] = "application/json";
+    const res = await fetch(buildUrl(this.opt, `/HSETNX-${encodeURIComponent(this.coll)}?f=${encodeURIComponent(field)}`), {
+      method: "POST",
+      headers,
+      body: JSON.stringify(value),
+    });
+    return parse(res);
+  }
+
+  /** HDEL-<coll>?f=<field> */
+  async hdel(field: string): Promise<void> {
+    const headers = await authHeaders(this.opt);
+    headers["Content-Type"] = "application/json";
+    const res = await fetch(buildUrl(this.opt, `/HDEL-${encodeURIComponent(this.coll)}?f=${encodeURIComponent(field)}`), {
+      method: "POST",
+      headers,
+    });
+    await parse(res);
+  }
+
+  /** HEXISTS-<coll>?f=<field> */
+  async hexists(field: string): Promise<unknown> {
+    const headers = await authHeaders(this.opt);
+    const res = await fetch(buildUrl(this.opt, `/HEXISTS-${encodeURIComponent(this.coll)}?f=${encodeURIComponent(field)}`), {
+      method: "GET",
+      headers,
+    });
+    return parse(res);
+  }
+
+  /** HGETALL-<coll> */
+  async hgetall(): Promise<unknown> {
+    const headers = await authHeaders(this.opt);
+    const res = await fetch(buildUrl(this.opt, `/HGETALL-${encodeURIComponent(this.coll)}`), {
+      method: "GET",
+      headers,
+    });
+    return parse(res);
+  }
+
+  /** HKEYS-<coll> */
+  async hkeys(): Promise<unknown> {
+    const headers = await authHeaders(this.opt);
+    const res = await fetch(buildUrl(this.opt, `/HKEYS-${encodeURIComponent(this.coll)}`), {
+      method: "GET",
+      headers,
+    });
+    return parse(res);
+  }
+
+  /** HLEN-<coll> */
+  async hlen(): Promise<unknown> {
+    const headers = await authHeaders(this.opt);
+    const res = await fetch(buildUrl(this.opt, `/HLEN-${encodeURIComponent(this.coll)}`), {
+      method: "GET",
+      headers,
+    });
+    return parse(res);
+  }
+
+  /** FIND-<coll> body JSON(filter) */
+  async find(filter: unknown): Promise<unknown> {
+    const headers = await authHeaders(this.opt);
+    headers["Content-Type"] = "application/json";
+    const res = await fetch(buildUrl(this.opt, `/FIND-${encodeURIComponent(this.coll)}`), {
+      method: "POST",
+      headers,
+      body: JSON.stringify(filter),
+    });
+    return parse(res);
+  }
+}
+
+/** Create a data-command client for the named collection. */
+export function collection(coll: string, options: RequestOptions = Opt): DataClient {
+  return new DataClient(coll, options);
+}

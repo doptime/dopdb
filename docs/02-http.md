@@ -62,30 +62,29 @@ perms.Grant("HGET", "User")
 perms.Deny("HGETALL", "User")     // 显式 off 压过 AutoAuth
 ```
 
-- AutoAuth=true(仅开发):首次见到的 `(cmd,coll)` 自动授予——白名单随开发自然长成「恰好用到的样子」。
-- API 调用也过白名单(`API::<endpoint>`)。
-- v1 内存实现;集群可用一个 dopdb 的 `_permissions` 集合做后端,只换 `Allowed/Grant` 的实现。
+### 权限持久化
 
+`Permissions` 默认内存驻留。启动时可从 JSON 文件恢复:
+
+```go
+perms, err := httpserve.LoadJSON("perm.json")
+// err 时回退: perms = httpserve.NewPermissions(autoAuth)
+perms.Grant("HGET", "User")
+// 进程退出前保存
+perms.SaveJSON("perm.json")
+```
+
+`LoadJSON` 载入的实例 `AutoAuth` 默认 false(生产安全)。
 ## 安全件三 · owner 行级隔离
 
 Redis 靠 key 命名免费拿到隔离(`userInfo<uid>`);Mongo 没有 key 命名空间,隔离必须是显式谓词。两种模式:
 
-### self 模式(个人数据,不需要 scope)
-集合按 uid 做主键,前端用 `?f=@uid`。`@uid` 来自 JWT,你只能读写自己的 `_id`,天然隔离。
-
-### owned-collection 模式(一对多,需要 scope)
-```go
-dopdb.SetOwnerScope("Order", "owner", "uid")  // 文档字段 owner == JWT claim uid
-```
-声明后:
-- **集合级读**(`HGETALL/HVALS/FIND`):自动注入 `{owner: <uid>}` 谓词,且客户端无法放宽(与其 filter 取 `$and`)。
 - **每键操作**(`HGET/HSET/HDEL/HEXISTS/HINCRBY`)对 scoped 集合:
   - 读 → 经 `Find({_id:key} ∧ scope)`,别人的文档即使知道 id 也读不到(404)。
-  - 写 → **owner 字段由框架从 scope 强制注入**(客户端伪造不了、也漏不掉),且若该 id 已被他人占有则拒(403)。
-  - `HKEYS/HLEN` 对 scoped 集合暂直接 403(安全默认)。
+  - 写 → **原子 scoped upsert**(`Store.PutScoped`):`updateOne({_id, owner:ownerVal}, {$set}, upsert)`;若 id 已被他人占有,过滤器不匹配 → upsert 尝试插入 → dup-key → `ErrForbidden`(403),**无 TOCTOU 窗口**。
+  - `HKEYS/HLEN` → scoped 版本返回**调用者本人**的键集/计数(不泄漏他人)。
 - 被 scope 但请求未带对应 claim ⇒ 401。
 
-> caveat:scoped 写入的防劫持检查目前是 check-then-act(非原子);原子版待 `Store` 加 filtered-upsert。
 
 ## 错误 → HTTP 状态
 

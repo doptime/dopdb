@@ -102,6 +102,25 @@ const greet = createApi<GreetIn, GreetOut>("greet");
 await greet({ name: "Ada" });   // POST {baseUrl}/api/greet,JSON body,Bearer 鉴权
 ```
 
+### 3d. 数据命令客户端(前端调远端 Go 服务的数据命令)
+
+`collection(name)` 返回一个数据命令客户端,直接打 `/CMD-<coll>` 路由,支持 HGET/HSET/HDEL/FIND 等所有数据命令:
+
+```ts
+import { configure, collection } from "dopdb-client";
+configure({ baseUrl: "https://api.example.com", getToken: () => localStorage.token });
+
+const orders = collection("Order");
+await orders.hset("o1", { item: "book" });   // POST /HSET-Order?f=o1
+const val = await orders.hget("o1");           // GET  /HGET-Order?f=o1
+const keys = await orders.hkeys();             // GET  /HKEYS-Order
+const len = await orders.hlen();               // GET  /HLEN-Order
+await orders.hdel("o1");                       // POST /HDEL-Order?f=o1
+const results = await orders.find({ owner: "u1" }); // POST /FIND-Order
+```
+
+所有方法带 Bearer 鉴权,写入方法自动带 `Content-Type: application/json`。
+
 构建:
 
 ```bash

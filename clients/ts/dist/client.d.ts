@@ -28,4 +28,30 @@ export declare function configure(opts: {
  * returned function POSTs its argument as JSON and resolves the JSON response.
  */
 export declare function createApi<I = any, O = any>(name: string, options?: RequestOptions): (data?: I, opt?: RequestOptions) => Promise<O>;
+/** A client for dopdb data commands on one collection. */
+export declare class DataClient {
+    readonly coll: string;
+    readonly opt: RequestOptions;
+    constructor(coll: string, opt: RequestOptions);
+    /** HGET-<coll>?f=<field> */
+    hget(field: string): Promise<unknown>;
+    /** HSET-<coll>?f=<field> body JSON */
+    hset(field: string, value: unknown): Promise<void>;
+    /** HSETNX-<coll>?f=<field> body JSON */
+    hsetnx(field: string, value: unknown): Promise<unknown>;
+    /** HDEL-<coll>?f=<field> */
+    hdel(field: string): Promise<void>;
+    /** HEXISTS-<coll>?f=<field> */
+    hexists(field: string): Promise<unknown>;
+    /** HGETALL-<coll> */
+    hgetall(): Promise<unknown>;
+    /** HKEYS-<coll> */
+    hkeys(): Promise<unknown>;
+    /** HLEN-<coll> */
+    hlen(): Promise<unknown>;
+    /** FIND-<coll> body JSON(filter) */
+    find(filter: unknown): Promise<unknown>;
+}
+/** Create a data-command client for the named collection. */
+export declare function collection(coll: string, options?: RequestOptions): DataClient;
 //# sourceMappingURL=client.d.ts.map

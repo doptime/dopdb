@@ -1,6 +1,8 @@
 package httpserve
 
 import (
+	"encoding/json"
+	"os"
 	"strings"
 	"sync"
 )
@@ -63,4 +65,29 @@ func (p *Permissions) Deny(cmd, coll string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.m[permKey(cmd, coll)] = false
+}
+
+// SaveJSON serialises the current permission map to a JSON file.
+func (p *Permissions) SaveJSON(path string) error {
+	p.mu.RLock()
+	data, err := json.MarshalIndent(p.m, "", "  ")
+	p.mu.RUnlock()
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0644)
+}
+
+// LoadJSON deserialises a JSON file back into a Permissions instance with
+// AutoAuth disabled.
+func LoadJSON(path string) (*Permissions, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var m map[string]bool
+	if err := json.Unmarshal(data, &m); err != nil {
+		return nil, err
+	}
+	return &Permissions{m: m, AutoAuth: false}, nil
 }

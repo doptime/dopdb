@@ -64,10 +64,10 @@ gofmt -l .             # 应空输出(无未格式化文件)
 
 ## 未竟项(按优先级,均非主干)
 
-1. **原子 scoped-write 原语**:给 `Store` 加 filtered-upsert(`updateOne({_id,owner:uid},{$set,$setOnInsert})`),替换 `http_accessor.go` 里 `HttpSetScoped` 的 check-then-act。把行级隔离从「v1 够用」提到「无竞态」。
-2. **scoped 的 `HKEYS/HLEN`**:现在直接 403;要支持需给 `Store` 加带 filter 的 count/distinct。
-3. **msgpack 请求/响应**:v1 仅 JSON。
-4. **`_permissions` 持久化**:权限白名单 v1 是内存;集群版用 dopdb 集合做后端实现同一接口。
+1. ~~**原子 scoped-write 原语**~~ → ✓ 已完成(R3):`Store.PutScoped` filtered-upsert + `Collection.HSetScoped` 原子 scoped 写;跨主→`ErrForbidden`。见 `01-data.md` 方法表。
+2. ~~**scoped 的 `HKEYS/HLEN`**~~ → ✓ 已完成(R3):scoped 集合现返回**调用者本人**的键/计数,不泄漏。
+3. **msgpack-at-rest** → ✗ 已砍(R3):JSON+BSON 两 codec 已足,价值最低。
+4. ~~**`_permissions` 持久化**~~ → ✓ 已完成(R3):`Permissions.SaveJSON/LoadJSON` 文件式落盘/恢复;启动时 `LoadJSON` 载入,`AutoAuth` 默认 false(生产安全)。
 5. **TS 重写**:最终目标——TS 里类型定义一次(Zod schema→infer+运行时校验),去掉 Go→TS 生成。
 
 ## 红线提醒(给执行方)

@@ -19,4 +19,6 @@ export {
   RequestOptions,
   Opt,
   type TokenGetter,
+  DataClient,
+  collection,
 } from "./client.js";
