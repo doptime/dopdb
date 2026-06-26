@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 
@@ -53,13 +54,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 	c, status, err := h.parse(r)
 	if err != nil {
-		writeErr(w, status, err)
+		writeErr(w, status, "validation", err)
 		return
 	}
 
 	if c.Cmd == "API" {
 		if !h.Perms.Allowed("API", c.Coll) {
-			writeErr(w, http.StatusForbidden, errors.New("not permitted: API::"+c.Coll))
+			writeErr(w, http.StatusForbidden, "forbidden", errors.New("not permitted: API::"+c.Coll))
 			return
 		}
 		h.serveAPI(w, r, c)
@@ -67,26 +68,26 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !dataCommands[c.Cmd] {
-		writeErr(w, http.StatusBadRequest, errors.New("unknown command: "+c.Cmd))
+		writeErr(w, http.StatusBadRequest, "validation", errors.New("unknown command: "+c.Cmd))
 		return
 	}
 
 	// Permission gate: command :: collection.
 	if !h.Perms.Allowed(c.Cmd, c.Coll) {
-		writeErr(w, http.StatusForbidden, errors.New("not permitted: "+c.Cmd+"::"+c.Coll))
+		writeErr(w, http.StatusForbidden, "forbidden", errors.New("not permitted: "+c.Cmd+"::"+c.Coll))
 		return
 	}
 
 	acc, ok := dopdb.LookupHttp(c.Coll)
 	if !ok {
-		writeErr(w, http.StatusNotFound, errors.New("collection not registered: "+c.Coll))
+		writeErr(w, http.StatusNotFound, "not_found", errors.New("collection not registered: "+c.Coll))
 		return
 	}
 
 	// Resolve the row-level owner scope (deny if scoped but unauthenticated).
 	scope, authed := dopdb.OwnerScope(c.Coll, c.Claims)
 	if !authed {
-		writeErr(w, http.StatusUnauthorized, errors.New("authentication required for "+c.Coll))
+		writeErr(w, http.StatusUnauthorized, "unauthorized", errors.New("authentication required for "+c.Coll))
 		return
 	}
 	scoped := dopdb.IsOwnerScoped(c.Coll)
@@ -100,7 +101,7 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 	switch c.Cmd {
 	case "HGET":
 		if key == "" {
-			writeErr(w, http.StatusBadRequest, errors.New("HGET requires ?f="))
+			writeErr(w, http.StatusBadRequest, "validation", errors.New("HGET requires ?f="))
 			return
 		}
 		var (
@@ -116,7 +117,7 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 
 	case "HSET":
 		if key == "" {
-			writeErr(w, http.StatusBadRequest, errors.New("HSET requires ?f="))
+			writeErr(w, http.StatusBadRequest, "validation", errors.New("HSET requires ?f="))
 			return
 		}
 		c.mergeBody() // fold body value fields into params (@-context already set)
@@ -130,16 +131,23 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 
 	case "HSETNX":
 		if key == "" {
-			writeErr(w, http.StatusBadRequest, errors.New("HSETNX requires ?f="))
+			writeErr(w, http.StatusBadRequest, "validation", errors.New("HSETNX requires ?f="))
 			return
 		}
 		c.mergeBody()
-		inserted, err := acc.HttpSetNX(ctx, c.DB, key, c.Params)
+		var inserted bool
+		var err error
+		if scoped {
+			// F10: scoped hsetnx checks ownership first — prevents cross-tenant existence leakage
+			inserted, err = acc.HttpSetNXScoped(ctx, c.DB, key, c.Params, scope)
+		} else {
+			inserted, err = acc.HttpSetNX(ctx, c.DB, key, c.Params)
+		}
 		writeResult(w, map[string]any{"inserted": inserted}, err)
 
 	case "HDEL", "DEL":
 		if len(c.Fields) == 0 {
-			writeErr(w, http.StatusBadRequest, errors.New(c.Cmd+" requires ?f="))
+			writeErr(w, http.StatusBadRequest, "validation", errors.New(c.Cmd+" requires ?f="))
 			return
 		}
 		var err error
@@ -157,7 +165,7 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 
 	case "HEXISTS":
 		if key == "" {
-			writeErr(w, http.StatusBadRequest, errors.New("HEXISTS requires ?f="))
+			writeErr(w, http.StatusBadRequest, "validation", errors.New("HEXISTS requires ?f="))
 			return
 		}
 		var (
@@ -195,24 +203,24 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 
 	case "HINCRBY", "HINCRBYFLOAT":
 		if key == "" {
-			writeErr(w, http.StatusBadRequest, errors.New(c.Cmd+" requires ?f="))
+			writeErr(w, http.StatusBadRequest, "validation", errors.New(c.Cmd+" requires ?f="))
 			return
 		}
 		field := c.Queries.Get("field")
 		if field == "" {
-			writeErr(w, http.StatusBadRequest, errors.New(c.Cmd+" requires ?field="))
+			writeErr(w, http.StatusBadRequest, "validation", errors.New(c.Cmd+" requires ?field="))
 			return
 		}
 		delta, perr := strconv.ParseFloat(c.Queries.Get("n"), 64)
 		if perr != nil {
-			writeErr(w, http.StatusBadRequest, errors.New("invalid ?n="))
+			writeErr(w, http.StatusBadRequest, "validation", errors.New("invalid ?n="))
 			return
 		}
 		if scoped {
 			// only increment if the document is owned by the caller
 			ok, err := acc.HttpExistsScoped(ctx, c.DB, key, scope)
 			if err != nil || !ok {
-				writeErr(w, http.StatusForbidden, dopdb.ErrForbidden)
+				writeErr(w, http.StatusForbidden, "forbidden", dopdb.ErrForbidden)
 				return
 			}
 		}
@@ -221,7 +229,7 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 	case "FIND":
 		filter, ferr := c.parseFilter()
 		if ferr != nil {
-			writeErr(w, http.StatusBadRequest, ferr)
+			writeErr(w, http.StatusBadRequest, "validation", ferr)
 			return
 		}
 		opt := dopdb.FindOpt{}
@@ -238,20 +246,33 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 		if s, e := strconv.ParseInt(c.Queries.Get("skip"), 10, 64); e == nil {
 			opt.Skip = s
 		}
+		// F13: parse sort (?s=<json>) and projection (?p=<json>) — mirrors TS.
+		if sv := c.Queries.Get("s"); sv != "" {
+			if err := json.Unmarshal([]byte(sv), &opt.Sort); err != nil {
+				writeErr(w, http.StatusBadRequest, "validation", fmt.Errorf("invalid ?s= JSON: %w", err))
+				return
+			}
+		}
+		if pv := c.Queries.Get("p"); pv != "" {
+			if err := json.Unmarshal([]byte(pv), &opt.Projection); err != nil {
+				writeErr(w, http.StatusBadRequest, "validation", fmt.Errorf("invalid ?p= JSON: %w", err))
+				return
+			}
+		}
 		v, err := acc.HttpFind(ctx, c.DB, filter, scope, opt)
 		writeResult(w, v, err)
 
 	case "HMSET":
 		var items map[string]dopdb.M
 		if err := json.Unmarshal(c.Body, &items); err != nil || len(items) == 0 {
-			writeErr(w, http.StatusBadRequest, errors.New("HMSET requires a JSON object body {id:{...}}"))
+			writeErr(w, http.StatusBadRequest, "validation", errors.New("HMSET requires a JSON object body {id:{...}}"))
 			return
 		}
 		writeOK(w, acc.HttpMSet(ctx, c.DB, items, scope))
 
 	case "HMGET":
 		if len(c.Fields) == 0 {
-			writeErr(w, http.StatusBadRequest, errors.New("HMGET requires ?f="))
+			writeErr(w, http.StatusBadRequest, "validation", errors.New("HMGET requires ?f="))
 			return
 		}
 		v, err := acc.HttpMGet(ctx, c.DB, scope, c.Fields...)
@@ -260,7 +281,7 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 	case "COUNT":
 		filter, ferr := c.parseFilter()
 		if ferr != nil {
-			writeErr(w, http.StatusBadRequest, ferr)
+			writeErr(w, http.StatusBadRequest, "validation", ferr)
 			return
 		}
 		n, err := acc.HttpCount(ctx, c.DB, filter, scope)
@@ -269,7 +290,7 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 	case "FINDONE":
 		filter, ferr := c.parseFilter()
 		if ferr != nil {
-			writeErr(w, http.StatusBadRequest, ferr)
+			writeErr(w, http.StatusBadRequest, "validation", ferr)
 			return
 		}
 		v, err := acc.HttpFindOne(ctx, c.DB, filter, scope)
@@ -278,7 +299,7 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 	case "WATCH":
 		flusher, ok := w.(http.Flusher)
 		if !ok {
-			writeErr(w, http.StatusInternalServerError, errors.New("streaming unsupported"))
+			writeErr(w, http.StatusInternalServerError, "error", errors.New("streaming unsupported"))
 			return
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -327,7 +348,7 @@ func (h *Handler) serveAPI(w http.ResponseWriter, r *http.Request, c *ReqCtx) {
 	c.mergeBody() // fold body args into params; @-context already injected
 	ret, err := api.CallByName(r.Context(), c.Coll, c.Params, c.Body)
 	if errors.Is(err, api.ErrNotFound) {
-		writeErr(w, http.StatusNotFound, err)
+		writeErr(w, http.StatusNotFound, "not_found", err)
 		return
 	}
 	writeResult(w, ret, err)
@@ -354,16 +375,16 @@ func writeOK(w http.ResponseWriter, err error) {
 func statusForError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, dopdb.ErrNoDoc):
-		writeErr(w, http.StatusNotFound, err)
+		writeErr(w, http.StatusNotFound, "not_found", err)
 	case errors.Is(err, dopdb.ErrForbidden):
-		writeErr(w, http.StatusForbidden, err)
+		writeErr(w, http.StatusForbidden, "forbidden", err)
 	default:
-		writeErr(w, http.StatusBadRequest, err)
+		writeErr(w, http.StatusInternalServerError, "error", err)
 	}
 }
 
-func writeErr(w http.ResponseWriter, status int, err error) {
-	writeJSON(w, status, map[string]any{"error": err.Error()})
+func writeErr(w http.ResponseWriter, status int, code string, err error) {
+	writeJSON(w, status, map[string]any{"error": err.Error(), "code": code})
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

@@ -177,6 +177,10 @@ async function exec(m: MongoCollection<Doc>, cmd: string, a: ExecArgs, scope: Fi
       return { ok: true };
     }
     case "hsetnx": {
+      // hsetnx = insert-if-absent. prepareWrite already stamps the owner onto
+      // the value (bind rule), so a scoped insert is owned. A dup on _id (no
+      // matter who owns it) returns inserted=false — uniform, so it never
+      // distinguishes "exists for me" from "exists for another tenant".
       const doc = { ...(a.value as Doc), _id: a.key };
       try {
         await m.insertOne(doc as Doc);

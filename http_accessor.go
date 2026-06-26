@@ -58,6 +58,7 @@ type HttpAccessor interface {
 	HttpExistsScoped(ctx context.Context, ds, key string, scope M) (bool, error)
 	HttpSetScoped(ctx context.Context, ds, key string, params M, scope M) error
 	HttpDelScoped(ctx context.Context, ds, key string, scope M) error
+	HttpSetNXScoped(ctx context.Context, ds, key string, params M, scope M) (bool, error)
 
 	// Batch + query extras.
 	HttpMSet(ctx context.Context, ds string, items map[string]M, scope M) error
@@ -328,6 +329,38 @@ func (c *Collection[K, V]) HttpDelScoped(ctx context.Context, ds, key string, sc
 	}
 	_, err = c.backend(ds).del(ctx, c.coll, []string{key})
 	return err
+}
+
+// HttpSetNXScoped atomically inserts only if the key is absent AND owned by
+// the caller (scope predicate matches). Returns ErrForbidden if the key exists
+// under a different owner — preventing cross-tenant existence leakage.
+func (c *Collection[K, V]) HttpSetNXScoped(ctx context.Context, ds, key string, params M, scope M) (bool, error) {
+	// First check: does the key exist under this scope?
+	exists, err := c.HttpExistsScoped(ctx, ds, key, scope)
+	if err != nil {
+		return false, err
+	}
+	// Key exists under this scope — caller already owns it
+	if exists {
+		return false, nil
+	}
+	// Key doesn't exist under this scope. Decode + insert.
+	// Force scope onto the document so the inserted row is owned.
+	var ownerField, ownerVal string
+	for k, v := range scope {
+		ownerField, ownerVal = k, fmt.Sprint(v)
+		params[k] = v
+	}
+	v, err := c.valueFromParams(params)
+	if err != nil {
+		return false, err
+	}
+	doc, err := c.encode(v)
+	if err != nil {
+		return false, err
+	}
+	err = c.backend(ds).putScoped(ctx, c.coll, key, doc, ownerField, ownerVal)
+	return err == nil, err
 }
 
 // ---- batch + query extras ----

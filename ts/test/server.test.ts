@@ -522,3 +522,29 @@ test("client.save derives the key from _id", async () => {
   assert.equal(got.body._id, "save1");
   assert.equal(got.body.name, "Saved");
 });
+
+// ---- listener property on DopdbServer ----------------------------------------
+
+test("serve returns a DopdbServer with a callable listener", async () => {
+  assert.equal(typeof srv.listener, "function", "listener must be a function");
+});
+
+test("srv.listener can handle a fake HTTP request", async () => {
+  const req = {
+    method: "GET",
+    url: "/api/hget/notes?f=n1",
+    headers: { authorization: `Bearer ${tokA}` },
+    on: () => {},
+  } as any;
+  const res = {
+    statusCode: 0,
+    setHeader: () => {},
+    writeHead: () => {},
+    write: (chunk: string) => (res._body += chunk),
+    end: (chunk?: string) => { if (chunk) res._body += chunk; },
+    _body: "",
+  } as any;
+  srv.listener(req, res);
+  await sleep(50);
+  assert.ok(res._body.length > 0, "listener should produce a response body");
+});

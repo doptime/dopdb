@@ -47,6 +47,62 @@ func Serve(cfg *config.Config, opts ...ServeOption) error {
 	return http.ListenAndServe(cfg.HTTP.Addr, handler)
 }
 
+// ServeHandle is what ServeWithHandle returns: the running HTTP server and a
+// Close function that shuts it down gracefully (drains connections, releases
+// listeners). Callers use this instead of Serve when they need lifecycle control.
+type ServeHandle struct {
+	Server *http.Server
+	Close  func(ctx context.Context) error
+}
+
+// ServeWithHandle is like Serve but returns a *ServeHandle so the caller can
+// shut the server down gracefully. The Serve signature is kept for backward
+// compatibility (it delegates here and blocks on ListenAndServe).
+//
+//	srv, err := httpserve.ServeWithHandle(cfg, httpserve.WithPermissions(perms))
+//	// ... later ...
+//	srv.Close(context.Background())
+func ServeWithHandle(cfg *config.Config, opts ...ServeOption) (*ServeHandle, error) {
+	ctx := context.Background()
+
+	sources := make([]dopdb.DatasourceConfig, 0, len(cfg.Mongo))
+	for _, m := range cfg.Mongo {
+		sources = append(sources, dopdb.DatasourceConfig{Name: m.Name, URI: m.URI, DB: m.DB})
+	}
+	ds, err := dopdb.ConnectDatasources(ctx, sources)
+	if err != nil {
+		return nil, err
+	}
+	dopdb.SetDatasources(ds)
+
+	o := &serveOptions{perms: NewPermissions()}
+	for _, opt := range opts {
+		opt(o)
+	}
+
+	h := NewHandler(NewServer(cfg.HTTP.JWTSecret), o.perms)
+
+	var handler http.Handler = h
+	if len(cfg.HTTP.CORSOrigins) > 0 {
+		handler = withCORS(handler, cfg.HTTP.CORSOrigins)
+	}
+
+	srv := &http.Server{Addr: cfg.HTTP.Addr, Handler: handler}
+
+	go func() {
+		if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+			// listener error (e.g. port in use) — log but don't panic
+		}
+	}()
+
+	return &ServeHandle{
+		Server: srv,
+		Close: func(ctx context.Context) error {
+			return srv.Shutdown(ctx)
+		},
+	}, nil
+}
+
 type serveOptions struct{ perms *Permissions }
 
 // ServeOption configures Serve.

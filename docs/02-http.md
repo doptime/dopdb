@@ -76,6 +76,20 @@ p.SaveJSON("perm.json"); q, _ := httpserve.LoadJSON("perm.json")
 ## JWT
 
 `Authorization: Bearer <token>`。支持 **HS256**(HMAC 密钥)与 **RS256**(PEM/SPKI 公钥验签),拒绝 `none` 与未知算法;校验 `exp`。
+## 错误线协议
+
+所有非 2xx 响应统一格式: `{ "error": "...", "code": "..." }`。状态码 ↔ `code` 固定 5 类:
+
+| 状态码 | code | 语义 |
+|---|---|---|
+| 400 | `validation` | 请求参数/输入不合法;可能额外带 `fields` 逐字段说明 |
+| 401 | `unauthorized` | 未认证或 JWT 无效 |
+| 403 | `forbidden` | 权限不足或行级隔离拒(写他人 → 403) |
+| 404 | `not_found` | 文档不存在或集合未注册 |
+| 409 | `conflict` | 唯一索引冲突或 `hsetnx` 命中已存在 |
+| 500 | `error` | 服务端内部错误兜底 |
+
+Go 与 TS 两端实现一致:客户端按 `code`(优先)→`status` 反构 typed error(供 `instanceof` 分支)。
 
 ## 一行起服务(Go)
 

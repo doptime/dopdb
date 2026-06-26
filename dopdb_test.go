@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -149,5 +150,141 @@ func TestIntegrationFindAndAtomicIncr(t *testing.T) {
 	g, _ := users.HGet("k0")
 	if g.Age != 25 { // 20 + 5
 		t.Errorf("age after HIncrBy=%d want 25", g.Age)
+	}
+}
+
+// ---- watch integration tests (M3) ----
+
+func TestIntegrationWatchInsertUpdate(t *testing.T) {
+	defer withTestDS(t)()
+	users := New[string, itUser](WithCollection("users_it_watch"))
+
+	ds := defaultDatasources
+	if ds == nil {
+		t.Fatal("no datasource")
+	}
+	b, ok := ds.get("")
+	if !ok {
+		t.Fatal("no backend")
+	}
+
+	var mu sync.Mutex
+	var ops []string
+	done := make(chan struct{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		_ = b.watch(ctx, "users_it_watch", nil, func(op, id string, raw []byte) error {
+			mu.Lock()
+			ops = append(ops, op)
+			mu.Unlock()
+			return nil
+		})
+		close(done)
+	}()
+
+	// Give change stream time to establish (1 second is enough for local replica set)
+	time.Sleep(1 * time.Second)
+
+	// Small grace period for change stream cursor
+	time.Sleep(200 * time.Millisecond)
+
+	// Insert a new document
+	_ = users.HSet("k1", itUser{Name: "Alice", Age: 30})
+
+	// Update the document
+	_ = users.HSet("k1", itUser{Name: "Alice", Age: 31})
+
+	// Wait for events
+	time.Sleep(1 * time.Second)
+
+	cancel()
+	<-done
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	t.Logf("watch events: %v", ops)
+	if len(ops) < 2 {
+		t.Fatalf("expected at least 2 events, got %d: %v", len(ops), ops)
+	}
+
+	firstValid := false
+	secondValid := false
+	for _, op := range ops {
+		if !firstValid && (op == "insert" || op == "replace") {
+			firstValid = true
+		} else if firstValid && !secondValid && (op == "update" || op == "replace") {
+			secondValid = true
+			break
+		}
+	}
+	if !firstValid || !secondValid {
+		t.Fatalf("expected insert+update sequence, got: %v", ops)
+	}
+}
+
+func TestIntegrationWatchScopedDelete(t *testing.T) {
+	// I-WA2: scoped delete should NOT deliver events (no fullDocument to scope on)
+	defer withTestDS(t)()
+	users := New[string, itUser](WithCollection("users_it_watch_del"))
+
+	ds := defaultDatasources
+	if ds == nil {
+		t.Fatal("no datasource")
+	}
+	b, ok := ds.get("")
+	if !ok {
+		t.Fatal("no backend")
+	}
+
+	var mu sync.Mutex
+	var ops []string
+	done := make(chan struct{})
+
+	// Scoped watch: only see events matching name=Alice
+	scope := M{"name": "Alice"}
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		_ = b.watch(ctx, "users_it_watch_del", scope, func(op, id string, raw []byte) error {
+			mu.Lock()
+			ops = append(ops, op)
+			mu.Unlock()
+			return nil
+		})
+		close(done)
+	}()
+
+	time.Sleep(1 * time.Second)
+	_ = users.HSet("k1", itUser{Name: "Alice", Age: 30})
+
+	// Delete it
+	_ = users.Del("k1")
+
+	time.Sleep(1 * time.Second)
+
+	cancel()
+	<-done
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	t.Logf("scoped watch events: %v", ops)
+
+	foundInsert := false
+	foundDelete := false
+	for _, op := range ops {
+		if op == "insert" || op == "replace" {
+			foundInsert = true
+		}
+		if op == "delete" {
+			foundDelete = true
+		}
+	}
+	if !foundInsert {
+		t.Fatal("expected to see insert event through scoped watch")
+	}
+	if foundDelete {
+		t.Fatal("scoped watch should NOT deliver delete events (no fullDocument)")
 	}
 }
