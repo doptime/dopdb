@@ -38,7 +38,19 @@ var dataCommands = map[string]bool{
 	"HMSET": true, "HMGET": true, "COUNT": true, "FINDONE": true, "WATCH": true,
 }
 
+// Guardrails (mirrored on the TypeScript side: server.ts MAX_BODY/DEFAULT_LIMIT/
+// MAX_LIMIT). They cap two DoS surfaces — unbounded request bodies and
+// unbounded FIND result sets.
+const (
+	maxBodyBytes = 1 << 20 // 1 MiB request-body ceiling (413 above it)
+	defaultLimit = 100     // FIND with no/invalid limit is capped here
+	maxLimit     = 1000    // an explicit FIND limit is clamped to this
+)
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// F4: cap the request body. Reads beyond the ceiling fail in parse() (which
+	// surfaces 413), instead of being accumulated unbounded.
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 	c, status, err := h.parse(r)
 	if err != nil {
 		writeErr(w, status, err)
@@ -215,6 +227,13 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 		opt := dopdb.FindOpt{}
 		if l, e := strconv.ParseInt(c.Queries.Get("limit"), 10, 64); e == nil {
 			opt.Limit = l
+		}
+		// F3: cap unbounded/oversized result sets (mirrors TS). An unset/invalid
+		// limit falls back to defaultLimit; an over-large one is clamped.
+		if opt.Limit <= 0 {
+			opt.Limit = defaultLimit
+		} else if opt.Limit > maxLimit {
+			opt.Limit = maxLimit
 		}
 		if s, e := strconv.ParseInt(c.Queries.Get("skip"), 10, 64); e == nil {
 			opt.Skip = s

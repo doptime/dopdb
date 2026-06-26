@@ -95,7 +95,13 @@ func (s *Server) parse(r *http.Request) (*ReqCtx, int, error) {
 	if c.DB == "" {
 		c.DB = "default"
 	}
-	c.Body, _ = io.ReadAll(r.Body)
+	body, berr := io.ReadAll(r.Body)
+	if berr != nil {
+		// Over the MaxBytesReader ceiling set in ServeHTTP, or a transport read
+		// error. Either way, do not proceed with a truncated body.
+		return nil, http.StatusRequestEntityTooLarge, berr
+	}
+	c.Body = body
 
 	// Verify JWT (if present) before any @-substitution.
 	if status, err := s.parseJWT(r, c); err != nil {

@@ -1,5 +1,0 @@
-=== RUN   TestMongoContract
-    integration_test.go:140: INTEGRATION OK against mongodb://localhost:27017/dopdb_integration_test
---- PASS: TestMongoContract (0.14s)
-PASS
-ok  	github.com/doptime/dopdb/mongostore	0.376s

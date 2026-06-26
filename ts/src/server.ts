@@ -40,6 +40,7 @@ import {
   NotFoundError,
   UnauthorizedError,
   ConflictError,
+  ValidationError,
 } from "./errors.js";
 import type { Db, DbApi, FindOpt, WatchEvent, WatchHandler, Unsubscribe } from "./client.js";
 import { Permissions } from "./permission.js";
@@ -96,6 +97,33 @@ function verifyJWT(token: string, secret: string): Claims {
 
 const empty = (m: Filter) => Object.keys(m).length === 0;
 const isDupKey = (e: unknown) => !!e && typeof e === "object" && (e as { code?: number }).code === 11000;
+
+// Guardrails (mirrored on the Go side).
+const DEFAULT_LIMIT = 100; // find with no explicit limit is capped here
+const MAX_LIMIT = 1000; // an explicit limit is clamped to this
+const MAX_BODY = 1_000_000; // 1 MB request-body ceiling (413 above it)
+
+// Combine the server-forced owner scope with the caller's (already sanitized)
+// filter so the caller can NEVER widen or override the scope. Identical to Go's
+// mergeScope: when both are non-empty we AND them, so a hostile filter like
+// {owner:"someone-else"} intersects with {owner:me} and matches nothing.
+function mergeScope(scope: Filter, filter: Filter): Filter {
+  if (empty(scope)) return filter;
+  if (empty(filter)) return scope;
+  return { $and: [scope, filter] } as Filter;
+}
+
+// Sort/projection come straight off the query string; admit only plain
+// field -> number/boolean maps. This blocks operator smuggling ($-keys) and
+// illegal field paths from reaching the driver.
+function checkSortProj(o: unknown, what: string): void {
+  if (o == null) return;
+  if (typeof o !== "object" || Array.isArray(o)) throw new ValidationError([], `dopdb: invalid ${what}`);
+  for (const [k, v] of Object.entries(o as Record<string, unknown>)) {
+    if (k.startsWith("$") || k.includes("$")) throw new ValidationError([], `dopdb: illegal ${what} field "${k}"`);
+    if (typeof v !== "number" && typeof v !== "boolean") throw new ValidationError([], `dopdb: illegal ${what} value for "${k}"`);
+  }
+}
 
 interface ExecArgs {
   key?: string;
@@ -185,7 +213,7 @@ async function exec(m: MongoCollection<Doc>, cmd: string, a: ExecArgs, scope: Fi
     }
     case "count": {
       const safe = sanitizeFilter(a.filter);
-      return { count: await m.countDocuments({ ...scope, ...safe } as Filter) };
+      return { count: await m.countDocuments(mergeScope(scope, safe)) };
     }
     case "hincrby":
     case "hincrbyfloat": {
@@ -220,16 +248,17 @@ async function exec(m: MongoCollection<Doc>, cmd: string, a: ExecArgs, scope: Fi
     }
     case "find": {
       const safe = sanitizeFilter(a.filter);
-      let cur = m.find({ ...scope, ...safe } as Filter);
+      let cur = m.find(mergeScope(scope, safe));
       if (a.opt?.sort) cur = cur.sort(a.opt.sort);
       if (a.opt?.projection) cur = cur.project(a.opt.projection);
       if (a.opt?.skip != null) cur = cur.skip(a.opt.skip);
-      if (a.opt?.limit != null) cur = cur.limit(a.opt.limit);
+      const lim = a.opt?.limit;
+      cur = cur.limit(lim != null ? Math.min(Math.max(lim, 0), MAX_LIMIT) : DEFAULT_LIMIT);
       return await cur.toArray();
     }
     case "findone": {
       const safe = sanitizeFilter(a.filter);
-      const doc = await m.findOne({ ...scope, ...safe } as Filter);
+      const doc = await m.findOne(mergeScope(scope, safe));
       if (!doc) throw new NotFoundError();
       return doc;
     }
@@ -457,7 +486,16 @@ function sendError(res: ServerResponse, e: unknown): void {
 function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     let data = "";
-    req.on("data", (c) => (data += c));
+    let size = 0;
+    req.on("data", (c) => {
+      size += (c as Buffer).length;
+      if (size > MAX_BODY) {
+        reject(new DopdbError("request body too large", 413, "too_large"));
+        req.destroy();
+        return;
+      }
+      data += c;
+    });
     req.on("end", () => resolve(data));
     req.on("error", reject);
   });
@@ -538,6 +576,21 @@ async function streamWatch(m: MongoCollection<Doc>, scope: Filter, resumeAfter: 
 // ---- the runtime (shared by every adapter) ----------------------------------
 
 async function buildRuntime(cfg: ServeConfig): Promise<Runtime> {
+  // Validate schema config BEFORE any side effects (Mongo connect). Fail-closed:
+  // a row-scoped collection MUST bind its owner field to an identity claim, or
+  // prepareWrite never sets the owner and the {owner:@uid} predicate matches
+  // nothing — scoping would silently break. Reject at startup; needs no Mongo.
+  for (const key of Object.keys(cfg.schema)) {
+    const c = cfg.schema[key];
+    const of = c.opts.ownerField;
+    if (of && !c.shape[of]?.rules.bind) {
+      throw new Error(
+        `dopdb serve: collection "${c.opts.name ?? key}" declares ownerField "${of}" but that field is not bound ` +
+        `to a claim (declare it as f.string().bind("uid")). Owner scope would silently fail otherwise.`,
+      );
+    }
+  }
+
   // Datasource registry: name -> Db. A single `mongo` registers as "default";
   // `datasources` registers several. ?ds=<name> selects one per request.
   const dbs = new Map<string, MongoDb>();
@@ -695,10 +748,11 @@ async function buildRuntime(cfg: ServeConfig): Promise<Runtime> {
     if (lim) opt.limit = parseInt(lim, 10);
     if (skp) opt.skip = parseInt(skp, 10);
     try {
-      if (srt) opt.sort = JSON.parse(srt);
-      if (prj) opt.projection = JSON.parse(prj);
-    } catch {
-      return { kind: "json", status: 400, body: { error: "invalid sort/projection json", code: "validation" } };
+      if (srt) { opt.sort = JSON.parse(srt); checkSortProj(opt.sort, "sort"); }
+      if (prj) { opt.projection = JSON.parse(prj); checkSortProj(opt.projection, "projection"); }
+    } catch (e) {
+      const msg = e instanceof ValidationError ? e.message : "invalid sort/projection json";
+      return { kind: "json", status: 400, body: { error: msg, code: "validation" } };
     }
 
     const out = await exec(m, r.cmd, {
@@ -880,6 +934,12 @@ async function webHandle(
 
   const url = new URL(req.url);
   const method = req.method.toUpperCase();
+  if (Number(req.headers.get("content-length") ?? "0") > MAX_BODY) {
+    return new Response(JSON.stringify({ error: "request body too large", code: "too_large" }), {
+      status: 413,
+      headers: { "Content-Type": "application/json", ...cors },
+    });
+  }
   const bodyText = method === "GET" || method === "HEAD" ? "" : await req.text();
   const input: ReqInput = {
     method,

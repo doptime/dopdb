@@ -1,8 +1,0 @@
-engine version: dopdb-wasm/0.1
-in-process OK; names = ["add","dreamanalyzer","greet"]
-serving on 56249
-(node:44905) ExperimentalWarning: The Fetch API is an experimental feature. This feature could change at any time
-(Use `node --trace-warnings ...` to show where the warning was created)
-ALL TS SDK INTEGRATION TESTS PASSED
-  remote greet -> {"msg":"hi Bob","n":1}
-  remote dream -> {"mood":"calm","text":"ocean"}

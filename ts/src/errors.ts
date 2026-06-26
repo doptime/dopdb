@@ -68,6 +68,13 @@ export class ConflictError extends DopdbError {
   }
 }
 
+/** 413 — request body exceeded the size limit (transport guard). */
+export class PayloadTooLargeError extends DopdbError {
+  constructor(message = "request body too large") {
+    super(message, 413, "payload_too_large");
+  }
+}
+
 const byCode: Record<string, (msg: string) => DopdbError> = {
   validation: (m) => new ValidationError([], m),
   unauthorized: (m) => new UnauthorizedError(m),
