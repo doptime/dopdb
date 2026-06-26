@@ -11,7 +11,6 @@ const sample = `
 [http]
 addr           = ":9000"
 jwt_secret_env = "TEST_JWT_SECRET"
-auto_auth      = false
 cors_origins   = ["https://a.example.com", "https://b.example.com"]
 
 [[mongo]]
@@ -48,9 +47,6 @@ func TestLoadAndEnvOverride(t *testing.T) {
 	}
 	if cfg.HTTP.JWTSecret != "s3cr3t" {
 		t.Errorf("jwt secret not resolved from env: %q", cfg.HTTP.JWTSecret)
-	}
-	if cfg.HTTP.AutoAuth {
-		t.Error("auto_auth should be false")
 	}
 	if len(cfg.HTTP.CORSOrigins) != 2 || cfg.HTTP.CORSOrigins[0] != "https://a.example.com" {
 		t.Errorf("cors=%v", cfg.HTTP.CORSOrigins)
@@ -110,14 +106,14 @@ db   = "appdb"
 
 func TestWarnings(t *testing.T) {
 	cfg := &Config{
-		HTTP: HTTPConfig{AutoAuth: true, JWTSecret: "x"},
+		HTTP: HTTPConfig{JWTSecret: "x"},
 		Mongo: []MongoSource{
 			{Name: "default", URI: "mongodb://user:pw@h:27017", DB: "d"}, // creds in literal
 		},
 	}
 	w := cfg.Warnings()
-	if len(w) != 2 {
-		t.Fatalf("expected 2 warnings, got %d: %v", len(w), w)
+	if len(w) != 1 {
+		t.Fatalf("expected 1 warning, got %d: %v", len(w), w)
 	}
 }
 

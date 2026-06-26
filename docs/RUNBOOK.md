@@ -1,75 +1,81 @@
 # RUNBOOK · dopdb 构建 / 测试 / 运行 / 迁移
 
-> 操作手册。谁来跑都照这个走。环境:Go 1.22+。
+## 前置
 
-## 构建
+- **Go** ≥ 1.22(driver `go.mongodb.org/mongo-driver/v2`)。
+- **Node** ≥ 20(TS 实现;`mongodb` ^6 为 peer 依赖)。
+- **MongoDB**:普通实例即可跑大部分集成测试;**`watch`(change stream)需副本集**。
 
-```bash
-# 不含驱动的全部包(任何环境都能构建)
-go build ./...      # 若本机无 mongo 驱动会在 mongostore 处失败,见下
-
-# 仅核心(确定无驱动依赖)
-go build . ./api ./httpserve ./config ./memstore
-```
-
-`mongostore` 是唯一 import MongoDB 驱动的包。要构建它,先在 `go.mod` 加依赖:
+## Go:构建与测试
 
 ```bash
-go get go.mongodb.org/mongo-driver/v2@latest
-go build ./mongostore
+make build         # go build ./...(根包直连 driver,需联网拉取一次 driver 模块)
+make vet           # go vet ./...
+make fmt-check     # gofmt 校验
+make test          # go test ./...(集成测试在未设 DOPDB_TEST_MONGO_URI 时自动跳过)
+make test-mongo    # DOPDB_TEST_MONGO_URI=mongodb://... 跑集成测试(watch 需副本集)
 ```
 
-> 注:本框架在作者沙箱里写就,沙箱网络到不了 `go.mongodb.org`/`golang.org/x`,所以 `mongostore` 与 `mongostore.NewFromSource` **未在沙箱编译过**。请在装了驱动的环境构建一遍;若 v2 某个点版本改了 options 签名(`options.Client()/Replace()/Update()/Find()/Index()` 这套 builder),那是机械修正,`Store` 契约不变。
-
-## 测试矩阵
-
-| 命令 | 覆盖 | 依赖 |
-|---|---|---|
-| `go test . ./api ./httpserve ./config ./memstore` | 数据核心 + API 流水线 + HTTP 端到端(memstore)+ 配置 | 无,任何环境 |
-| `go test ./mongostore` | 适配器对真实驱动的契约 | mongo 驱动 + 运行中的 MongoDB |
-| `go test ./...` | 全部 | 同上 |
-
-沙箱可跑的那条目前 **34 测试全过**(数据 10 + api 7 + httpserve 11 + config 6;memstore 无测试)。
+- **单测**(`api/`、`config/`、`httpserve/` 的 api-dispatch/permission):无需数据库。
+- **集成测试**(根包 `dopdb_test.go`、`httpserve/integration_test.go`):需 `DOPDB_TEST_MONGO_URI`,各自用一次性数据库,结束即 drop。
 
 ```bash
-go vet ./...           # 静态检查
-gofmt -l .             # 应空输出(无未格式化文件)
+# 例:本地副本集(单节点)便于跑 watch
+DOPDB_TEST_MONGO_URI="mongodb://localhost:27017/?replicaSet=rs0" make test-mongo
 ```
 
-## 运行
+## TypeScript:构建与测试
 
-1. `cp config.toml.example config.toml`,改 `db`、`cors_origins`、`addr`。
-2. 设密钥环境变量(**别写进文件**):
-   ```bash
-   export DOPTIME_JWT_SECRET='…HS256 密钥或 RS256 PEM…'
-   export DOPTIME_MONGO_URI='mongodb://user:pw@host:27017/?authSource=admin'
-   ```
-3. 装配并起服务(代码见 `docs/03-config.md`)。生产务必 `auto_auth=false`。
+```bash
+make ts            # cd ts && npm install && npm run build
+make ts-typecheck  # tsc -p tsconfig.json --noEmit(strict)
+make ts-test       # node --import tsx --test test/*.test.ts
+```
 
-### MongoDB 部署要点
+TS 单测多数无需真库(`server.test.ts` 用注入的内存假 Mongo;`config.test.ts` 仅解析 TOML)。
 
-- **多文档 ACID 事务**需副本集部署(单机不支持事务)。
-- 持久化用 WiredTiger journal:写关注 `w:majority, j:true`。
-- 自托管全文 / 向量检索(`$search/$vectorSearch`)需 MongoDB 8.2+ 的 `mongot`;若用到 redisdb 时代的 RediSearch/VectorSet 能力,在此对接(上线前复核该版本 GA 状态)。
+## 运行(Go)
 
-## 从 doptime / redisdb 迁移
+```toml
+# config.toml(密钥从环境变量解析)
+[http]
+addr = ":8080"
+jwt_secret_env = "DOPTIME_JWT_SECRET"
+cors_origins = ["https://app.example.com"]
+[[mongo]]
+name = "default"
+uri_env = "DOPTIME_MONGO_URI"
+db = "appdb"
+```
 
-1. **结构体标签**:`msgpack:"alias:x"` → `bson:"x"`;补 `json:"x"` 同名(可脚本)。见 `01-data.md`。
-2. **主键**:非字符串主键别打 `bson:"_id"`(`_id` 永远是字符串);主键留外部。
-3. **数据 API**:`data.New[K,V]()` → `dopdb.New[K,V]()`,方法同名。
-4. **API**:`api.Api(...)` 流水线与命名规则不变;`.Func` 本地直调。
-5. **配置**:Redis 数据源表 → `[[mongo]]`;密钥进环境变量。
-6. **历史数据搬迁**:msgpack blob → BSON 文档需一次性转换(读旧 Redis hash → 反序列化 → `HSet` 进 Mongo);属一次性脚本,按集合逐个搬。
-7. **去掉的能力**:ZSet/Set 抽象、阻塞列表、Redis-stream RPC——迁移前确认业务没依赖;ZSet 排行榜改用「带 score 字段 + 降序索引 + `Find` 排序」。
+```bash
+export DOPTIME_JWT_SECRET="...HS256 密钥或 RS256 PEM..."
+export DOPTIME_MONGO_URI="mongodb://user:pw@host:27017/?authSource=admin"
+./your-server   # 内部:config.Load → httpserve.Serve(cfg, WithPermissions(perms))
+```
 
-## 未竟项(按优先级,均非主干)
+请求示例:
 
-1. ~~**原子 scoped-write 原语**~~ → ✓ 已完成(R3):`Store.PutScoped` filtered-upsert + `Collection.HSetScoped` 原子 scoped 写;跨主→`ErrForbidden`。见 `01-data.md` 方法表。
-2. ~~**scoped 的 `HKEYS/HLEN`**~~ → ✓ 已完成(R3):scoped 集合现返回**调用者本人**的键/计数,不泄漏。
-3. **msgpack-at-rest** → ✗ 已砍(R3):JSON+BSON 两 codec 已足,价值最低。
-4. ~~**`_permissions` 持久化**~~ → ✓ 已完成(R3):`Permissions.SaveJSON/LoadJSON` 文件式落盘/恢复;启动时 `LoadJSON` 载入,`AutoAuth` 默认 false(生产安全)。
-5. **TS 重写**:最终目标——TS 里类型定义一次(Zod schema→infer+运行时校验),去掉 Go→TS 生成。
+```bash
+TOKEN="Bearer <jwt>"
+# 写(默认数据源)
+curl -XPOST "localhost:8080/api/hset/users?f=u1" -H "Authorization: $TOKEN" -d '{"name":"Ada","email":"ada@x.io","age":30}'
+# 读(指定数据源)
+curl "localhost:8080/api/hget/users?ds=analytics&f=u1" -H "Authorization: $TOKEN"
+# 我自己的记录
+curl "localhost:8080/api/hget/profiles?f=@uid" -H "Authorization: $TOKEN"
+# 查询(过滤器走 body)
+curl -XPOST "localhost:8080/api/find/users?limit=20" -H "Authorization: $TOKEN" -d '{"age":{"$gte":18}}'
+# 实时订阅(SSE)
+curl -N "localhost:8080/api/watch/users" -H "Authorization: $TOKEN"
+```
 
-## 红线提醒(给执行方)
+## 从旧版本迁移(要点)
 
-跑测试 / 验收时不改测试、不改门槛、不改守卫来让自己过(RL2);代码退出码 0 ≠ 任务完成,看语义指标(RL5);如实报告,诚实失败优于假装成功(RL6);守卫脚本前置缺失必须非零退出(RL7)。密钥只走环境变量(RL4)。
+- **URL**:数据命令从旧的 `CMD-KEY` 段改为 `/api/<cmd>/<coll>`;数据源从路径段改为 `?ds=<name>`。
+- **Store/Codec**:已删除;若曾依赖 `memstore`/`mongostore`/`WithStore`,改为直接 `New[...]` + `SetDatasources`/`ConnectDatasources`。
+- **权限**:`auto_auth` 已移除;改为显式 `Grant`(或加载 JSON)。默认拒绝。
+- **WASM**:已退场;TS 是独立等效实现,直接用 `dopdb/client` 与 `dopdb/server`。
+- **API 钩子**:`ParamEnhancer/ResultSaver/ResponseModifier` 已去除,仅保留 `Validate`。
+
+> 注意:本仓库 Go 代码绑定 driver v2,请在本机 `go build ./...` 确认 API 细节;TS 已通过严格类型检查与全部单测。

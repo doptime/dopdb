@@ -4,7 +4,6 @@
 [http]
 addr           = ":8080"                 # HTTP 监听地址
 jwt_secret_env = "DOPTIME_JWT_SECRET"    # 持有 HS256 密钥 / RS256 PEM 公钥的环境变量名
-auto_auth      = false                   # 仅开发期可设 true(首用即授权);生产必须 false
 cors_origins   = ["https://app.example.com"]
 
 # 至少要有一个 name = "default" 的数据源(框架默认数据源)。

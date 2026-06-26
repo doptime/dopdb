@@ -7,50 +7,37 @@ import (
 	"sync"
 )
 
-// Permissions is the black/white list gating data commands, keyed by
+// Permissions is the black/white list gating data + API commands, keyed by
 // "COMMAND::collection". It mirrors doptime's single-list on/off model
 // (command::key::on/off) so existing operational habits carry over; here the
-// "key" is a collection name.
+// "key" is a collection name (or an API endpoint name).
 //
-// This in-memory implementation is sufficient for a single process and for dev
-// (with AutoAuth). For a cluster, back the same interface with a dopdb
-// collection ("_permissions", _id = "CMD::coll", value {on: bool}) so the list
-// is shared — the HTTP layer only calls Allowed/Grant.
+// Default is DENY: a pair that was never granted is refused. (The former
+// dev-only AutoAuth grant-on-first-use was removed — grants are always explicit.)
+//
+// This in-memory implementation is sufficient for a single process; persist it
+// with SaveJSON / LoadJSON, or for a cluster back the same calls with a shared
+// dopdb collection — the HTTP layer only calls Allowed/Grant/Deny.
 type Permissions struct {
 	mu sync.RWMutex
 	m  map[string]bool // "CMD::coll" -> on
-	// AutoAuth: in development, grant-on-first-use so the whitelist builds
-	// itself exactly to what the client exercises. NEVER enable in production.
-	AutoAuth bool
 }
 
-// NewPermissions returns an empty permission set. Pass autoAuth=true only in dev.
-func NewPermissions(autoAuth bool) *Permissions {
-	return &Permissions{m: map[string]bool{}, AutoAuth: autoAuth}
+// NewPermissions returns an empty permission set (default deny).
+func NewPermissions() *Permissions {
+	return &Permissions{m: map[string]bool{}}
 }
 
 func permKey(cmd, coll string) string {
 	return strings.ToUpper(cmd) + "::" + coll
 }
 
-// Allowed reports whether (cmd, coll) is permitted. With AutoAuth on, an unseen
-// pair is granted and reported allowed.
+// Allowed reports whether (cmd, coll) is explicitly permitted. Unknown pairs are
+// denied.
 func (p *Permissions) Allowed(cmd, coll string) bool {
-	key := permKey(cmd, coll)
 	p.mu.RLock()
-	on, seen := p.m[key]
-	auto := p.AutoAuth
-	p.mu.RUnlock()
-	if seen {
-		return on
-	}
-	if auto {
-		p.mu.Lock()
-		p.m[key] = true
-		p.mu.Unlock()
-		return true
-	}
-	return false
+	defer p.mu.RUnlock()
+	return p.m[permKey(cmd, coll)]
 }
 
 // Grant adds an allow entry.
@@ -60,7 +47,7 @@ func (p *Permissions) Grant(cmd, coll string) {
 	p.m[permKey(cmd, coll)] = true
 }
 
-// Deny adds a deny entry (an explicit off, which beats AutoAuth).
+// Deny adds an explicit deny entry.
 func (p *Permissions) Deny(cmd, coll string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -78,8 +65,7 @@ func (p *Permissions) SaveJSON(path string) error {
 	return os.WriteFile(path, data, 0644)
 }
 
-// LoadJSON deserialises a JSON file back into a Permissions instance with
-// AutoAuth disabled.
+// LoadJSON deserialises a JSON file back into a Permissions instance.
 func LoadJSON(path string) (*Permissions, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -89,5 +75,5 @@ func LoadJSON(path string) (*Permissions, error) {
 	if err := json.Unmarshal(data, &m); err != nil {
 		return nil, err
 	}
-	return &Permissions{m: m, AutoAuth: false}, nil
+	return &Permissions{m: m}, nil
 }

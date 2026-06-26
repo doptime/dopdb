@@ -1,36 +1,39 @@
-# dopdb — common tasks. The no-driver packages compile & test without the
-# MongoDB driver (and thus without network); mongostore needs the driver.
+# dopdb — common tasks.
+#
+# dopdb binds the MongoDB driver directly (no Store abstraction), so every Go
+# package needs the driver module. Unit tests (api/config/httpserve) run WITHOUT
+# a database; integration tests self-skip unless DOPDB_TEST_MONGO_URI points at a
+# running MongoDB. The watch/change-stream tests additionally require the server
+# to be a replica set.
+#
+# The TypeScript implementation (an equivalent of the Go one) lives in ts.
 
-GO       ?= go
-NODRIVER  = . ./api ./httpserve ./config ./memstore
+GO ?= go
 export GOFLAGS = -mod=mod
 
-.PHONY: help test test-mongo test-all vet fmt fmt-check build build-mongo wasm ts tidy clean
+.PHONY: help test test-mongo vet fmt fmt-check build tidy ts ts-test ts-typecheck clean
 
 help:
-	@echo "make test        - run the no-driver test suite (34 tests)"
-	@echo "make test-mongo  - run mongostore integration test (needs DOPTIME_TEST_MONGO_URI)"
-	@echo "make test-all    - run every test (needs mongo driver + MongoDB)"
-	@echo "make vet         - go vet on no-driver packages"
-	@echo "make fmt         - gofmt -w on the tree"
-	@echo "make fmt-check   - fail if anything is unformatted"
-	@echo "make build       - build no-driver packages"
-	@echo "make build-mongo - build incl mongostore (needs: go get go.mongodb.org/mongo-driver/v2)"
-	@echo "make wasm        - compile the WASM module into clients/ts/wasm/"
-	@echo "make ts          - build the TypeScript client (implies wasm)"
-	@echo "make tidy        - go mod tidy"
+	@echo "make test          - go test ./...  (integration tests skip without DOPDB_TEST_MONGO_URI)"
+	@echo "make test-mongo    - run integration tests against DOPDB_TEST_MONGO_URI (replica set for watch)"
+	@echo "make vet           - go vet ./..."
+	@echo "make fmt           - gofmt -w ."
+	@echo "make fmt-check     - fail if anything is unformatted"
+	@echo "make build         - go build ./..."
+	@echo "make tidy          - go mod tidy"
+	@echo "make ts            - build the TypeScript implementation (ts)"
+	@echo "make ts-test       - run the TypeScript test suite"
+	@echo "make ts-typecheck  - strict typecheck the TypeScript implementation"
 
 test:
-	$(GO) test -count=1 $(NODRIVER)
-
-test-mongo:
-	$(GO) test -count=1 -run TestMongoContract -v ./mongostore
-
-test-all:
 	$(GO) test -count=1 ./...
 
+test-mongo:
+	@if [ -z "$(DOPDB_TEST_MONGO_URI)" ]; then echo "set DOPDB_TEST_MONGO_URI=mongodb://...  (replica set required for watch)"; exit 1; fi
+	$(GO) test -count=1 -run Integration -v ./...
+
 vet:
-	$(GO) vet $(NODRIVER)
+	$(GO) vet ./...
 
 fmt:
 	gofmt -w .
@@ -39,26 +42,19 @@ fmt-check:
 	@out=$$(gofmt -l .); if [ -n "$$out" ]; then echo "unformatted:"; echo "$$out"; exit 1; fi
 
 build:
-	$(GO) build $(NODRIVER)
-
-build-mongo:
 	$(GO) build ./...
-
-WASMOUT = clients/ts/wasm
-
-wasm:
-	GOOS=js GOARCH=wasm $(GO) build -o $(WASMOUT)/dopdb.wasm ./wasm
-	@goroot=$$($(GO) env GOROOT); \
-	for c in "$$goroot/lib/wasm/wasm_exec.js" "$$goroot/misc/wasm/wasm_exec.js" /usr/share/go-*/misc/wasm/wasm_exec.js /usr/local/go/misc/wasm/wasm_exec.js; do \
-	  if [ -f $$c ]; then cp $$c $(WASMOUT)/wasm_exec.js; echo "copied wasm_exec.js from $$c"; break; fi; \
-	done; \
-	echo "wasm -> $(WASMOUT)/dopdb.wasm (keeping committed wasm_exec.js if none found)"
-
-ts: wasm
-	cd clients/ts && npm install --no-audit --no-fund && npm run build
 
 tidy:
 	$(GO) mod tidy
+
+ts:
+	cd ts && npm install --no-audit --no-fund && npm run build
+
+ts-test:
+	cd ts && npm test
+
+ts-typecheck:
+	cd ts && npm run typecheck
 
 clean:
 	$(GO) clean

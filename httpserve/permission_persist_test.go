@@ -7,7 +7,7 @@ import (
 )
 
 func TestSaveLoadJSON(t *testing.T) {
-	p := NewPermissions(false)
+	p := NewPermissions()
 
 	// Grant 5 entries
 	grants := [][2]string{
@@ -51,9 +51,9 @@ func TestSaveLoadJSON(t *testing.T) {
 		}
 	}
 
-	// Unknown key with AutoAuth=false must return false
+	// Unknown key must return false (default deny)
 	if q.Allowed("UNKNOWN", "Collection") {
-		t.Error("expected false for unknown key with AutoAuth=false")
+		t.Error("expected false for unknown key (default deny)")
 	}
 
 	// LoadJSON on non-existent file must error

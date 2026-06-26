@@ -1,5 +1,7 @@
 # dopdb 简约化改进清单(架构主线 · 决策用)
 
+> **状态(本轮已落地)**:本清单评估的简约化方向已实施,并完成 4 项课程修正——(1) 删除 Store/Codec 抽象、直连 MongoDB;(2) 多数据源 + `?ds=` 参数(缺省 `default`);(3) 权限默认拒绝(去 AutoAuth);(4) TypeScript 为 Go 的对等完整实现(非客户端)。此外:URL 改 `/api/<cmd>/<coll>`、新增 `hmset/hmget/count/findone/watch`、`watch` 走 change stream→SSE、API 流水线精简为 `decode→Validate→Func`、WASM 退场。详见 `README` 与 `docs/`。本文件以下内容为当初的评估记录,保留以备追溯。
+
 > 目的:把「让 DB+API 用起来的代码再变少」这件事,所有可能的改进 + 每一处开发者体验改进,全部列出,按**用户体验改进程度**排序,供你判断要不要实施。本文件只评估、不编码。
 >
 > 这里的「用户」= 用 dopdb 的开发者,所以「用户体验(UX)」≈ 开发者体验(DX)。

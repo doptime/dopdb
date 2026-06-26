@@ -1,116 +1,122 @@
 # dopdb
 
-> `doptime` + `redisdb` 合并重写,数据后端换成 **MongoDB**。先以 Go 落地,最终用 TypeScript 重写以消除前后端分离。
->
-> 模块路径:`github.com/doptime/dopdb` · Go 1.22+
+> `doptime` + `redisdb` + `doptime-client` 合并重写,数据后端换成 **MongoDB**。
+> 一份 schema 同时产出**类型、校验、带类型的客户端、服务端**——不生成代码、不前后端各写一遍。
 
-把 doptime 的三个招牌——**`@`-绑定上下文模型**、**闭合命令词表**、**API 钩子流水线**——原样搬到 MongoDB 上;丢掉 Redis 才有的东西(ZSet/Set 抽象、阻塞列表、Redis-stream RPC);顺手修掉 redisdb 几处旧缺陷(读路径跑 modifier、键编解码不一致、非原子计数、msgpack-at-rest)。
+dopdb 有 **两套对等的完整实现**,共享同一套线协议与全部特性:
 
-核心架构:整个类型层只依赖一个窄接口 `dopdb.Store`,MongoDB 驱动**只出现在 `mongostore/` 一个文件**——所以核心逻辑用内存 store 就能全量测试,换引擎只重写一个适配器。
+| 实现 | 位置 | 用途 |
+|---|---|---|
+| **Go** | 根包 `dopdb` + `api/` + `httpserve/` + `config/` | 服务端(直连 MongoDB 驱动) |
+| **TypeScript** | `ts/` | 既能在 Node 跑同样的服务端,也能在浏览器做带类型的客户端 |
 
-## 目录结构
+TypeScript 不是“客户端 SDK”,而是 Go 的等效重写:同样的 URL 方案、同样的命令词表、同样的 `@`-绑定/行级隔离/权限模型。两端可以混用(Go 服务 + TS 客户端,或反之)。
 
-```
-.                          模块根 = package dopdb(数据核心)
-├─ store.go                Store 接口 + Codec + ErrNoDoc/ErrForbidden + M/FindOpt/IndexSpec
-├─ dopdb.go                Collection[K,V] + New + 选项 + 键编解码 + index 标签 + H* 方法
-├─ modifiers.go            写入期 modifiers + 时间戳 + SetValidator/RunValidate
-├─ sanitize.go             SanitizeFilter(查询净化,安全核心)
-├─ http_accessor.go        HttpAccessor 类型擦除桥 + 注册表 + owner-scope 策略
-├─ api/                    api.Api + CallByMap 钩子流水线 + 命名 + 注册表
-├─ httpserve/              HTTP 层:JWT、@-绑定、权限白名单、owner 行级隔离、命令/API 派发
-├─ config/                 TOML 配置读取 + 环境变量解析密钥 + 校验(无外部依赖)
-├─ memstore/               内存 Store + JSONCodec(应用单测用)
-├─ mongostore/             MongoDB Store 适配器 + BSONCodec(唯一 import 驱动)
-├─ wasm/                   Go→WASM 桥:把 api 核心暴露给 JS(createApi/callApi);stub.go 保非 wasm 平台可构建
-├─ clients/ts/             dopdb-client:TS/JS 客户端(WASM 运行时 + 远程调用器),发布 .ts + dist/*.js + *.d.ts
-├─ config.toml.example     配置样例
-├─ Makefile                常用命令(make test / vet / fmt / build / wasm / ts)
-├─ docs/                   设计与使用文档(从这里读起)
-│  ├─ 00-overview.md         架构 / 取舍 / 包地图
-│  ├─ 01-data.md             数据层:集合 / 方法 / modifiers / 索引 / Find
-│  ├─ 02-http.md             HTTP 与安全:@-绑定 / 命令词表 / 权限 / 行级隔离
-│  ├─ 03-config.md           配置:schema / env 密钥 / 装配
-│  ├─ 04-wasm-ts.md          WASM 桥 / TS·JS 客户端 / /api/<name> 路由
-│  └─ RUNBOOK.md             构建 / 测试矩阵 / 部署 / 迁移 / 未竟项
-└─ delivery/               云×本地×人 协作运行库(给 agent harness 派发测试任务)
-   ├─ kit/                   方法论本体(协议 + 两份手册,跨项目通用)
-   ├─ project/               dopdb 项目卡(慢变事实)
-   ├─ STATUS.md / ROLES.md / README.md
-   └─ rounds/R1/             首回合:在真实 MongoDB 上验证框架的测试派发
-```
+---
 
-## 安装
+## 设计要点(本轮确定)
 
-```bash
-go get github.com/doptime/dopdb
-# 用到 mongostore 时,额外拉驱动:
-go get go.mongodb.org/mongo-driver/v2
-```
+- **直连 Mongo,不要 Store 抽象**:删除了 `Store`/`Codec` 接口与 `memstore`/`mongostore`,根包直接用 `go.mongodb.org/mongo-driver/v2`。把 Mongo 当 Mongo 用(`$inc`、change stream、唯一索引、`2dsphere` 等)。
+- **多数据源 + `?ds=` 参数**:配置可写多个 `[[mongo]]`;每个请求用查询参数 `?ds=<name>` 选择数据源,缺省为 `default`。数据源**不进路径**。
+- **URL**:数据命令 `/api/<cmd>/<coll>`,函数式 API `/api/<name>`。键用 `?f=`(可多值)。
+- **闭合命令词表**:`hget hset hsetnx hdel del hexists hgetall hkeys hvals hlen hincrby hincrbyfloat hmset hmget count find findone watch`。
+- **`@`-绑定(很重要)**:服务端把 `@uid`/`@key`/`@field`/`@remoteAddr`/`@host`/`@method`/`@path`/`@rawQuery` 及 JWT claims 注入请求上下文;客户端传来的 `@`-键一律剥除(防伪造)。`?f=@uid` 即“我自己的那条记录”。
+- **行级隔离(owner scope)**:声明某集合按 `owner` 字段隔离(对应某个 JWT claim),整集合读取会被强制加上 `{owner: 我}` 的过滤,客户端无法放宽。
+- **权限:默认拒绝**:`Grant/Deny/Allowed` + JSON 持久化,键为 `COMMAND::collection`;**没有 AutoAuth**(不再首用即授权),授权一律显式。
+- **JWT**:HS256 与 RS256(RS256 用 PEM/SPKI 公钥验签);拒绝 `none`。
+- **watch**:Mongo change stream → SSE(`text/event-stream`),owner-scope 过滤、断线按 resume token 续传。**需要 MongoDB 以副本集运行**;owner-scope 下 delete 事件因无 fullDocument 不投递。
+- **API 流水线极简**:`decode → Validate → Func`(去掉了 doptime 的 ParamEnhancer/ResultSaver/ResponseModifier 钩子链)。
+- **WASM 已退场**:TS 是独立等效实现,不再通过 WASM 桥接 Go。
 
-> 说明:`go.mod` 默认不声明 mongo 驱动——只有 `mongostore` 包用它。核心包(`dopdb`/`api`/`httpserve`/`config`/`memstore`)零外部依赖。
+---
 
-## 快速上手
+## 快速上手(Go)
 
 ```go
-// 1) 定义集合(bson 与 json 标签同名;@uid 类字段从已验证 JWT 注入)
+// 1) 定义集合(K=键类型,V=值类型)。schema 即真相,无代码生成。
 type User struct {
-    UID   string `bson:"_id"  json:"_id"`
-    Name  string `bson:"name" json:"name" mod:"trim" validate:"required"`
-    Email string `bson:"email" json:"email" mod:"trim,lowercase" index:"unique"`
+    Name  string `json:"name"  bson:"name"`
+    Email string `json:"email" bson:"email" index:"unique"`
+    Age   int    `json:"age"   bson:"age"   index:"1"`
 }
+users := dopdb.New[string, *User](dopdb.WithCollection("users"))
 
-// 2) 启动时装配(生产用 mongostore;测试用 memstore)
-st, _ := mongostore.New(ctx, uri, "appdb")   // 或 memstore.New()
-dopdb.SetDefaultStore(st)
-dopdb.SetDefaultCodec(mongostore.BSONCodec{}) // 测试用 memstore.JSONCodec{}
+// 2) 暴露给 HTTP 数据命令层 + 声明行级隔离(可选)。
+dopdb.RegisterHttp(users)
+// dopdb.SetOwnerScope("users", "owner", "uid") // 若 User 有 owner 字段
 
-dopdb.RegisterHttp(dopdb.New[string, *User](dopdb.WithCollection("User")))
-
-// 3) HTTP(数据命令 + API 走同一个 Handler)
-h := httpserve.NewHandler(httpserve.NewServer(jwtSecret), httpserve.NewPermissions(autoAuth))
-http.ListenAndServe(":8080", h)
+// 3) 一行起服务:连接配置里的所有数据源 → 建 Handler → CORS → 监听。
+cfg, _ := config.Load("config.toml")
+perms := httpserve.NewPermissions()
+perms.Grant("HGET", "users"); perms.Grant("HSET", "users"); perms.Grant("FIND", "users")
+log.Fatal(httpserve.Serve(cfg, httpserve.WithPermissions(perms)))
 ```
 
-配置驱动的装配见 `docs/03-config.md`;`@`-绑定与 owner 行级隔离见 `docs/02-http.md`。
+服务端代码内部要直接读写(可信、无 scope/JWT),直接用 `users.HGet("u1")`、`users.Find(dopdb.M{"age": 30}, dopdb.FindOpt{})` 等原生方法。
 
-## 测试
-
-```bash
-make test        # 无驱动全套:数据 10 + api 7 + httpserve 11 + config 6 = 34
-make vet fmt     # 静态检查 + 格式检查
-make build       # 构建无驱动包
-make build-mongo # 构建含 mongostore(需先 go get 驱动)
-make test-mongo  # mongostore 集成测试(需 DOPTIME_TEST_MONGO_URI)
-```
-
-完整测试矩阵、部署与迁移见 `docs/RUNBOOK.md`。
-
-## WASM / TypeScript(用 TS 函数创建 API)
-
-api 核心可编译成 WebAssembly,在任意 JS 运行时里加载;**传入一个带接口类型的 TS/JS 函数**即创建 API,路由默认 `/api/<名称>`(名称取自函数名或显式指定)。
+## 快速上手(TypeScript)
 
 ```ts
-import { loadDopdb, createApi, configure } from "dopdb-client";
+// 同一份 schema 两端共用。
+import { collection, f } from "dopdb";
+export const schema = {
+  users: collection({ name: f.string(), email: f.string().unique(), age: f.int() })
+    .named("users"),
+};
 
-// 服务端/同构:用 TS 函数定义并伺服 API
-const db = await loadDopdb();
-const greet = db.api((input: { name: string }) => ({ msg: "hi " + input.name })); // -> /api/greet
-import { createServer } from "node:http";
-createServer(db.nodeListener).listen(8080);
+// 服务端 —— 主路径:在 Next.js 中接管 /api(App Router,零配置)
+// app/api/[...slug]/route.ts
+import { createNextHandler, Permissions } from "dopdb/server";
+const perms = new Permissions().grant("HGET", "users").grant("HSET", "users");
+export const { GET, POST, OPTIONS } = createNextHandler({
+  schema, mongo: { uri: process.env.MONGO_URI!, db: "appdb" },
+  jwtSecret: process.env.JWT_SECRET!, permissions: perms,
+});
+export const runtime = "nodejs"; // Mongo 驱动不兼容 Edge
 
-// 前端:调远端 dopdb 服务的 /api/<name>
-configure({ baseUrl: "https://api.example.com" });
-await createApi("greet")({ name: "Ada" });   // POST {baseUrl}/api/greet
+// 或:独立 Node 服务端
+import { serveFromConfig } from "dopdb/server";
+await serveFromConfig("config.toml", { schema, permissions: perms });
+
+// 浏览器(fetch,带类型):
+import { clientDb } from "dopdb/client";
+const db = clientDb(schema, { baseUrl: "https://api.example.com", getToken: () => localStorage.token });
+await db.users.hset("u1", { name: "Ada", email: "ada@x.io", age: 30 });
+const u = await db.users.hget("u1"); // 类型为 User | null
 ```
 
-```bash
-make wasm   # 编译 dopdb.wasm 到 clients/ts/wasm/
-make ts     # 上面 + 编译 TS 客户端到 clients/ts/dist/
+用 TS 时与 Go 完全无关:TS 服务端自己处理 JWT/@-绑定/owner-scope/权限/watch,直连 Mongo,不向任何 Go 后端转发。前缀名可配:把路由文件夹从 `api` 改成别的(handler 读 catch-all 段),客户端设 `apiBase` 对齐。非默认数据源:集合上 `.inDb("analytics")` → 客户端自动带 `?ds=analytics`。
+
+---
+
+## 构建 / 测试
+
+```
+make test          # go test ./...(集成测试在未设 DOPDB_TEST_MONGO_URI 时自动跳过)
+make test-mongo    # 跑集成测试(需 DOPDB_TEST_MONGO_URI;watch 需副本集)
+make build         # go build ./...
+make ts            # 构建 TypeScript 实现(ts)
+make ts-test       # 跑 TS 测试
+make ts-typecheck  # TS 严格类型检查
 ```
 
-细节(WASM 桥、命名规则、服务端适配器、运行时边界)见 `docs/04-wasm-ts.md`。
+> Go 侧绑定 driver v2,需在本机 `go build ./...` 确认(本仓库的 Go 代码按 mongostore 的既有 driver-v2 写法实现)。TS 侧已通过严格 `tsc --noEmit` 与全部单测。
 
-## 状态
+## 仓库结构
 
-核心(数据 + api + http + config)在内存 store 上已全量自测(34 测试)。`mongostore` 对真实 MongoDB 的验证由 `delivery/rounds/R1/` 派发给本地 harness 执行(见该目录)。未竟硬化项(原子 scoped-write、scoped HKEYS/HLEN、msgpack、权限持久化)与 TS 重写见 `docs/RUNBOOK.md §未竟`。
+```
+dopdb.go            根包:泛型 Collection[K,V](原生可信 API)
+types.go            M / FindOpt / SortKey / IndexSpec / 错误
+mongo.go            具体 mongoBackend(直连 driver v2)+ Datasources 注册表
+http_accessor.go    类型擦除桥(HttpAccessor)+ owner-scope 策略
+modifiers.go        写入修饰器(时间戳 / @-绑定字段)
+sanitize.go         过滤器消毒(防注入)
+api/                函数式 API 端点(decode → Validate → Func)
+httpserve/          HTTP 运行时:路由 / JWT / 权限 / 派发 / watch(SSE)/ Serve
+config/             TOML 配置(多 [[mongo]];密钥从环境变量解析)
+ts/         TypeScript 等效实现(浏览器客户端 + Node 服务端)
+docs/               设计文档
+delivery/           交付物
+```
+
+详细文档见 `docs/`(总览、数据层、HTTP/安全、配置、TypeScript、RUNBOOK)。

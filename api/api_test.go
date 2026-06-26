@@ -33,7 +33,7 @@ func TestNameDerivation(t *testing.T) {
 			t.Errorf("apiNameByType(%T)=%q want %q", c.v, got, c.want)
 		}
 	}
-	// Explicit names (WithName/RegisterDynamic) are literal — only lower-cased.
+	// Explicit names (WithName) are literal — only lower-cased.
 	if got := cleanName("DreamAnalyzer"); got != "dreamanalyzer" {
 		t.Errorf("cleanName(DreamAnalyzer)=%q", got)
 	}
@@ -57,41 +57,27 @@ func TestLocalCall(t *testing.T) {
 	}
 }
 
-func TestPipelineOrder(t *testing.T) {
+func TestValidateThenFunc(t *testing.T) {
 	clearRegistry()
 	var trace []string
 	ep := Api(func(in *InDemo) (string, error) {
 		trace = append(trace, "func")
 		return "R:" + in.Name, nil
 	}, WithName("pipe"))
-	ep.ParamEnhancer = func(in *InDemo) (*InDemo, error) {
-		trace = append(trace, "enhancer")
-		in.Name = strings.ToUpper(in.Name)
-		return in, nil
-	}
 	ep.Validate = func(v any) error {
 		trace = append(trace, "validate")
 		return nil
-	}
-	ep.ResultSaver = func(in *InDemo, ret string) error {
-		trace = append(trace, "saver")
-		return nil
-	}
-	ep.ResponseModifier = func(in *InDemo, ret string) (any, error) {
-		trace = append(trace, "modifier")
-		return map[string]any{"out": ret}, nil
 	}
 
 	got, err := ep.CallByMap(context.Background(), map[string]any{"name": "x"}, nil)
 	if err != nil {
 		t.Fatalf("CallByMap: %v", err)
 	}
-	want := []string{"enhancer", "validate", "func", "saver", "modifier"}
+	want := []string{"validate", "func"}
 	if strings.Join(trace, ",") != strings.Join(want, ",") {
 		t.Errorf("order=%v want %v", trace, want)
 	}
-	m, ok := got.(map[string]any)
-	if !ok || m["out"] != "R:X" { // enhancer upper-cased then func ran
+	if got != "R:x" { // Func result returned directly (no ResponseModifier)
 		t.Errorf("result=%v", got)
 	}
 }

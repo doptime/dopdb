@@ -35,6 +35,7 @@ var dataCommands = map[string]bool{
 	"HGET": true, "HSET": true, "HSETNX": true, "HDEL": true, "DEL": true,
 	"HEXISTS": true, "HGETALL": true, "HKEYS": true, "HVALS": true,
 	"HLEN": true, "HINCRBY": true, "HINCRBYFLOAT": true, "FIND": true,
+	"HMSET": true, "HMGET": true, "COUNT": true, "FINDONE": true, "WATCH": true,
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -95,9 +96,9 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 			err error
 		)
 		if scoped {
-			v, err = acc.HttpGetScoped(ctx, key, scope)
+			v, err = acc.HttpGetScoped(ctx, c.DB, key, scope)
 		} else {
-			v, err = acc.HttpGet(ctx, key)
+			v, err = acc.HttpGet(ctx, c.DB, key)
 		}
 		writeResult(w, v, err)
 
@@ -109,9 +110,9 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 		c.mergeBody() // fold body value fields into params (@-context already set)
 		var err error
 		if scoped {
-			err = acc.HttpSetScoped(ctx, key, c.Params, scope)
+			err = acc.HttpSetScoped(ctx, c.DB, key, c.Params, scope)
 		} else {
-			err = acc.HttpSet(ctx, key, c.Params)
+			err = acc.HttpSet(ctx, c.DB, key, c.Params)
 		}
 		writeOK(w, err)
 
@@ -121,7 +122,7 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 			return
 		}
 		c.mergeBody()
-		inserted, err := acc.HttpSetNX(ctx, key, c.Params)
+		inserted, err := acc.HttpSetNX(ctx, c.DB, key, c.Params)
 		writeResult(w, map[string]any{"inserted": inserted}, err)
 
 	case "HDEL", "DEL":
@@ -133,12 +134,12 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 		if scoped {
 			// delete each key only if owned by caller
 			for _, k := range c.Fields {
-				if err = acc.HttpDelScoped(ctx, k, scope); err != nil {
+				if err = acc.HttpDelScoped(ctx, c.DB, k, scope); err != nil {
 					break
 				}
 			}
 		} else {
-			err = acc.HttpDel(ctx, c.Fields...)
+			err = acc.HttpDel(ctx, c.DB, c.Fields...)
 		}
 		writeOK(w, err)
 
@@ -152,32 +153,32 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 			err error
 		)
 		if scoped {
-			ex, err = acc.HttpExistsScoped(ctx, key, scope)
+			ex, err = acc.HttpExistsScoped(ctx, c.DB, key, scope)
 		} else {
-			ex, err = acc.HttpExists(ctx, key)
+			ex, err = acc.HttpExists(ctx, c.DB, key)
 		}
 		writeResult(w, map[string]any{"exists": ex}, err)
 
 	case "HGETALL", "HVALS":
-		v, err := acc.HttpGetAll(ctx, scope) // scope nil for unscoped collections
+		v, err := acc.HttpGetAll(ctx, c.DB, scope) // scope nil for unscoped collections
 		writeResult(w, v, err)
 
 	case "HKEYS":
 		if scoped {
-			v, err := acc.HttpKeysScoped(ctx, scope)
+			v, err := acc.HttpKeysScoped(ctx, c.DB, scope)
 			writeResult(w, v, err)
 			return
 		}
-		v, err := acc.HttpKeys(ctx)
+		v, err := acc.HttpKeys(ctx, c.DB)
 		writeResult(w, v, err)
 
 	case "HLEN":
 		if scoped {
-			n, err := acc.HttpLenScoped(ctx, scope)
+			n, err := acc.HttpLenScoped(ctx, c.DB, scope)
 			writeResult(w, map[string]any{"len": n}, err)
 			return
 		}
-		n, err := acc.HttpLen(ctx)
+		n, err := acc.HttpLen(ctx, c.DB)
 		writeResult(w, map[string]any{"len": n}, err)
 
 	case "HINCRBY", "HINCRBYFLOAT":
@@ -197,13 +198,13 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 		}
 		if scoped {
 			// only increment if the document is owned by the caller
-			ok, err := acc.HttpExistsScoped(ctx, key, scope)
+			ok, err := acc.HttpExistsScoped(ctx, c.DB, key, scope)
 			if err != nil || !ok {
 				writeErr(w, http.StatusForbidden, dopdb.ErrForbidden)
 				return
 			}
 		}
-		writeOK(w, acc.HttpIncrBy(ctx, key, field, delta))
+		writeOK(w, acc.HttpIncrBy(ctx, c.DB, key, field, delta))
 
 	case "FIND":
 		filter, ferr := c.parseFilter()
@@ -218,8 +219,63 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 		if s, e := strconv.ParseInt(c.Queries.Get("skip"), 10, 64); e == nil {
 			opt.Skip = s
 		}
-		v, err := acc.HttpFind(ctx, filter, scope, opt)
+		v, err := acc.HttpFind(ctx, c.DB, filter, scope, opt)
 		writeResult(w, v, err)
+
+	case "HMSET":
+		var items map[string]dopdb.M
+		if err := json.Unmarshal(c.Body, &items); err != nil || len(items) == 0 {
+			writeErr(w, http.StatusBadRequest, errors.New("HMSET requires a JSON object body {id:{...}}"))
+			return
+		}
+		writeOK(w, acc.HttpMSet(ctx, c.DB, items, scope))
+
+	case "HMGET":
+		if len(c.Fields) == 0 {
+			writeErr(w, http.StatusBadRequest, errors.New("HMGET requires ?f="))
+			return
+		}
+		v, err := acc.HttpMGet(ctx, c.DB, scope, c.Fields...)
+		writeResult(w, v, err)
+
+	case "COUNT":
+		filter, ferr := c.parseFilter()
+		if ferr != nil {
+			writeErr(w, http.StatusBadRequest, ferr)
+			return
+		}
+		n, err := acc.HttpCount(ctx, c.DB, filter, scope)
+		writeResult(w, map[string]any{"count": n}, err)
+
+	case "FINDONE":
+		filter, ferr := c.parseFilter()
+		if ferr != nil {
+			writeErr(w, http.StatusBadRequest, ferr)
+			return
+		}
+		v, err := acc.HttpFindOne(ctx, c.DB, filter, scope)
+		writeResult(w, v, err)
+
+	case "WATCH":
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			writeErr(w, http.StatusInternalServerError, errors.New("streaming unsupported"))
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.WriteHeader(http.StatusOK)
+		flusher.Flush()
+		emit := func(op, id string, doc any) error {
+			payload, _ := json.Marshal(map[string]any{"type": op, "id": id, "doc": doc})
+			if _, err := w.Write([]byte("data: " + string(payload) + "\n\n")); err != nil {
+				return err
+			}
+			flusher.Flush()
+			return nil
+		}
+		_ = acc.HttpWatch(ctx, c.DB, scope, emit)
 	}
 }
 

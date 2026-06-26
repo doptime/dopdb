@@ -1,124 +1,86 @@
-# 02 · HTTP 层与安全模型(`@`-绑定 · 命令词表 · 权限 · 行级隔离)
+# 02 · HTTP 层与安全模型(URL · `@`-绑定 · 命令词表 · 权限 · 行级隔离 · watch)
 
-> 这一层让 CRUD 端点消失:前端直接说 `HGET-User?f=@uid`,框架在服务端解析、鉴权、注入身份、隔离行、再落到 MongoDB。本文件讲 URL 文法、安全三件套、API 端点,以及一个请求走完的全程。
+HTTP 层只把 schema 暴露成一组**闭合**的数据命令 + 函数式 API,并在边界强制 JWT `@`-绑定、行级隔离、权限。Go 在 `httpserve/`,TS 在 `ts/src/server.ts`,行为一致。
 
-## 一个请求的全程
+## URL 方案
 
-```
-GET /HGET-User?f=@uid   (Authorization: Bearer <jwt>)
-  │
-  1. 解析 CMD-KEY:CMD=HGET, Coll=User;读 ?f= 字段、?ds= 数据源
-  2. 验 JWT(HS256/RS256,拒 none;LRU 缓存)
-  3. @-替换:?f=@uid → uid=<jwt.uid>(缺 claim 即 fail-closed)
-  4. 建 param 表:query+header → 剥离客户端 @-键(防伪) → 注入 @key/@field/@<claim>
-  5. 权限闸:Allowed("HGET","User")?(白名单 + AutoAuth)
-  6. 查注册表:LookupHttp("User")
-  7. owner 作用域:OwnerScope("User", claims) —— 被 scope 但无 claim ⇒ 401
-  8. 派发到 dopdb 方法 → JSON 响应
-```
+- **数据命令**:`/api/<cmd>/<coll>` —— `/api/` 后两段,首段是命令、次段是集合。
+- **函数式 API**:`/api/<name>` —— `/api/` 后一段。
+- **数据源**:查询参数 `?ds=<name>`,缺省 `default`。**数据源不进路径**。
+- **键**:查询参数 `?f=`(可多值,用于 hmget/hdel 等);`?f=@uid` 触发 `@`-解析。
+- **查询**:`find/findone/count` 的过滤器走 **POST body**(JSON);`?limit= &skip= &s=<排序JSON> &p=<投影JSON>`。
 
-## URL 文法
+区分规则:`/api/` 后 ≥2 段且首段在命令词表内 → 数据命令;否则按 `/api/<name>` 当函数式 API。
 
-路径最后一段 = `CMD-KEY`;字段走 `?f=`;数据源走 `?ds=`(默认 `default`)。
-
-- `CMD-KEY` 里 **KEY = 集合名**,**`?f=` 的值 = 文档主键**(经 `@`-解析)。
-- 段内**没有 `-`** ⇒ 当作 **API 调用**(`Cmd=API`,见末节)。
-- 主键 / 字段里可含 `@tag`。
-
-例:
-- `GET /HGET-User?f=@uid` → 取调用者自己的 User 文档(self 模式)。
-- `POST /HSET-Order?f=o1`(body `{"item":"book"}`)→ 写 Order o1。
-- `GET /FIND-Order?q=<urlencoded json>&limit=50` → 查询(净化 + scope)。
-
-## 闭合命令词表
-
-前端只能调这组固定动词,**不是任意查询**——这就是从 Redis 继承的安全属性:
+## 命令词表(闭合)
 
 ```
-HGET HSET HSETNX HDEL DEL HEXISTS HGETALL HKEYS HVALS HLEN HINCRBY HINCRBYFLOAT FIND
+hget hset hsetnx hdel del hexists hgetall hkeys hvals hlen
+hincrby hincrbyfloat hmset hmget count find findone watch
 ```
 
-词表外(且非 API)的命令 → 400。`HINCRBY` 取 `?f=`(文档主键)+ `?field=`(数值字段点路径)+ `?n=`(增量)。
+| 命令 | 方法 | 语义 |
+|---|---|---|
+| `hget` | GET | 取一条(scoped:仅自己的,否则 404) |
+| `hset` | POST | upsert 一条(body 为值;scoped 写他人 id → 403) |
+| `hsetnx` | POST | 不存在才写 |
+| `hdel`/`del` | POST/GET | 删一/多条(`?f=` 多值) |
+| `hexists` | GET | 是否存在 |
+| `hgetall` | GET | 全部值(scoped 仅自己的) |
+| `hkeys`/`hvals`/`hlen` | GET | 键 / 值 / 计数 |
+| `hincrby`/`hincrbyfloat` | GET | 原子 `$inc`(整数 / 浮点) |
+| `hmset` | POST | 批量写,body 为 `{id: {字段...}, ...}` |
+| `hmget` | GET | 批量取,`?f=` 多值,按输入顺序对齐(缺失为 null) |
+| `count` | POST | 计数(可带过滤器 body;scoped 叠加) |
+| `find` | POST | 查询数组(过滤器 body + `limit/skip/s/p`) |
+| `findone` | POST | 查询首条(无则 404) |
+| `watch` | GET | change stream → SSE 实时订阅 |
 
-## 安全件一 · `@`-绑定(上下文注入 + 防伪)
+## `@`-绑定(防伪造的身份注入)
 
-`@`-标记在主键 / 字段 / API 入参里被服务端替换:
+服务端为每个请求构造上下文:已验证的 JWT claims + 服务端注入的 `@key`(集合名)、`@field`(默认=记录键)、`@remoteAddr`、`@host`、`@method`、`@path`、`@rawQuery`。
 
-- `@uuid` / `@nanoid[N]`:服务端生成。
-- 其余 `@name`:从**已验证 JWT claim** 取;缺失即报错(fail-closed)。
-- 数字 claim 渲染成整数(规避科学计数法)。
+- 写入时,值里标了 `@uid` 等的字段由上下文填充,**客户端传来的 `@`-键一律剥除**——身份无法伪造。
+- 键里的 `@`-记号:`@uuid`/`@nanoid` 现场生成;`@<claim>` 取自 JWT。所以 `?f=@uid` 表示“我自己的那条记录”;对应 claim 缺失则**失败关闭**(拒绝)。
 
-**防伪**:建 param 表时**先删掉所有客户端送来的 `@`-前缀键**,再注入服务端的 `@key/@field/@remoteAddr/@host/@method/@path/@rawQuery` 与每个 JWT claim(`@<claim>`)。所以客户端无法用 `?@uid=别人` 顶替身份。
+## 行级隔离(owner scope)
 
-入参结构体里 `json:"@uid"` 的字段,就从注入的 `@uid` 填充。`mergeBody()` 把请求体的非 `@` 字段并进 param,`@`-上下文永远盖过它。
+Redis 时代靠 key 命名(如 `userInfo<uid>`)天然隔离;Mongo 没有键命名空间,隔离必须是显式谓词。
 
-## 安全件二 · 权限白名单
+- 声明:`dopdb.SetOwnerScope("orders", "owner", "uid")`(文档 `owner` 字段 == JWT claim `uid`)。TS:集合 `.ownerScope("owner")`。
+- 整集合读取(hgetall/hkeys/hlen/find/...)被强制 AND 上 `{owner: 我}`,客户端无法放宽。
+- 按键操作(hget/hset/hdel 的 scoped 版)用 `{_id, owner}` 交集 + 原子过滤 upsert,杜绝“先查再写”竞态;写他人 id → 403,读他人 id → 404。
+- 若集合声明了 scope 但请求无对应 claim → 一律拒绝。
 
-`command::collection::on/off`,键为 `"CMD::Coll"`,对应 doptime 的 `_permissions`(这里 key 是集合名):
+## 权限(默认拒绝)
+
+键为 `COMMAND::collection`,**默认拒绝**:未显式授权的组合一律 403。函数式 API 用 `API::<name>` 同样受门控。
 
 ```go
-perms := httpserve.NewPermissions(false /* 生产:AutoAuth 关 */)
-perms.Grant("HGET", "User")
-perms.Deny("HGETALL", "User")     // 显式 off 压过 AutoAuth
+p := httpserve.NewPermissions()      // 空集 = 全拒
+p.Grant("HGET", "users"); p.Grant("HSET", "users")
+p.Deny("DEL", "users")               // 显式拒(覆盖 Grant)
+p.SaveJSON("perm.json"); q, _ := httpserve.LoadJSON("perm.json")
 ```
 
-### 权限持久化
+> 已**移除 AutoAuth**(首用即授权)。授权一律显式;集群可用共享集合承载同样的 Grant/Deny/Allowed。
 
-`Permissions` 默认内存驻留。启动时可从 JSON 文件恢复:
+## watch(change stream → SSE)
+
+`GET /api/watch/<coll>` 返回 `text/event-stream`,每个变更一行 `data: {"type","id","doc"}`。
+
+- owner-scope:管道按 `fullDocument.<owner>` 过滤;**delete 无 fullDocument,scoped 下不投递**。
+- 断线续传:Go 用 resume token 自动重连;TS 客户端发 `Last-Event-ID`,服务端 `resumeAfter`。
+- **需要 MongoDB 以副本集运行**(change stream 的前提)。
+
+## JWT
+
+`Authorization: Bearer <token>`。支持 **HS256**(HMAC 密钥)与 **RS256**(PEM/SPKI 公钥验签),拒绝 `none` 与未知算法;校验 `exp`。
+
+## 一行起服务(Go)
 
 ```go
-perms, err := httpserve.LoadJSON("perm.json")
-// err 时回退: perms = httpserve.NewPermissions(autoAuth)
-perms.Grant("HGET", "User")
-// 进程退出前保存
-perms.SaveJSON("perm.json")
+cfg, _ := config.Load("config.toml")            // 读所有 [[mongo]]
+log.Fatal(httpserve.Serve(cfg, httpserve.WithPermissions(perms)))
+// 连接所有数据源 → SetDatasources → NewHandler → CORS → ListenAndServe
 ```
-
-`LoadJSON` 载入的实例 `AutoAuth` 默认 false(生产安全)。
-## 安全件三 · owner 行级隔离
-
-Redis 靠 key 命名免费拿到隔离(`userInfo<uid>`);Mongo 没有 key 命名空间,隔离必须是显式谓词。两种模式:
-
-- **每键操作**(`HGET/HSET/HDEL/HEXISTS/HINCRBY`)对 scoped 集合:
-  - 读 → 经 `Find({_id:key} ∧ scope)`,别人的文档即使知道 id 也读不到(404)。
-  - 写 → **原子 scoped upsert**(`Store.PutScoped`):`updateOne({_id, owner:ownerVal}, {$set}, upsert)`;若 id 已被他人占有,过滤器不匹配 → upsert 尝试插入 → dup-key → `ErrForbidden`(403),**无 TOCTOU 窗口**。
-  - `HKEYS/HLEN` → scoped 版本返回**调用者本人**的键集/计数(不泄漏他人)。
-- 被 scope 但请求未带对应 claim ⇒ 401。
-
-
-## 错误 → HTTP 状态
-
-`ErrNoDoc`→404,`ErrForbidden`→403,词表外命令/坏 filter/坏入参→400,JWT 无效/scoped 未鉴权→401,集合未注册→404,API 端点未找到→404。
-
-## 装配
-
-```go
-dopdb.RegisterHttp(dopdb.New[string, *User](dopdb.WithCollection("User")))
-dopdb.RegisterHttp(dopdb.New[string, *Order](dopdb.WithCollection("Order")))
-dopdb.SetOwnerScope("Order", "owner", "uid")
-
-h := httpserve.NewHandler(httpserve.NewServer(jwtSecret), httpserve.NewPermissions(autoAuth))
-http.ListenAndServe(addr, h)
-```
-
-## API 端点(无 `-` 的路径)
-
-`api.Api(...)` 定义的端点,经 HTTP 走同一个 Handler:
-
-```go
-type EchoIn struct {
-    UID string `json:"@uid"`   // 从 JWT 注入
-    Msg string `json:"msg"`    // 从请求体
-}
-api.Api(func(in *EchoIn) (map[string]any, error) {
-    return map[string]any{"uid": in.UID, "msg": in.Msg}, nil
-}, api.WithName("echo"))
-```
-
-- 命名:`InDemo`→`api:demo`;客户端用 `/demo` 或 `/api:demo`。
-- 流水线(逐字保留 doptime):`解码 → ParamEnhancer → Validate → Func → ResultSaver → ResponseModifier`。
-- 入参经同一套 `@`-绑定(`json:"@uid"` 从 JWT 填)。
-- 也过权限白名单(`API::echo`)。
-- 本地直调:`ep.Func(&EchoIn{...})`,零 HTTP 开销。
-
-详见 `api/api.go` 与 `02` 配套测试 `httpserve/serve_test.go`、`httpserve/api_dispatch_test.go`。

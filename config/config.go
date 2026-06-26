@@ -7,7 +7,6 @@
 //	[http]
 //	addr           = ":8080"
 //	jwt_secret_env = "DOPTIME_JWT_SECRET"   # env var holding the HS256 key / RS256 PEM
-//	auto_auth      = false                  # dev-only grant-on-first-use; MUST be false in prod
 //	cors_origins   = ["https://app.example.com"]
 //
 //	[[mongo]]
@@ -25,7 +24,6 @@ package config
 import (
 	"fmt"
 	"os"
-	"strconv"
 	"strings"
 )
 
@@ -34,7 +32,6 @@ type HTTPConfig struct {
 	Addr         string
 	JWTSecretEnv string
 	JWTSecret    string // resolved from JWTSecretEnv at Load time; never read from the file
-	AutoAuth     bool
 	CORSOrigins  []string
 }
 
@@ -137,9 +134,6 @@ func (c *Config) Validate() error {
 // log these at startup.
 func (c *Config) Warnings() []string {
 	var w []string
-	if c.HTTP.AutoAuth {
-		w = append(w, "http.auto_auth is ON — grant-on-first-use; never run this in production")
-	}
 	for _, m := range c.Mongo {
 		if m.URIEnv == "" && strings.Contains(m.URI, "@") {
 			w = append(w, fmt.Sprintf("datasource %q has credentials in a literal uri — move it to %s via uri_env", m.Name, "an env var"))
@@ -209,12 +203,6 @@ func assignHTTP(h *HTTPConfig, key, val string, line int) error {
 		h.JWTSecretEnv = mustString(val)
 	case "jwt_secret":
 		h.JWTSecret = mustString(val) // dev only; prefer jwt_secret_env
-	case "auto_auth":
-		b, err := strconv.ParseBool(val)
-		if err != nil {
-			return fmt.Errorf("line %d: auto_auth must be true/false", line)
-		}
-		h.AutoAuth = b
 	case "cors_origins":
 		h.CORSOrigins = parseStringArray(val)
 	default:

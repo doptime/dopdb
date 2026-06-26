@@ -8,7 +8,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"path"
 	"strconv"
 	"strings"
 )
@@ -59,35 +58,30 @@ func (s *Server) parse(r *http.Request) (*ReqCtx, int, error) {
 	}
 	pathStr = strings.TrimRight(pathStr, "/")
 
-	// API route: anything under .../api/<name> is an API call (the name may
-	// contain dashes, unlike data commands). Default route is /api/<name>.
-	if idx := strings.Index(pathStr, "/api/"); idx >= 0 {
-		name := pathStr[idx+len("/api/"):]
-		if dec, derr := url.QueryUnescape(name); derr == nil {
-			name = dec
+	// Everything is routed under /api/:
+	//   data command:  /api/<cmd>/<coll>   (two segments; cmd ∈ the closed verb set)
+	//   api call:      /api/<name>         (one segment)
+	// The datasource is a query parameter (?ds=), never a path segment.
+	idx := strings.Index(pathStr, "/api/")
+	if idx < 0 {
+		return nil, http.StatusBadRequest, errors.New("url must be /api/<cmd>/<coll> (data) or /api/<name> (api)")
+	}
+	rest := strings.Trim(pathStr[idx+len("/api/"):], "/")
+	if rest == "" {
+		return nil, http.StatusBadRequest, errors.New("url missing command/collection or api name")
+	}
+	parts := strings.Split(rest, "/")
+	for i := range parts {
+		if dec, derr := url.QueryUnescape(parts[i]); derr == nil {
+			parts[i] = dec
 		}
-		name = strings.Trim(name, "/")
-		if name == "" {
-			return nil, http.StatusBadRequest, errors.New("api route missing name (use /api/<name>)")
-		}
-		c.Cmd = "API"
-		c.Coll = name
+	}
+	if len(parts) >= 2 {
+		c.Cmd = strings.ToUpper(parts[0]) // data command
+		c.Coll = parts[1]
 	} else {
-		// Data command: the last path segment is CMD-KEY (must contain a dash).
-		last := path.Base(pathStr)
-		if last == "" || last == "/" || last == "." {
-			return nil, http.StatusBadRequest, errors.New("url missing command or collection")
-		}
-		decoded, derr := url.QueryUnescape(last)
-		if derr != nil {
-			return nil, http.StatusBadRequest, derr
-		}
-		cmdKey := strings.SplitN(decoded, "-", 2)
-		if len(cmdKey) == 1 {
-			return nil, http.StatusBadRequest, errors.New("data command must be CMD-KEY; API calls use /api/<name>")
-		}
-		c.Cmd = strings.ToUpper(cmdKey[0])
-		c.Coll = cmdKey[1]
+		c.Cmd = "API" // function endpoint
+		c.Coll = parts[0]
 	}
 	if c.Cmd == "" || c.Coll == "" {
 		return nil, http.StatusBadRequest, errors.New("url missing command or collection")

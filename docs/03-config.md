@@ -1,22 +1,20 @@
 # 03 · 配置(TOML · 环境变量密钥 · 装配)
 
-> `config` 包从 TOML 文件读运行配置,**密钥与带凭据的连接串只从环境变量取**(RL4),文件里只写「持有它的环境变量名」。无外部依赖(内置一个覆盖本 schema 的小 TOML reader),所以能在无 Mongo 环境下编译与测试。
+`config/`(Go)与 `ts/src/config.ts`(TS)读取同一套 TOML schema。两者都**不引入第三方依赖**(自带刚好覆盖本 schema 的小解析器),密钥与连接串一律从**环境变量**解析,绝不从文件读取明文。
 
-## 文件格式
-
-完整示例见仓库根 `config.toml.example`:
+## Schema
 
 ```toml
 [http]
 addr           = ":8080"
-jwt_secret_env = "DOPTIME_JWT_SECRET"    # 持有 HS256 密钥 / RS256 PEM 的环境变量名
-auto_auth      = false                   # 仅开发可 true;生产必须 false
+jwt_secret_env = "DOPTIME_JWT_SECRET"    # 持有 HS256 密钥 / RS256 PEM 公钥的环境变量名
 cors_origins   = ["https://app.example.com"]
 
+# 可写多个 [[mongo]];必须有一个 name = "default"
 [[mongo]]
-name    = "default"                      # 必须有一个 name="default"
-uri_env = "DOPTIME_MONGO_URI"            # 连接串环境变量(可含凭据);env 优先于 uri
-uri     = "mongodb://localhost:27017"    # 字面回退,仅开发
+name    = "default"
+uri_env = "DOPTIME_MONGO_URI"            # 持有连接串(可含账号密码)的环境变量名
+uri     = "mongodb://localhost:27017"    # 字面回退(仅开发);env 优先
 db      = "appdb"
 
 [[mongo]]
@@ -25,48 +23,39 @@ uri  = "mongodb://localhost:27017"
 db   = "analytics"
 ```
 
-## 解析规则
+> 已**移除 `auto_auth`**(随 AutoAuth 一起删除)。权限默认拒绝,授权一律显式(见 `02-http`)。
 
-- `jwt_secret_env` 指向的环境变量被读入 `HTTP.JWTSecret`;若该变量未设,回退到文件里的 `jwt_secret`(不推荐,仅开发)。
-- 每个 `[[mongo]]` 的 `uri_env` 指向的环境变量覆盖 `uri`;未设则用字面 `uri`。
-- 注释 `#` 在引号外才生效(`addr = "host#x:80"` 里的 `#` 不会被当注释)。
-- 支持的值类型:字符串、整数、浮点、布尔、字符串数组。
+## 解析与校验
 
-## 校验(Load 时强制)
+- `jwt_secret`:由 `jwt_secret_env` 指定的环境变量解析;为空则报错。
+- 每个 `[[mongo]]` 的 `uri`:`uri_env` 指定的环境变量优先,否则用字面 `uri`。
+- 校验:至少一个 `[[mongo]]`;必须存在 `name="default"`;名字唯一;每个源都要有 `uri` 与 `db`。
+- `Warnings()`:把“字面 uri 里带账号密码(应改用 `uri_env`)”等非致命风险列出,供启动时打印。
 
-- 至少一个 `[[mongo]]`,且必须有 `name="default"`。
-- 数据源名不重复,每个都有非空 `uri` 与 `db`。
-- 解析密钥后 `JWTSecret` 非空,否则报错(点名该填哪个环境变量)。
-
-## 非致命告警(`cfg.Warnings()`)
-
-启动时建议打印:`auto_auth` 开着会告警(生产别开);`uri` 字面串里含 `@`(疑似把凭据写进了文件)会告警建议改走 `uri_env`。
-
-## 装配进框架
+## 装配(Go)
 
 ```go
 cfg, err := config.Load("config.toml")
 if err != nil { log.Fatal(err) }
-for _, w := range cfg.Warnings() { log.Println("[config]", w) }
+for _, w := range cfg.Warnings() { log.Println("warn:", w) }
 
-ctx := context.Background()
-st, err := mongostore.NewFromSource(ctx, cfg.Default())   // 需 mongo 驱动
-if err != nil { log.Fatal(err) }
-dopdb.SetDefaultStore(st)
-dopdb.SetDefaultCodec(mongostore.BSONCodec{})
-
-// 注册集合、声明 owner-scope……(见 02-http.md)
-
-h := httpserve.NewHandler(
-    httpserve.NewServer(cfg.HTTP.JWTSecret),
-    httpserve.NewPermissions(cfg.HTTP.AutoAuth),
-)
-log.Fatal(http.ListenAndServe(cfg.HTTP.Addr, h))
+// 一行起服务:连接所有数据源 → SetDatasources → Handler → CORS → 监听
+log.Fatal(httpserve.Serve(cfg, httpserve.WithPermissions(perms)))
 ```
 
-多数据源(迁移期):`src, _ := cfg.Source("analytics")` → `mongostore.NewFromSource(ctx, src)` → 给某集合 `dopdb.WithStore(...)`。
+`httpserve.Serve` 内部用 `cfg.Mongo` 构造 `[]dopdb.DatasourceConfig` 调 `ConnectDatasources`,再 `SetDatasources`。请求用 `?ds=<name>` 选源,缺省 `default`。
 
-## 与 doptime 配置的差异
+## 装配(TS)
 
-- doptime 走 `github.com/doptime/config`(cfgredis/cfghttp),数据源是 Redis 服务器表;dopdb 的数据源是 Mongo `{uri, db}`。
-- doptime 部分配置用「环境变量里塞 JSON」(如 `HTTP={"AutoAuth":true}`);dopdb 统一用 TOML 文件 + 环境变量只放密钥,边界更清楚。
+```ts
+import { serveFromConfig, Permissions } from "dopdb/server";
+const perms = new Permissions().grant("HGET", "users").grant("HSET", "users");
+await serveFromConfig("config.toml", { schema, permissions: perms });
+// serveFromConfig 会把所有 [[mongo]] 作为数据源载入,并传入权限
+```
+
+## 相关环境变量
+
+- `DOPTIME_JWT_SECRET`(示例名):HS256 密钥或 RS256 PEM 公钥。
+- `DOPTIME_MONGO_URI`(示例名):默认数据源连接串。
+- `DOPDB_TEST_MONGO_URI`:**仅测试用**;设置后运行集成测试(watch 需副本集)。

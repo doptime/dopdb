@@ -1,234 +1,153 @@
-package dopdb_test
+package dopdb
 
 import (
-	"errors"
-	"strings"
+	"context"
+	"fmt"
+	"os"
 	"testing"
 	"time"
 
-	"github.com/doptime/dopdb"
-	"github.com/doptime/dopdb/memstore"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
-type User struct {
-	UID       string    `bson:"_id" json:"_id" index:"unique"`
-	Name      string    `bson:"name" json:"name" mod:"trim" validate:"required"`
-	Email     string    `bson:"email" json:"email" mod:"trim,lowercase" index:"1"`
-	Role      string    `bson:"role" json:"role" mod:"default=member"`
-	Token     string    `bson:"token" json:"token" mod:"nanoid"`
-	Logins    int64     `bson:"logins" json:"logins" mod:"counter"`
-	Age       int       `bson:"age" json:"age"`
-	CreatedAt time.Time `bson:"createdAt" json:"createdAt"`
-	UpdatedAt time.Time `bson:"updatedAt" json:"updatedAt"`
+// Integration tests run against a real MongoDB (the Store abstraction was
+// removed, so there is no in-memory backend to test against). They self-skip
+// unless DOPDB_TEST_MONGO_URI is set. Each test uses a throwaway database that is
+// dropped on cleanup.
+
+type itUser struct {
+	Name  string `json:"name" bson:"name"`
+	Email string `json:"email" bson:"email" index:"unique"`
+	Age   int    `json:"age" bson:"age" index:"1"`
 }
 
-func setup(t *testing.T) {
+func withTestDS(t *testing.T) func() {
 	t.Helper()
-	dopdb.SetDefaultStore(memstore.New())
-	dopdb.SetDefaultCodec(memstore.JSONCodec{})
-	dopdb.SetValidator(func(v any) error {
-		u, ok := v.(*User)
-		if ok && strings.TrimSpace(u.Name) == "" {
-			return errors.New("name required")
-		}
-		return nil
-	})
+	uri := os.Getenv("DOPDB_TEST_MONGO_URI")
+	if uri == "" {
+		t.Skip("set DOPDB_TEST_MONGO_URI to run integration tests")
+	}
+	cl, err := mongo.Connect(options.Client().ApplyURI(uri))
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	if err := cl.Ping(context.Background(), nil); err != nil {
+		t.Fatalf("ping: %v", err)
+	}
+	dbName := fmt.Sprintf("dopdb_it_%d", time.Now().UnixNano())
+	ds := NewDatasources()
+	ds.Add("default", cl.Database(dbName))
+	SetDatasources(ds)
+	return func() {
+		_ = cl.Database(dbName).Drop(context.Background())
+		_ = cl.Disconnect(context.Background())
+		SetDatasources(nil)
+	}
 }
 
-func TestSetGetRoundTrip(t *testing.T) {
-	setup(t)
-	users := dopdb.New[string, *User](dopdb.WithCollection("users"))
-	if users == nil {
-		t.Fatal("New returned nil")
-	}
-	if err := users.HSet("u1", &User{UID: "u1", Name: " Alice ", Email: " ALICE@X.COM "}); err != nil {
+func TestIntegrationCRUD(t *testing.T) {
+	defer withTestDS(t)()
+	users := New[string, *itUser](WithCollection("it_users"))
+
+	if err := users.HSet("u1", &itUser{Name: "Ada", Email: "ada@x.io", Age: 30}); err != nil {
 		t.Fatalf("HSet: %v", err)
 	}
 	got, err := users.HGet("u1")
 	if err != nil {
 		t.Fatalf("HGet: %v", err)
 	}
-	if got.Name != "Alice" {
-		t.Errorf("trim failed: %q", got.Name)
+	if got.Name != "Ada" || got.Age != 30 {
+		t.Errorf("got=%+v", got)
 	}
-	if got.Email != "alice@x.com" {
-		t.Errorf("trim,lowercase failed: %q", got.Email)
-	}
-	if got.Role != "member" {
-		t.Errorf("default failed: %q", got.Role)
-	}
-	if len(got.Token) != 21 {
-		t.Errorf("nanoid failed: %q (len %d)", got.Token, len(got.Token))
-	}
-	if got.Logins != 1 {
-		t.Errorf("counter failed: %d", got.Logins)
-	}
-	if got.CreatedAt.IsZero() || got.UpdatedAt.IsZero() {
-		t.Errorf("timestamps not set on write: created=%v updated=%v", got.CreatedAt, got.UpdatedAt)
-	}
-}
 
-func TestValidationOnWrite(t *testing.T) {
-	setup(t)
-	users := dopdb.New[string, *User](dopdb.WithCollection("users"))
-	if err := users.HSet("bad", &User{UID: "bad", Name: "   "}); err == nil {
-		t.Fatal("expected validation error on write (empty name)")
+	if ok, _ := users.HExists("u1"); !ok {
+		t.Error("HExists u1 should be true")
 	}
-}
+	if ok, _ := users.HExists("missing"); ok {
+		t.Error("HExists missing should be false")
+	}
 
-func TestSaveDerivesKey(t *testing.T) {
-	setup(t)
-	users := dopdb.New[string, *User](dopdb.WithCollection("users"))
-	if err := users.Save(&User{UID: "u7", Name: "Bob"}); err != nil {
-		t.Fatalf("Save: %v", err)
+	// HSetNX: first wins, second is a no-op.
+	if ins, _ := users.HSetNX("u1", &itUser{Name: "Other"}); ins {
+		t.Error("HSetNX on existing key should not insert")
 	}
-	got, err := users.HGet("u7")
-	if err != nil {
-		t.Fatalf("HGet after Save: %v", err)
+	if ins, _ := users.HSetNX("u2", &itUser{Name: "Bob", Email: "bob@x.io", Age: 25}); !ins {
+		t.Error("HSetNX on new key should insert")
 	}
-	if got.Name != "Bob" {
-		t.Errorf("got %q", got.Name)
-	}
-}
 
-func TestNotFound(t *testing.T) {
-	setup(t)
-	users := dopdb.New[string, *User](dopdb.WithCollection("users"))
-	if _, err := users.HGet("nope"); !errors.Is(err, dopdb.ErrNoDoc) {
-		t.Fatalf("expected ErrNoDoc, got %v", err)
-	}
-}
-
-func TestSetNX(t *testing.T) {
-	setup(t)
-	users := dopdb.New[string, *User](dopdb.WithCollection("users"))
-	ins, err := users.HSetNX("u1", &User{UID: "u1", Name: "First"})
-	if err != nil || !ins {
-		t.Fatalf("first SetNX should insert: ins=%v err=%v", ins, err)
-	}
-	ins, err = users.HSetNX("u1", &User{UID: "u1", Name: "Second"})
-	if err != nil || ins {
-		t.Fatalf("second SetNX should not insert: ins=%v err=%v", ins, err)
-	}
-	got, _ := users.HGet("u1")
-	if got.Name != "First" {
-		t.Errorf("value overwritten: %q", got.Name)
-	}
-}
-
-func TestBatchAndEnumerate(t *testing.T) {
-	setup(t)
-	users := dopdb.New[string, *User](dopdb.WithCollection("users"))
-	_ = users.HMSet(map[string]*User{
-		"a": {UID: "a", Name: "A"},
-		"b": {UID: "b", Name: "B"},
-		"c": {UID: "c", Name: "C"},
-	})
-	if n, _ := users.HLen(); n != 3 {
-		t.Fatalf("HLen=%d", n)
+	if n, _ := users.HLen(); n != 2 {
+		t.Errorf("HLen=%d want 2", n)
 	}
 	keys, _ := users.HKeys()
-	if len(keys) != 3 {
-		t.Fatalf("HKeys=%v", keys)
+	if len(keys) != 2 {
+		t.Errorf("HKeys=%v", keys)
 	}
-	vals, err := users.HMGet("a", "zzz", "c")
+
+	if err := users.HDel("u1"); err != nil {
+		t.Fatalf("HDel: %v", err)
+	}
+	if _, err := users.HGet("u1"); err != ErrNoDoc {
+		t.Errorf("HGet after delete err=%v want ErrNoDoc", err)
+	}
+}
+
+func TestIntegrationMGetMSet(t *testing.T) {
+	defer withTestDS(t)()
+	users := New[string, *itUser](WithCollection("it_users_m"))
+
+	if err := users.HMSet(map[string]*itUser{
+		"a": {Name: "A", Email: "a@x.io"},
+		"b": {Name: "B", Email: "b@x.io"},
+	}); err != nil {
+		t.Fatalf("HMSet: %v", err)
+	}
+	got, err := users.HMGet("a", "missing", "b")
 	if err != nil {
 		t.Fatalf("HMGet: %v", err)
 	}
-	if vals[0] == nil || vals[0].Name != "A" {
-		t.Errorf("HMGet[0]=%v", vals[0])
+	if len(got) != 3 {
+		t.Fatalf("HMGet len=%d want 3", len(got))
 	}
-	if vals[1] != nil {
-		t.Errorf("HMGet missing should be nil, got %v", vals[1])
+	if got[0] == nil || got[0].Name != "A" {
+		t.Errorf("got[0]=%+v", got[0])
 	}
-	if ok, _ := users.HExists("b"); !ok {
-		t.Error("HExists(b) false")
+	if got[1] != nil {
+		t.Errorf("got[1] should be nil (missing), got %+v", got[1])
 	}
-	_ = users.HDel("b")
-	if ok, _ := users.HExists("b"); ok {
-		t.Error("HDel didn't remove b")
+	if got[2] == nil || got[2].Name != "B" {
+		t.Errorf("got[2]=%+v", got[2])
 	}
 }
 
-func TestIncrAtomicField(t *testing.T) {
-	setup(t)
-	type Counter struct {
-		ID string `bson:"_id" json:"_id"`
-		N  int64  `bson:"n" json:"n"`
-	}
-	c := dopdb.New[string, *Counter](dopdb.WithCollection("counters"))
-	for i := 0; i < 5; i++ {
-		if err := c.HIncrBy("hits", "n", 1); err != nil {
-			t.Fatalf("HIncrBy: %v", err)
+func TestIntegrationFindAndAtomicIncr(t *testing.T) {
+	defer withTestDS(t)()
+	users := New[string, *itUser](WithCollection("it_users_f"))
+
+	for i, u := range []*itUser{
+		{Name: "x", Email: "x@x.io", Age: 20},
+		{Name: "y", Email: "y@x.io", Age: 40},
+		{Name: "z", Email: "z@x.io", Age: 40},
+	} {
+		if err := users.HSet(fmt.Sprintf("k%d", i), u); err != nil {
+			t.Fatalf("HSet: %v", err)
 		}
 	}
-	got, err := c.HGet("hits")
-	if err != nil {
-		t.Fatalf("HGet: %v", err)
-	}
-	if got.N != 5 {
-		t.Errorf("counter=%d want 5", got.N)
-	}
-}
 
-func TestFindAndSanitize(t *testing.T) {
-	setup(t)
-	users := dopdb.New[string, *User](dopdb.WithCollection("users"))
-	_ = users.HSet("a", &User{UID: "a", Name: "Ann", Age: 30})
-	_ = users.HSet("b", &User{UID: "b", Name: "Bo", Age: 17})
-	_ = users.HSet("c", &User{UID: "c", Name: "Cy", Age: 41})
-
-	adults, err := users.Find(dopdb.M{"age": dopdb.M{"$gte": 18}}, dopdb.FindOpt{})
+	out, err := users.Find(M{"age": 40}, FindOpt{SortKeys: []SortKey{{Field: "name", Asc: true}}})
 	if err != nil {
 		t.Fatalf("Find: %v", err)
 	}
-	if len(adults) != 2 {
-		t.Fatalf("expected 2 adults, got %d", len(adults))
+	if len(out) != 2 || out[0].Name != "y" || out[1].Name != "z" {
+		t.Errorf("Find age=40 => %+v", out)
 	}
-	if _, err = users.Find(dopdb.M{"$where": "while(true){}"}, dopdb.FindOpt{}); err == nil {
-		t.Fatal("sanitizer let $where through")
-	}
-	if _, err = users.Find(dopdb.M{"x": dopdb.M{"$function": "..."}}, dopdb.FindOpt{}); err == nil {
-		t.Fatal("sanitizer let $function through")
-	}
-}
 
-func TestIntKey(t *testing.T) {
-	setup(t)
-	// _id is always a canonical string in dopdb, so a non-string id is kept as
-	// an ordinary field; the int key still round-trips via HKeys.
-	type Item struct {
-		ID   int    `bson:"itemId" json:"itemId"`
-		Name string `bson:"name" json:"name"`
+	// HIncrBy is a true atomic $inc on a numeric field.
+	if err := users.HIncrBy("k0", "age", 5); err != nil {
+		t.Fatalf("HIncrBy: %v", err)
 	}
-	items := dopdb.New[int, *Item](dopdb.WithCollection("items"))
-	_ = items.HSet(42, &Item{ID: 42, Name: "answer"})
-	got, err := items.HGet(42)
-	if err != nil {
-		t.Fatalf("HGet int key: %v", err)
-	}
-	if got.Name != "answer" {
-		t.Errorf("got %q", got.Name)
-	}
-	keys, _ := items.HKeys()
-	if len(keys) != 1 || keys[0] != 42 {
-		t.Errorf("HKeys=%v", keys)
-	}
-}
-
-func TestStructValue(t *testing.T) {
-	setup(t)
-	type Note struct {
-		ID   string `bson:"_id" json:"_id"`
-		Text string `bson:"text" json:"text" mod:"trim"`
-	}
-	notes := dopdb.New[string, Note](dopdb.WithCollection("notes"))
-	_ = notes.HSet("n1", Note{ID: "n1", Text: "  hi  "})
-	got, err := notes.HGet("n1")
-	if err != nil {
-		t.Fatalf("HGet: %v", err)
-	}
-	if got.Text != "hi" {
-		t.Errorf("trim on struct value failed: %q", got.Text)
+	g, _ := users.HGet("k0")
+	if g.Age != 25 { // 20 + 5
+		t.Errorf("age after HIncrBy=%d want 25", g.Age)
 	}
 }

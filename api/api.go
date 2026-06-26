@@ -8,11 +8,12 @@
 // (doptime additionally forwarded calls over a Redis stream "switch"; dopdb
 // drops that transport — endpoints are local + HTTP only.)
 //
-// The execution pipeline mirrors doptime's CallByMap exactly:
+// The execution pipeline is intentionally minimal:
 //
-//	decode input -> ParamEnhancer -> Validate -> Func -> ResultSaver -> ResponseModifier
+//	decode input -> Validate -> Func
 //
-// Input is decoded from the merged HTTP param map (query + body + @-context), so
+// (doptime's longer hook chain — ParamEnhancer/ResultSaver/ResponseModifier — is
+// dropped.) Input is decoded from the merged HTTP param map (query + body + @-context), so
 // fields tagged json:"@uid" etc. are filled from the verified JWT, never the
 // client — the same non-forgeable @-binding the data layer uses.
 package api
@@ -38,14 +39,8 @@ type Ctx[i any, o any] struct {
 	Name string
 	Func func(in i) (o, error)
 
-	// Validate runs after ParamEnhancer (default: the framework validator).
+	// Validate runs before Func (default: the framework validator).
 	Validate func(v any) error
-	// ParamEnhancer rewrites/fills the input before validation and execution.
-	ParamEnhancer func(in i) (i, error)
-	// ResultSaver persists the result after a successful call (errors ignored).
-	ResultSaver func(in i, ret o) error
-	// ResponseModifier transforms the value returned to the caller.
-	ResponseModifier func(in i, ret o) (any, error)
 
 	iIsPtr bool
 	iElem  reflect.Type
@@ -99,27 +94,12 @@ func (c *Ctx[i, o]) CallByMap(_ context.Context, params map[string]any, body []b
 	if err != nil {
 		return nil, err
 	}
-	if c.ParamEnhancer != nil {
-		if in, err = c.ParamEnhancer(in); err != nil {
-			return nil, err
-		}
-	}
 	if c.Validate != nil {
 		if err = c.Validate(c.validationTarget(in)); err != nil {
 			return nil, err
 		}
 	}
-	ret, err := c.Func(in)
-	if err != nil {
-		return nil, err
-	}
-	if c.ResultSaver != nil {
-		_ = c.ResultSaver(in, ret)
-	}
-	if c.ResponseModifier != nil {
-		return c.ResponseModifier(in, ret)
-	}
-	return ret, nil
+	return c.Func(in)
 }
 
 // decodeInput builds the typed input from the merged param map via a JSON
@@ -270,41 +250,7 @@ func apiNameByType(t reflect.Type) string {
 // routing). A client may call /api/Demo or /api/demo interchangeably.
 func normalizeName(s string) string { return cleanName(s) }
 
-// ----------------------------------------------------------------------------
-// dynamic (non-Go) endpoints — used to bridge JS/TS handlers from WASM
-// ----------------------------------------------------------------------------
-
-// DynamicFunc is a non-generic endpoint body supplied at runtime by a non-Go
-// caller (e.g. a JS/TS function bridged in through WASM). It receives the same
-// merged param map and raw body the typed pipeline would, and returns the value
-// to send back.
-type DynamicFunc func(ctx context.Context, params map[string]any, body []byte) (any, error)
-
-type dynamicCtx struct {
-	name string
-	fn   DynamicFunc
-}
-
-func (d *dynamicCtx) APIName() string { return d.name }
-func (d *dynamicCtx) CallByMap(ctx context.Context, params map[string]any, body []byte) (any, error) {
-	return d.fn(ctx, params, body)
-}
-
-// RegisterDynamic registers a name -> function endpoint whose body is supplied
-// at runtime (the WASM bridge uses this to expose JS/TS handlers). The HTTP
-// route is /api/<name>; the name is taken literally (only lower-cased).
-// Returns the registered name. Panics on duplicate.
-func RegisterDynamic(name string, fn DynamicFunc) string {
-	n := cleanName(name)
-	if n == "" {
-		panic("api: RegisterDynamic requires a non-empty name")
-	}
-	register(&dynamicCtx{name: n, fn: fn})
-	return n
-}
-
-// Unregister removes an endpoint by name (used by dynamic runtimes that
-// re-register, e.g. hot-reloading JS handlers). No-op if absent.
+// Unregister removes an endpoint by name. No-op if absent.
 func Unregister(name string) {
 	registryMu.Lock()
 	delete(registry, normalizeName(name))
