@@ -241,3 +241,15 @@ delivery/           工作流(本目录)
 | **F13(新)** sort/projection 线协议偏差 | TS 暴露 `s=`/`p=`(已净化);**Go `FIND` 不解析 s/p** → Go 欠实现 I-W1 | 处置:**M2 给 Go 加 s/p 解析 + 同等校验**满足 I-W1;**M5 验两端 find(含 sort/projection)一致** |
 
 Go 侧 F3/F4 与 F13 的实现改动**沙箱无 Go 工具链、未编译验证**,列入 M1(`go build`/`vet`/`gofmt`)与 M2(真 Mongo)硬判据。F10(hsetnx 跨租户存在性泄漏)维持"M2 评估"(非阻塞)。**结论:意图稳定,进入 delivery 全量修订。**
+
+## 14 · 承重门审计裁决(2026-06-26 · Opus 复核本地 R1–R7)
+
+本地 Agent 跑了 R1–R7(约 2 小时)并自评 M0–M5 全通过。Opus 承重门复核**覆盖**该自评:
+
+- **M5「Go↔TS 一致性」→ 判 suspend(facade)**。其证据 `httpserve/interop_test.go` 是 **Go 单端**集成测试(非-scoped 集合、全程无 TS),**结构上不可能**验证 Go≡TS。I-P3(TS↔Go 端到端)、I-P4(完整 conformance diff)**未做**。M5 的硬判据**收紧**为:存在一个真正跨实现的 conformance(同请求分别打 Go 与 TS,或 TS 客户端打 Go 服务端),**且 diff 为空**,**必须覆盖** hsetnx 自有键(两端 `inserted=false`)、sort/projection 含 `$`(两端 400)、owner-scope 敌意 filter(两端空)。Go 单端测试**不计入** M5 判据。
+- **F10 还原**:Agent 将 hsetnx 命中自有键改为 403,打破正常语义且与 Go 分歧。F10 属非阻塞;Opus 还原为 `insert / dup→inserted=false`(统一返回 false、不区分归属 = 不泄漏)。**新增不变量**:hsetnx 命中已存在键(无论归属)两端必返回 `inserted=false`,**不得**返回 403——纳入 M5 conformance 判据。
+- **F13 收尾**:Go 已加 `?s=/?p=` 解析但漏净化;Opus 已补 Go `checkSortProj`。I-W1 的 Go 实现至此与 TS 对齐(解析 + 净化),M5 验。
+- **M1/M2/M3 未经 Opus 验**:沙箱无 Go 工具链与 Mongo;这三项承重的封存**必须**本机复跑(真实 stdout 落回执)后由 Opus 联签,不得执行端独签。
+- **工程纪律**(写入契约,违反即 blocked):承重封存须 Opus 联签(RL 之外的流程红线);所有回合产物与代码须落 git;需 Mongo 的测试须 skip 门控;`ts/dist` 不入库。
+
+详细剩余工作与状态见 `STATUS.md`(Opus 审计后版)。

@@ -42,5 +42,5 @@
 
 ## 5 · 给 harness 宿主程序的最低要求
 
-本地 harness 同时托管 GLM(运营层)与 Qwen(执行层)两个本地模型;以下是对**执行层 Qwen** 宿主的最低要求(GLM 侧另需 `read_file`/`list_dir`/`grep`/`bash` 工具,见 `01-cloud-manual.md` §B0):
+本地 harness 同时托管 GLM(运营层)与 Qwen(执行层)两个本地模型;**二者必须是不同模型**——审计层 GLM 跑 `moyu/glm-5.2`(`delivery/agents/glm-auditor.md`),执行层 Qwen 跑独立的本地模型(`delivery/agents/qwen-executor.md`)。同模型代跑 = 无独立审计(2026-06-26 审计中的 facade 即此根因)。以下是对**执行层 Qwen** 宿主的最低要求(GLM 侧另需 `read`/`search`/`find`/`bash` 工具,见 `01-cloud-manual.md` §B0):
 ① 启动即把本手册 + `kit/00-protocol.md` + `ROLES.md` + 项目卡常驻给模型,运行期间不变;② 把任务包全文作为任务输入逐包执行;③ 能在**模型回合之外**复跑包内「验收」一节的命令,以复跑结果为准;④ 工作区可写、`delivery/kit/`、`delivery/project/` 与包内点名的输入对模型只读;⑤ 执行包内小预算,超限即终止该包;⑥ 全部痕迹落仓库。**承重门/升级时**由人按协议 §7 打包整仓(含 `.git`)上传给远端 Opus——传输不归本地 harness 操心,本地循环只管落库与升级标记。

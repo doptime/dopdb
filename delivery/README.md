@@ -18,6 +18,10 @@ delivery/
 │  ├─ 00-protocol.md      四方契约:6 步、格式、红线、冻结、升级闸、打包(唯一权威)
 │  ├─ 01-cloud-manual.md  云端手册:上半=意图层 Opus(SOP),下半=运营层 GLM(SOP)
 │  └─ 02-local-manual.md  本地手册:执行层 Qwen 的执行循环与回执纪律
+├─ agents/          本地两层 agent 的模型绑定(omp 格式)── 审计层 ≠ 执行层
+│  ├─ glm-auditor.md      运营层 GLM:model moyu/glm-5.2(审计/封包/对账/出包)
+│  ├─ qwen-executor.md    执行层 Qwen:本地执行模型(≠ glm-5.2)
+│  └─ README.md           三种绑定法 + contextWindow/maxTokens + 放置位置
 ├─ project/         本项目慢变事实 + 全量意图清单(换项目换这一格)
 │  └─ 10-project-card-dopdb.md
 └─ rounds/          回合目录:一回合一目录
