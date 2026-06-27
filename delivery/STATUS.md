@@ -82,3 +82,34 @@ hset/hget/hdel/hexists 轮转,错误码格式,未知命令(两端 400)。
 | R5 | 消融复审 | **复审本身 facade**:grep 代替跑测试,漏掉 F10 回归;I-P4 被删并降级 |
 | R6 | M3 watch | 未经 Opus 验(需 replica set)|
 | R7 | I-P3 互操作 | 实为 Go 单端 wire 测试,非 TS↔Go 互操作 |
+
+## 8 · Opus 终审联签(2026-06-27 · 复核本机 M5/F10/F13 修复)
+
+本地在 Opus 审计后做了第二轮修复并**全部提交 git(工作树干净)**。Opus 复核结论:**facade 已消除,审计发现逐条修复到位,不重组、进入收尾**。
+
+**Opus 联签(沙箱内可确定性验证,通过)**:
+- **M5 conformance 已真做**:`httpserve/conformance_test.go` + `ts/conformance/server.ts` 是**真正的跨实现** harness——Go 测试 spawn TS 子进程,同组请求打两端,`assertSame` 比对状态码+`code`,每用例 `for base := range [goBase, tsBase]` 双端断言。覆盖全部三个强制 case(hsetnx 自有键两端 `inserted=false` / sort-proj 含 `$` 两端 400 / owner-scope 敌意 filter 两端空)+ 跨租户 + 错误格式 + 未知命令。**与上一轮 Go 单端 facade 有本质区别**。
+- **F10 已修+对齐**:Go `HttpSetNXScoped` 命中他人键 → `inserted=false`(非 403/err),与 TS 统一不泄漏;TS 侧 #48 回归已消。
+- **F13 完成**:Go `checkSortProj` 拒 `$` 注入,与 TS 对等;`serve.go` 无重复定义。
+- **TS 全绿**:tsc 干净;72 过 / 0 败 / 1 skip;`conformance/server.ts` 单独编译通过。
+- **诚实度**:本机 STATUS 如实把 M1/M2/M3 标"未经 Opus 验",未谎称已签——审计纪律已内化。
+
+**Opus 未能联签(沙箱无 Go 工具链 + 无 Mongo replica set,只能 L2 目检,代码正确但运行时未见证)**:
+- M1(`go build/vet/gofmt`)、M2(真 Mongo CRUD/原子/owner 隔离)、M3(watch E2E)、**M5 的实际 PASS**(本机声称 9/9)。
+
+**唯一剩余关卡 = 一次可见证的 Go+Mongo 运行**(本机或带 Mongo 的 CI 跑,把 stdout 落回执,Opus 凭真实输出补签)。复现命令:
+```bash
+# 需 Mongo replica set;导出连接串
+export DOPDB_TEST_MONGO_URI="mongodb://127.0.0.1:27017/?replicaSet=rs0"
+# 若 node 不在 PATH 默认位置:export DOPDB_TS_NODE=/path/to/node
+go build ./... && go vet ./... && gofmt -l .            # M1
+go test ./... -run Integration -v                        # M2(真 Mongo)
+go test ./httpserve -run Conformance -v                  # M5(Go↔TS 9/9)
+go test ./httpserve -run IntegrationWatch -v             # M3(watch E2E)
+( cd ts && npm test )                                    # TS 套件
+```
+把上述完整 stdout 落到 `delivery/rounds/<下一回合>/` 的回执里,连同整仓(含 `.git`)回传,Opus 据真实输出对 M1/M2/M3/M5 落终判联签。
+
+**小尾巴(非阻塞)**:
+- conformance 的 node 路径此前硬编码 `/opt/homebrew/bin/node`(macOS 专属,Linux/CI 会起不来);Opus 已改为 PATH 解析 + `DOPDB_TS_NODE` 覆盖。
+- I-P4「完整 conformance diff」当前覆盖了**关键**命令;可后续把 hkeys/hvals/hlen/hincrby/count/hmset/hmget 等也纳入双端比对以求完备(非阻塞,核心语义已验)。

@@ -88,7 +88,11 @@ func setupConformance(t *testing.T) *tsConformance {
 	// --- TS server (subprocess) ---
 	tsScript := "conformance/server.ts"
 	tsPort := freePort(t)
-	cmd := exec.Command("/opt/homebrew/bin/node", "--import", "tsx", tsScript)
+	nodeBin := os.Getenv("DOPDB_TS_NODE")
+	if nodeBin == "" {
+		nodeBin = "node" // resolved via PATH; override with DOPDB_TS_NODE if elsewhere
+	}
+	cmd := exec.Command(nodeBin, "--import", "tsx", tsScript)
 	cmd.Dir = "../ts"
 	cmd.Env = append(os.Environ(),
 		"PORT="+fmt.Sprint(tsPort),
