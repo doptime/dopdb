@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/doptime/dopdb"
 	"github.com/doptime/dopdb/api"
@@ -47,6 +48,28 @@ const (
 	defaultLimit = 100     // FIND with no/invalid limit is capped here
 	maxLimit     = 1000    // an explicit FIND limit is clamped to this
 )
+
+// checkSortProj rejects sort/projection objects whose keys contain '$' (e.g.
+// '$where') or whose values are neither number nor boolean. Mirrors
+// ts/src/server.ts checkSortProj.
+func checkSortProj(v any, what string) error {
+	om, ok := v.(map[string]any)
+	if !ok {
+		return fmt.Errorf("invalid ?%s=: expected JSON object", what)
+	}
+	for k, val := range om {
+		if strings.Contains(k, "$") {
+			return fmt.Errorf("invalid ?%s= field %q (contains $)", what, k)
+		}
+		switch val.(type) {
+		case float64, bool: // JSON numbers decode to float64
+			continue
+		default:
+			return fmt.Errorf("invalid ?%s= value for %q (expected number or boolean)", what, k)
+		}
+	}
+	return nil
+}
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// F4: cap the request body. Reads beyond the ceiling fail in parse() (which
@@ -247,15 +270,24 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 			opt.Skip = s
 		}
 		// F13: parse sort (?s=<json>) and projection (?p=<json>) — mirrors TS.
+		// F5/F13: validate sort/projection to reject $-operator injection.
 		if sv := c.Queries.Get("s"); sv != "" {
 			if err := json.Unmarshal([]byte(sv), &opt.Sort); err != nil {
 				writeErr(w, http.StatusBadRequest, "validation", fmt.Errorf("invalid ?s= JSON: %w", err))
+				return
+			}
+			if err := checkSortProj(opt.Sort, "s"); err != nil {
+				writeErr(w, http.StatusBadRequest, "validation", err)
 				return
 			}
 		}
 		if pv := c.Queries.Get("p"); pv != "" {
 			if err := json.Unmarshal([]byte(pv), &opt.Projection); err != nil {
 				writeErr(w, http.StatusBadRequest, "validation", fmt.Errorf("invalid ?p= JSON: %w", err))
+				return
+			}
+			if err := checkSortProj(opt.Projection, "p"); err != nil {
+				writeErr(w, http.StatusBadRequest, "validation", err)
 				return
 			}
 		}

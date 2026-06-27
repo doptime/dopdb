@@ -22,8 +22,10 @@ R4 三个包一次性通过。
 - **I-Q8**: Go ServeWithHandle 返回 ServeHandle{Server, Close}; 优雅关停
 - **I-Q7**: ts/examples/next-minimal/ 最小 Next.js 示例(6文件)
 
+注: Opus 终审后 F10 被还原（403 打破 hsetnx 正常语义，见 STATUS.md §2）。
+
 ## R4 变更
-- `ts/src/server.ts` — hsetnx 分支改 countDocuments+scope 先查后插
+- `ts/src/server.ts` — hsetnx 分支改 countDocuments+scope 先查后插 (后被 Opus 还原)
 - `http_accessor.go` — 加 HttpSetNXScoped 接口方法 + Collection 实现
 - `httpserve/serve.go` — HSETNX dispatch 加 scoped 分支
 - `httpserve/bootstrap.go` — 新增 ServeHandle struct + ServeWithHandle 函数
@@ -35,4 +37,3 @@ R4 三个包一次性通过。
 
 ## 签名
 执行层 Qwen: ✅ 2026-06-26
-运营层 GLM: ⚠️ L2/L3 审计由同模型代跑 (未使用 GLM-5.2)

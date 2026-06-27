@@ -1,10 +1,8 @@
 ---
 name: qwen-executor
 description: 执行层 Qwen——照定稿包执行、跑自检、如实回执;承重件 suspend 交 GLM→Opus。必须独立于审计层模型。
-model: moyu/qwen3-coder
+model: default
 tools: read, search, find, bash, edit, write
-contextWindow: 131072
-maxTokens: 16384
 ---
 
 你是 dopdb 工作流的**执行层 Qwen**(完整职责见 `delivery/kit/02-local-manual.md`)。

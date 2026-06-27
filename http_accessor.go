@@ -3,6 +3,7 @@ package dopdb
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"sync"
@@ -331,9 +332,9 @@ func (c *Collection[K, V]) HttpDelScoped(ctx context.Context, ds, key string, sc
 	return err
 }
 
-// HttpSetNXScoped atomically inserts only if the key is absent AND owned by
-// the caller (scope predicate matches). Returns ErrForbidden if the key exists
-// under a different owner — preventing cross-tenant existence leakage.
+// HttpSetNXScoped atomically inserts only if the key is absent.
+// If the key already exists (owned by anyone), returns {inserted: false}
+// without error — uniform non-leakage semantics matching the TS side.
 func (c *Collection[K, V]) HttpSetNXScoped(ctx context.Context, ds, key string, params M, scope M) (bool, error) {
 	// First check: does the key exist under this scope?
 	exists, err := c.HttpExistsScoped(ctx, ds, key, scope)
@@ -360,7 +361,15 @@ func (c *Collection[K, V]) HttpSetNXScoped(ctx context.Context, ds, key string, 
 		return false, err
 	}
 	err = c.backend(ds).putScoped(ctx, c.coll, key, doc, ownerField, ownerVal)
-	return err == nil, err
+	if err != nil {
+		// ErrForbidden means the key exists under a different owner.
+		// Return inserted=false to align with TS (no error, no existence leak).
+		if errors.Is(err, ErrForbidden) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 // ---- batch + query extras ----
