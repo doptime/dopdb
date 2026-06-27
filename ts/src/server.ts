@@ -512,7 +512,9 @@ function routeSegments(segs: string[]): RouteResult | null {
     try { return decodeURIComponent(x); } catch { return x; }
   });
   if (s.length === 0) return null;
-  if (s.length >= 2 && ROUTED_COMMANDS.has(s[0].toLowerCase())) {
+  // Any 2+ segment path is a data-command route (/api/<cmd>/<coll>).
+  // Unknown commands are caught at line 667 → 400 validation error.
+  if (s.length >= 2) {
     return { kind: "data", cmd: s[0].toLowerCase(), coll: s[1] };
   }
   return { kind: "api", name: s.join("/") };
