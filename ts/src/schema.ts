@@ -151,48 +151,60 @@ export type Shape = Record<string, Field<any, any, any>>;
 
 // ---- HTTP permission bitmask (mirrors Go dopdb.Perm) -----------------------
 // One bit per command in the closed vocabulary; use with collection.httpOn().
-export const HGet = 1 << 0;
-export const HSet = 1 << 1;
-export const HSetNX = 1 << 2;
-export const HDel = 1 << 3;
-export const Del = 1 << 4;
-export const HExists = 1 << 5;
-export const HGetAll = 1 << 6;
-export const HKeys = 1 << 7;
-export const HVals = 1 << 8;
-export const HLen = 1 << 9;
-export const HIncrBy = 1 << 10;
-export const HIncrByFloat = 1 << 11;
-export const HMSet = 1 << 12;
-export const HMGet = 1 << 13;
-export const Count = 1 << 14;
-export const Find = 1 << 15;
-export const FindOne = 1 << 16;
-export const Watch = 1 << 17;
-export const HScan = 1 << 18;
-export const HScanNoValues = 1 << 19;
-export const HRandField = 1 << 20;
-export const StrGet = 1 << 21;
-export const StrSet = 1 << 22;
-export const StrSetAll = 1 << 23;
-export const StrGetAll = 1 << 24;
-export const StrDel = 1 << 25;
-export const SAdd = 1 << 26;
-export const SRem = 1 << 27;
-export const SMembers = 1 << 28;
-export const SIsMember = 1 << 29;
-export const SCard = 1 << 30;
+export const HGet = 1n << 0n;
+export const HSet = 1n << 1n;
+export const HSetNX = 1n << 2n;
+export const HDel = 1n << 3n;
+export const Del = 1n << 4n;
+export const HExists = 1n << 5n;
+export const HGetAll = 1n << 6n;
+export const HKeys = 1n << 7n;
+export const HVals = 1n << 8n;
+export const HLen = 1n << 9n;
+export const HIncrBy = 1n << 10n;
+export const HIncrByFloat = 1n << 11n;
+export const HMSet = 1n << 12n;
+export const HMGet = 1n << 13n;
+export const Count = 1n << 14n;
+export const Find = 1n << 15n;
+export const FindOne = 1n << 16n;
+export const Watch = 1n << 17n;
+export const HScan = 1n << 18n;
+export const HScanNoValues = 1n << 19n;
+export const HRandField = 1n << 20n;
+export const StrGet = 1n << 21n;
+export const StrSet = 1n << 22n;
+export const StrSetAll = 1n << 23n;
+export const StrGetAll = 1n << 24n;
+export const StrDel = 1n << 25n;
+export const SAdd = 1n << 26n;
+export const SRem = 1n << 27n;
+export const SMembers = 1n << 28n;
+export const SIsMember = 1n << 29n;
+export const SCard = 1n << 30n;
+export const LPush = 1n << 31n;
+export const RPush = 1n << 32n;
+export const LPop = 1n << 33n;
+export const RPop = 1n << 34n;
+export const LRange = 1n << 35n;
+export const LLen = 1n << 36n;
+export const LIndex = 1n << 37n;
+export const LSet = 1n << 38n;
+export const LRem = 1n << 39n;
+export const LTrim = 1n << 40n;
+export const LInsertBefore = 1n << 41n;
+export const LInsertAfter = 1n << 42n;
 /** Every non-mutating command. */
 export const ReadOnly =
-  HGet | HExists | HGetAll | HKeys | HVals | HLen | HMGet | Count | Find | FindOne | Watch | HScan | HScanNoValues | HRandField | StrGet | StrGetAll | SMembers | SIsMember | SCard;
+  HGet | HExists | HGetAll | HKeys | HVals | HLen | HMGet | Count | Find | FindOne | Watch | HScan | HScanNoValues | HRandField | StrGet | StrGetAll | SMembers | SIsMember | SCard | LRange | LLen | LIndex;
 /** Every mutating command. */
-export const Writes = StrSet | StrSetAll | StrDel | SAdd | SRem | HSet | HSetNX | HDel | Del | HIncrBy | HIncrByFloat | HMSet;
+export const Writes = StrSet | StrSetAll | StrDel | LPush | RPush | LPop | RPop | LSet | LRem | LTrim | LInsertBefore | LInsertAfter | SAdd | SRem | HSet | HSetNX | HDel | Del | HIncrBy | HIncrByFloat | HMSet;
 /** Everything — the httpOn() debug default. */
 export const All = ReadOnly | Writes;
 /** doptime-compatible alias for All. */
 export const HashAll = All;
 /** Map an HTTP command string (upper-case) to its Perm bit. */
-export const CMD_BIT: Record<string, number> = {
+export const CMD_BIT: Record<string, bigint> = {
   HGET: HGet, HSET: HSet, HSETNX: HSetNX, HDEL: HDel, DEL: Del, HEXISTS: HExists,
   HGETALL: HGetAll, HKEYS: HKeys, HVALS: HVals, HLEN: HLen, HINCRBY: HIncrBy,
   HINCRBYFLOAT: HIncrByFloat, HMSET: HMSet, HMGET: HMGet, COUNT: Count, FIND: Find,
@@ -205,7 +217,7 @@ export interface CollectionOpts {
   name?: string; // collection name (defaults to the variable name via define())
   ownerField?: string; // row-level owner scope field
   db?: string; // non-default datasource/database
-  httpPerm?: number; // HTTP command bitmask declared by .httpOn() (mirrors Go dopdb.Perm)
+  httpPerm?: bigint; // HTTP command bitmask declared by .httpOn() (mirrors Go dopdb.Perm)
 }
 
 export class Collection<S extends Shape> {
@@ -230,8 +242,8 @@ export class Collection<S extends Shape> {
    * call — doptime/redisdb style. No arguments enables EVERYTHING (the debug
    * default); tighten later, e.g. `.httpOn(HGet | HGetAll | HSet | HDel)` or
    * `.httpOn(ReadOnly)`. Mirrors the Go `Collection.HttpOn(...dopdb.Perm)`. */
-  httpOn(...perms: number[]): Collection<S> {
-    const p = perms.length ? perms.reduce((a, b) => a | b, 0) : All;
+  httpOn(...perms: bigint[]): Collection<S> {
+    const p = perms.length ? perms.reduce((a, b) => a | b, 0n) : All;
     return new Collection(this.shape, { ...this.opts, httpPerm: p });
   }
 }

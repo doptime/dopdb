@@ -75,8 +75,9 @@ func setupConformance(t *testing.T) *tsConformance {
 	// Mirror the TS schema: notes (scoped) + items (plain).
 	dopdb.RegisterHttp(dopdb.New[string, confDoc](dopdb.WithCollection("notes")))
 	dopdb.RegisterHttp(dopdb.New[string, confItem](dopdb.WithCollection("items")))
-	dopdb.NewString[string](dopdb.WithCollection("strvals")).HttpOn() // String family (STR*), non-scoped
-	dopdb.NewSet[string](dopdb.WithCollection("setvals")).HttpOn()    // Set family (S*), non-scoped
+	dopdb.NewString[string](dopdb.WithCollection("strvals")).HttpOn()        // String family (STR*), non-scoped
+	dopdb.NewSet[string](dopdb.WithCollection("setvals")).HttpOn()           // Set family (S*), non-scoped
+	dopdb.NewList[string, string](dopdb.WithCollection("listvals")).HttpOn() // List family (L*/R*), non-scoped
 	dopdb.SetOwnerScope("notes", "owner", "uid")
 	perms := NewPermissions()
 	for _, c := range []string{
@@ -735,4 +736,130 @@ func TestConformanceSet(t *testing.T) {
 	if boolField(gb, "member") != false || boolField(gb, "member") != boolField(tb, "member") {
 		t.Errorf("sismember b after srem: Go=%v TS=%v", gb, tb)
 	}
+}
+
+// TestConformanceList: L*/R* family two-engine parity over listvals.
+func TestConformanceList(t *testing.T) {
+	c := setupConformance(t)
+	defer c.close()
+	tok := tokenFor(t, "alice")
+
+	// RPUSH [a,b,c] then LRANGE 0 -1 == [a,b,c] on both engines.
+	for _, base := range []string{c.goBase, c.tsBase} {
+		if st, _ := httpCall(t, base, "POST", "/api/rpush/listvals?f=l1", tok, `{"items":["a","b","c"]}`); st != 200 {
+			t.Fatalf("rpush %s: %d", base, st)
+		}
+	}
+	_, gb := httpCall(t, c.goBase, "GET", "/api/lrange/listvals?f=l1&start=0&stop=-1", tok, "")
+	_, tb := httpCall(t, c.tsBase, "GET", "/api/lrange/listvals?f=l1&start=0&stop=-1", tok, "")
+	if !sliceEq(toStrSlice(gb), toStrSlice(tb)) {
+		t.Errorf("lrange: Go=%v TS=%v", gb, tb)
+	}
+	if got := toStrSlice(gb); len(got) != 3 || got[0] != "a" || got[2] != "c" {
+		t.Errorf("lrange content: %v", got)
+	}
+
+	// LLEN 3.
+	_, gb = httpCall(t, c.goBase, "GET", "/api/llen/listvals?f=l1", tok, "")
+	_, tb = httpCall(t, c.tsBase, "GET", "/api/llen/listvals?f=l1", tok, "")
+	if numField(gb, "len") != 3 || numField(gb, "len") != numField(tb, "len") {
+		t.Errorf("llen: Go=%v TS=%v", gb, tb)
+	}
+
+	// LINDEX 0 -> a, LINDEX -1 -> c.
+	_, gb = httpCall(t, c.goBase, "GET", "/api/lindex/listvals?f=l1&index=0", tok, "")
+	_, tb = httpCall(t, c.tsBase, "GET", "/api/lindex/listvals?f=l1&index=0", tok, "")
+	if gb != "a" || gb != tb {
+		t.Errorf("lindex 0: Go=%v TS=%v", gb, tb)
+	}
+	_, gb = httpCall(t, c.goBase, "GET", "/api/lindex/listvals?f=l1&index=-1", tok, "")
+	_, tb = httpCall(t, c.tsBase, "GET", "/api/lindex/listvals?f=l1&index=-1", tok, "")
+	if gb != "c" || gb != tb {
+		t.Errorf("lindex -1: Go=%v TS=%v", gb, tb)
+	}
+
+	// LPOP -> a, RPOP -> c (atomic; both engines return the popped head/tail).
+	_, gb = httpCall(t, c.goBase, "GET", "/api/lpop/listvals?f=l1", tok, "")
+	_, tb = httpCall(t, c.tsBase, "GET", "/api/lpop/listvals?f=l1", tok, "")
+	if gb != "a" || gb != tb {
+		t.Errorf("lpop: Go=%v TS=%v", gb, tb)
+	}
+	_, gb = httpCall(t, c.goBase, "GET", "/api/rpop/listvals?f=l1", tok, "")
+	_, tb = httpCall(t, c.tsBase, "GET", "/api/rpop/listvals?f=l1", tok, "")
+	if gb != "c" || gb != tb {
+		t.Errorf("rpop: Go=%v TS=%v", gb, tb)
+	}
+
+	// After pop: [b]. LPUSH [z] -> [z,b].
+	for _, base := range []string{c.goBase, c.tsBase} {
+		httpCall(t, base, "POST", "/api/lpush/listvals?f=l1", tok, `{"items":["z"]}`)
+	}
+	_, gb = httpCall(t, c.goBase, "GET", "/api/lrange/listvals?f=l1&start=0&stop=-1", tok, "")
+	_, tb = httpCall(t, c.tsBase, "GET", "/api/lrange/listvals?f=l1&start=0&stop=-1", tok, "")
+	if !sliceEq(toStrSlice(gb), toStrSlice(tb)) {
+		t.Errorf("after lpush lrange: Go=%v TS=%v", gb, tb)
+	}
+	if got := toStrSlice(gb); len(got) != 2 || got[0] != "z" || got[1] != "b" {
+		t.Errorf("after lpush content: %v", got)
+	}
+
+	// LSET 0 X, then LINDEX 0 == X.
+	for _, base := range []string{c.goBase, c.tsBase} {
+		httpCall(t, base, "POST", "/api/lset/listvals?f=l1&index=0", tok, `{"item":"X"}`)
+	}
+	_, gb = httpCall(t, c.goBase, "GET", "/api/lindex/listvals?f=l1&index=0", tok, "")
+	_, tb = httpCall(t, c.tsBase, "GET", "/api/lindex/listvals?f=l1&index=0", tok, "")
+	if gb != "X" || gb != tb {
+		t.Errorf("lset/lindex: Go=%v TS=%v", gb, tb)
+	}
+
+	// LINSERTBEFORE pivot b item Y -> [X,Y,b]; LINSERTAFTER pivot b item W -> [X,Y,b,W].
+	for _, base := range []string{c.goBase, c.tsBase} {
+		httpCall(t, base, "POST", "/api/linsertbefore/listvals?f=l1", tok, `{"pivot":"b","item":"Y"}`)
+		httpCall(t, base, "POST", "/api/linsertafter/listvals?f=l1", tok, `{"pivot":"b","item":"W"}`)
+	}
+	_, gb = httpCall(t, c.goBase, "GET", "/api/lrange/listvals?f=l1&start=0&stop=-1", tok, "")
+	_, tb = httpCall(t, c.tsBase, "GET", "/api/lrange/listvals?f=l1&start=0&stop=-1", tok, "")
+	want := []string{"X", "Y", "b", "W"}
+	if !sliceEq(toStrSlice(gb), want) {
+		t.Errorf("after linsert Go: %v want %v", toStrSlice(gb), want)
+	}
+	if !sliceEq(toStrSlice(tb), want) {
+		t.Errorf("after linsert TS: %v want %v", toStrSlice(tb), want)
+	}
+
+	// LREM 1 Y, then LTRIM 0 1 -> [X,b].
+	for _, base := range []string{c.goBase, c.tsBase} {
+		httpCall(t, base, "POST", "/api/lrem/listvals?f=l1&count=1", tok, `{"item":"Y"}`)
+		httpCall(t, base, "POST", "/api/ltrim/listvals?f=l1&start=0&stop=1", tok, "")
+	}
+	_, gb = httpCall(t, c.goBase, "GET", "/api/lrange/listvals?f=l1&start=0&stop=-1", tok, "")
+	_, tb = httpCall(t, c.tsBase, "GET", "/api/lrange/listvals?f=l1&start=0&stop=-1", tok, "")
+	want2 := []string{"X", "b"}
+	if !sliceEq(toStrSlice(gb), want2) {
+		t.Errorf("after lrem/ltrim Go: %v want %v", toStrSlice(gb), want2)
+	}
+	if !sliceEq(toStrSlice(tb), want2) {
+		t.Errorf("after lrem/ltrim TS: %v want %v", toStrSlice(tb), want2)
+	}
+}
+
+func toStrSlice(body any) []string {
+	arr, _ := body.([]any)
+	out := make([]string, len(arr))
+	for i, e := range arr {
+		out[i], _ = e.(string)
+	}
+	return out
+}
+func sliceEq(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

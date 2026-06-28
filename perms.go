@@ -9,7 +9,7 @@ import (
 // It mirrors doptime/redisdb's HttpOn(<flags>) model: a collection declares
 // WHICH commands the client may call, in one place, at definition time —
 // registration and authorization together, no per-command Grant bookkeeping.
-type Perm uint32
+type Perm uint64
 
 // One bit per command in the closed vocabulary (see httpserve.dataCommands).
 const (
@@ -44,14 +44,26 @@ const (
 	SMembers
 	SIsMember
 	SCard
+	LPush
+	RPush
+	LPop
+	RPop
+	LRange
+	LLen
+	LIndex
+	LSet
+	LRem
+	LTrim
+	LInsertBefore
+	LInsertAfter
 )
 
 // Convenience groups.
 const (
 	// ReadOnly = every non-mutating command.
-	ReadOnly Perm = HGet | HExists | HGetAll | HKeys | HVals | HLen | HMGet | Count | Find | FindOne | Watch | HScan | HScanNoValues | HRandField | StrGet | StrGetAll | SMembers | SIsMember | SCard
+	ReadOnly Perm = HGet | HExists | HGetAll | HKeys | HVals | HLen | HMGet | Count | Find | FindOne | Watch | HScan | HScanNoValues | HRandField | StrGet | StrGetAll | SMembers | SIsMember | SCard | LRange | LLen | LIndex
 	// Writes = every mutating command.
-	Writes Perm = HSet | HSetNX | HDel | Del | HIncrBy | HIncrByFloat | HMSet | StrSet | StrSetAll | StrDel | SAdd | SRem
+	Writes Perm = HSet | HSetNX | HDel | Del | HIncrBy | HIncrByFloat | HMSet | StrSet | StrSetAll | StrDel | SAdd | SRem | LPush | RPush | LPop | RPop | LSet | LRem | LTrim | LInsertBefore | LInsertAfter
 	// All = everything. This is the HttpOn() debug default.
 	All Perm = ReadOnly | Writes
 	// HashAll is a doptime-compatible alias for All.
@@ -68,6 +80,9 @@ var cmdPerm = map[string]Perm{
 	"HSCAN": HScan, "HSCANNOVALUES": HScanNoValues, "HRANDFIELD": HRandField,
 	"STRGET": StrGet, "STRSET": StrSet, "STRSETALL": StrSetAll, "STRGETALL": StrGetAll, "STRDEL": StrDel,
 	"SADD": SAdd, "SREM": SRem, "SMEMBERS": SMembers, "SISMEMBER": SIsMember, "SCARD": SCard,
+	"LPUSH": LPush, "RPUSH": RPush, "LPOP": LPop, "RPOP": RPop, "LRANGE": LRange,
+	"LLEN": LLen, "LINDEX": LIndex, "LSET": LSet, "LREM": LRem, "LTRIM": LTrim,
+	"LINSERTBEFORE": LInsertBefore, "LINSERTAFTER": LInsertAfter,
 }
 
 var (
@@ -132,7 +147,7 @@ func HttpPermNames(p Perm) []string {
 		{HMSet, "hmset"}, {HMGet, "hmget"}, {Count, "count"}, {Find, "find"},
 		{FindOne, "findone"}, {Watch, "watch"},
 		{HScan, "hscan"}, {HScanNoValues, "hscannovalues"}, {HRandField, "hrandfield"},
-		{StrGet, "strget"}, {StrSet, "strset"}, {StrSetAll, "strsetall"}, {StrGetAll, "strgetall"}, {StrDel, "strdel"}, {SAdd, "sadd"}, {SRem, "srem"}, {SMembers, "smembers"}, {SIsMember, "sismember"}, {SCard, "scard"},
+		{StrGet, "strget"}, {StrSet, "strset"}, {StrSetAll, "strsetall"}, {StrGetAll, "strgetall"}, {StrDel, "strdel"}, {SAdd, "sadd"}, {SRem, "srem"}, {SMembers, "smembers"}, {SIsMember, "sismember"}, {SCard, "scard"}, {LPush, "lpush"}, {RPush, "rpush"}, {LPop, "lpop"}, {RPop, "rpop"}, {LRange, "lrange"}, {LLen, "llen"}, {LIndex, "lindex"}, {LSet, "lset"}, {LRem, "lrem"}, {LTrim, "ltrim"}, {LInsertBefore, "linsertbefore"}, {LInsertAfter, "linsertafter"},
 	}
 	var out []string
 	for _, o := range order {

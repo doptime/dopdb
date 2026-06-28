@@ -36,6 +36,11 @@ const schema = {
     _id: f.string(),
     members: f.string(), // array via wire; not schema-validated for S*
   }).named("setvals"),
+  // List family (L*/R*): items array, non-scoped.
+  Listvals: collection({
+    _id: f.string(),
+    items: f.string(), // array via wire
+  }).named("listvals"),
 };
 
 async function main(): Promise<void> {

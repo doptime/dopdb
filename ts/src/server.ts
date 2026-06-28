@@ -139,6 +139,12 @@ interface ExecArgs {
   match?: string;
   members?: unknown[];
   member?: unknown;
+  items?: unknown[];
+  item?: unknown;
+  pivot?: unknown;
+  index?: number;
+  start?: number;
+  stop?: number;
   opt?: FindOpt;
 }
 
@@ -248,6 +254,95 @@ async function exec(m: MongoCollection<Doc>, cmd: string, a: ExecArgs, scope: Fi
       const next = docs.length === count ? cursor + docs.length : 0;
       if (cmd === "hscannovalues") return { cursor: next, keys };
       return { cursor: next, keys, values: docs };
+    }
+    case "lpush":
+    case "rpush": {
+      const each = a.items ?? [];
+      const upd = cmd === "lpush" ? { $push: { items: { $each: each, $position: 0 } } } : { $push: { items: { $each: each } } };
+      await m.updateOne({ _id: a.key, ...scope } as Filter, upd as never, { upsert: true });
+      return { ok: true };
+    }
+    case "lpop":
+    case "rpop": {
+      const before = await m.findOneAndUpdate({ _id: a.key, ...scope } as Filter, { $pop: { items: cmd === "lpop" ? -1 : 1 } } as never) as Doc | null;
+      if (!before) throw new NotFoundError();
+      const its = (before.items as unknown[]) ?? [];
+      if (its.length === 0) return null;
+      return cmd === "lpop" ? its[0] : its[its.length - 1];
+    }
+    case "lrange": {
+      const doc = await m.findOne({ _id: a.key, ...scope } as Filter) as Doc | null;
+      const its = (doc?.items as unknown[]) ?? [];
+      const n = its.length;
+      let st = listIdx(n, a.start ?? 0); if (st < 0) st = 0;
+      let en = listIdx(n, a.stop ?? -1) + 1; if (en > n) en = n; if (en < st) en = st;
+      return st >= n ? [] : its.slice(st, en);
+    }
+    case "llen": {
+      const doc = await m.findOne({ _id: a.key, ...scope } as Filter) as Doc | null;
+      return { len: ((doc?.items as unknown[]) ?? []).length };
+    }
+    case "lindex": {
+      const doc = await m.findOne({ _id: a.key, ...scope } as Filter) as Doc | null;
+      const its = (doc?.items as unknown[]) ?? [];
+      const i = listIdx(its.length, a.index ?? 0);
+      return i >= 0 && i < its.length ? its[i] : null;
+    }
+    case "lset": {
+      const doc = await m.findOne({ _id: a.key, ...scope } as Filter) as Doc | null;
+      const its = (doc?.items as unknown[]) ?? [];
+      const i = listIdx(its.length, a.index ?? 0);
+      if (i < 0 || i >= its.length) throw new NotFoundError();
+      await m.updateOne({ _id: a.key, ...scope } as Filter, { $set: { [`items.${i}`]: a.item } } as never);
+      return { ok: true };
+    }
+    case "lrem": {
+      const doc = await m.findOne({ _id: a.key, ...scope } as Filter) as Doc | null;
+      const its = (doc?.items as unknown[]) ?? [];
+      const cnt = a.count ?? 0;
+      const kept: unknown[] = [];
+      let rm = 0;
+      if (cnt < 0) {
+        for (let i = its.length - 1; i >= 0; i--) {
+          if (its[i] === a.item && (cnt === 0 || rm < -cnt)) rm++;
+          else kept.unshift(its[i]);
+        }
+      } else {
+        for (const v of its) {
+          if (v === a.item && (cnt === 0 || rm < cnt)) rm++;
+          else kept.push(v);
+        }
+      }
+      await m.updateOne({ _id: a.key, ...scope } as Filter, { $set: { items: kept } } as never);
+      return { ok: true };
+    }
+    case "ltrim": {
+      const doc = await m.findOne({ _id: a.key, ...scope } as Filter) as Doc | null;
+      const its = (doc?.items as unknown[]) ?? [];
+      const n = its.length;
+      let st = listIdx(n, a.start ?? 0); if (st < 0) st = 0;
+      let en = listIdx(n, a.stop ?? -1) + 1; if (en > n) en = n; if (en < st) en = st;
+      await m.updateOne({ _id: a.key, ...scope } as Filter, { $set: { items: st < n ? its.slice(st, en) : [] } } as never);
+      return { ok: true };
+    }
+    case "linsertbefore":
+    case "linsertafter": {
+      const doc = await m.findOne({ _id: a.key, ...scope } as Filter) as Doc | null;
+      const its = (doc?.items as unknown[]) ?? [];
+      const out: unknown[] = [];
+      let ins = false;
+      const before = cmd === "linsertbefore";
+      for (const v of its) {
+        if (v === a.pivot && !ins) {
+          if (before) out.push(a.item, v);
+          else out.push(v, a.item);
+          ins = true;
+          continue;
+        }
+        out.push(v);
+      }
+      if (ins) await m.updateOne({ _id: a.key, ...scope } as Filter, { $set: { items: out } } as never);
+      return { ok: true };
     }
     case "sadd": {
       await m.updateOne({ _id: a.key, ...scope } as Filter, { $addToSet: { members: { $each: a.members ?? [] } } } as never, { upsert: true });
@@ -368,6 +463,8 @@ async function exec(m: MongoCollection<Doc>, cmd: string, a: ExecArgs, scope: Fi
 
 // globToRegex converts a Redis glob (used by HSCAN match) to an anchored regex,
 // mirroring Go's globToRegex.
+function listIdx(n: number, i: number): number { return i < 0 ? n + i : i; }
+
 function globToRegex(glob: string): string {
   let r = "^";
   for (const ch of glob) {
@@ -499,6 +596,7 @@ const DATA_COMMANDS = new Set([
   "hrandfield", "hscan", "hscannovalues",
   "strget", "strset", "strsetall", "strgetall", "strdel",
   "sadd", "srem", "smembers", "sismember", "scard",
+  "lpush", "rpush", "lpop", "rpop", "lrange", "llen", "lindex", "lset", "lrem", "ltrim", "linsertbefore", "linsertafter",
 ]);
 const STREAM_COMMANDS = new Set(["watch"]);
 const ROUTED_COMMANDS = new Set([...DATA_COMMANDS, ...STREAM_COMMANDS]);
@@ -755,9 +853,9 @@ async function buildRuntime(cfg: ServeConfig): Promise<Runtime> {
   // .httpOn(...) flags are the primary grant for data commands; the `gate`
   // (permit / permissions / deny-all) still applies as a fallback / override.
   const httpAllows = (cmd: string, coll: string): boolean => {
-    const perm = byName.get(coll)?.coll.opts.httpPerm ?? 0;
-    const bit = CMD_BIT[cmd.toUpperCase()] ?? 0;
-    return bit !== 0 && (perm & bit) !== 0;
+    const perm = byName.get(coll)?.coll.opts.httpPerm ?? 0n;
+    const bit = CMD_BIT[cmd.toUpperCase()] ?? 0n;
+    return bit !== 0n && (perm & bit) !== 0n;
   };
 
   async function resolve(input: ReqInput): Promise<Outcome> {
@@ -849,6 +947,9 @@ async function buildRuntime(cfg: ServeConfig): Promise<Runtime> {
 
     let entries: Record<string, Doc> | undefined;
     let members: unknown[] | undefined;
+    let items: unknown[] | undefined;
+    let item: unknown;
+    let pivot: unknown;
     if (r.cmd === "hmset") {
       let body: Record<string, Doc> = {};
       if (bodyText) {
@@ -885,6 +986,23 @@ async function buildRuntime(cfg: ServeConfig): Promise<Runtime> {
         catch { return { kind: "json", status: 400, body: { error: "invalid JSON body", code: "validation" } }; }
       }
       members = body.members;
+    }
+    if (r.cmd === "lpush" || r.cmd === "rpush") {
+      let body: { items?: unknown[] } = {};
+      if (bodyText) {
+        try { body = JSON.parse(bodyText); }
+        catch { return { kind: "json", status: 400, body: { error: "invalid JSON body", code: "validation" } }; }
+      }
+      items = body.items;
+    }
+    if (r.cmd === "lset" || r.cmd === "lrem" || r.cmd === "linsertbefore" || r.cmd === "linsertafter") {
+      let body: { item?: unknown; pivot?: unknown } = {};
+      if (bodyText) {
+        try { body = JSON.parse(bodyText); }
+        catch { return { kind: "json", status: 400, body: { error: "invalid JSON body", code: "validation" } }; }
+      }
+      item = body.item;
+      pivot = body.pivot;
     }
 
     let filter: Filter | undefined;
@@ -925,6 +1043,10 @@ async function buildRuntime(cfg: ServeConfig): Promise<Runtime> {
       match: input.url.searchParams.get("match") ?? undefined,
       members,
       member: input.url.searchParams.get("member") ?? undefined,
+      items, item, pivot,
+      index: input.url.searchParams.has("index") ? Number(input.url.searchParams.get("index")) : undefined,
+      start: input.url.searchParams.has("start") ? Number(input.url.searchParams.get("start")) : undefined,
+      stop: input.url.searchParams.has("stop") ? Number(input.url.searchParams.get("stop")) : undefined,
       opt,
     }, scope);
     return { kind: "json", status: 200, body: out ?? null };

@@ -42,6 +42,8 @@ var dataCommands = map[string]bool{
 	"HSCAN": true, "HSCANNOVALUES": true, "HRANDFIELD": true,
 	"STRGET": true, "STRSET": true, "STRSETALL": true, "STRGETALL": true, "STRDEL": true,
 	"SADD": true, "SREM": true, "SMEMBERS": true, "SISMEMBER": true, "SCARD": true,
+	"LPUSH": true, "RPUSH": true, "LPOP": true, "RPOP": true, "LRANGE": true, "LLEN": true,
+	"LINDEX": true, "LSET": true, "LREM": true, "LTRIM": true, "LINSERTBEFORE": true, "LINSERTAFTER": true,
 }
 
 // Guardrails (mirrored on the TypeScript side: server.ts MAX_BODY/DEFAULT_LIMIT/
@@ -429,6 +431,125 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 		}
 		writeOK(w, sa.HttpStrSetAll(ctx, c.DB, items, scope))
 
+	case "LPUSH", "RPUSH":
+		la, ok := acc.(dopdb.ListAccessor)
+		if !ok {
+			writeErr(w, http.StatusNotFound, "not_found", errors.New("not a list collection: "+c.Coll))
+			return
+		}
+		if key == "" {
+			writeErr(w, http.StatusBadRequest, "validation", errors.New(c.Cmd+" requires ?f="))
+			return
+		}
+		var body map[string]any
+		if err := json.Unmarshal(c.Body, &body); err != nil {
+			writeErr(w, http.StatusBadRequest, "validation", errors.New(c.Cmd+` body needs {"items":[...]}`))
+			return
+		}
+		its, _ := body["items"].([]any)
+		if c.Cmd == "LPUSH" {
+			writeOK(w, la.HttpLPush(ctx, c.DB, key, its, scope))
+		} else {
+			writeOK(w, la.HttpRPush(ctx, c.DB, key, its, scope))
+		}
+
+	case "LPOP", "RPOP":
+		la, ok := acc.(dopdb.ListAccessor)
+		if !ok {
+			writeErr(w, http.StatusNotFound, "not_found", errors.New("not a list collection: "+c.Coll))
+			return
+		}
+		if key == "" {
+			writeErr(w, http.StatusBadRequest, "validation", errors.New(c.Cmd+" requires ?f="))
+			return
+		}
+		if c.Cmd == "LPOP" {
+			v, err := la.HttpLPop(ctx, c.DB, key, scope)
+			writeResult(w, v, err)
+		} else {
+			v, err := la.HttpRPop(ctx, c.DB, key, scope)
+			writeResult(w, v, err)
+		}
+
+	case "LRANGE":
+		la, ok := acc.(dopdb.ListAccessor)
+		if !ok {
+			writeErr(w, http.StatusNotFound, "not_found", errors.New("not a list collection: "+c.Coll))
+			return
+		}
+		start, stop := parseRange(c)
+		v, err := la.HttpLRange(ctx, c.DB, key, start, stop, scope)
+		writeResult(w, v, err)
+
+	case "LLEN":
+		la, ok := acc.(dopdb.ListAccessor)
+		if !ok {
+			writeErr(w, http.StatusNotFound, "not_found", errors.New("not a list collection: "+c.Coll))
+			return
+		}
+		n, err := la.HttpLLen(ctx, c.DB, key, scope)
+		writeResult(w, map[string]any{"len": n}, err)
+
+	case "LINDEX":
+		la, ok := acc.(dopdb.ListAccessor)
+		if !ok {
+			writeErr(w, http.StatusNotFound, "not_found", errors.New("not a list collection: "+c.Coll))
+			return
+		}
+		idx, _ := strconv.Atoi(c.Queries.Get("index"))
+		v, err := la.HttpLIndex(ctx, c.DB, key, idx, scope)
+		writeResult(w, v, err)
+
+	case "LSET":
+		la, ok := acc.(dopdb.ListAccessor)
+		if !ok {
+			writeErr(w, http.StatusNotFound, "not_found", errors.New("not a list collection: "+c.Coll))
+			return
+		}
+		idx, _ := strconv.Atoi(c.Queries.Get("index"))
+		var body map[string]any
+		if err := json.Unmarshal(c.Body, &body); err != nil || body["item"] == nil {
+			writeErr(w, http.StatusBadRequest, "validation", errors.New(`LSET body needs {"item":<value>}`))
+			return
+		}
+		writeOK(w, la.HttpLSet(ctx, c.DB, key, idx, body["item"], scope))
+
+	case "LREM":
+		la, ok := acc.(dopdb.ListAccessor)
+		if !ok {
+			writeErr(w, http.StatusNotFound, "not_found", errors.New("not a list collection: "+c.Coll))
+			return
+		}
+		count, _ := strconv.Atoi(c.Queries.Get("count"))
+		var body map[string]any
+		if err := json.Unmarshal(c.Body, &body); err != nil || body["item"] == nil {
+			writeErr(w, http.StatusBadRequest, "validation", errors.New(`LREM body needs {"item":<value>}`))
+			return
+		}
+		writeOK(w, la.HttpLRem(ctx, c.DB, key, count, body["item"], scope))
+
+	case "LTRIM":
+		la, ok := acc.(dopdb.ListAccessor)
+		if !ok {
+			writeErr(w, http.StatusNotFound, "not_found", errors.New("not a list collection: "+c.Coll))
+			return
+		}
+		start, stop := parseRange(c)
+		writeOK(w, la.HttpLTrim(ctx, c.DB, key, start, stop, scope))
+
+	case "LINSERTBEFORE", "LINSERTAFTER":
+		la, ok := acc.(dopdb.ListAccessor)
+		if !ok {
+			writeErr(w, http.StatusNotFound, "not_found", errors.New("not a list collection: "+c.Coll))
+			return
+		}
+		var body map[string]any
+		if err := json.Unmarshal(c.Body, &body); err != nil || body["pivot"] == nil || body["item"] == nil {
+			writeErr(w, http.StatusBadRequest, "validation", errors.New(`LINSERT body needs {"pivot":..,"item":..}`))
+			return
+		}
+		writeOK(w, la.HttpLInsert(ctx, c.DB, key, c.Cmd == "LINSERTBEFORE", body["pivot"], body["item"], scope))
+
 	case "SADD":
 		sa, ok := acc.(dopdb.SetAccessor)
 		if !ok {
@@ -594,6 +715,16 @@ func statusForError(w http.ResponseWriter, err error) {
 
 func writeErr(w http.ResponseWriter, status int, code string, err error) {
 	writeJSON(w, status, map[string]any{"error": err.Error(), "code": code})
+}
+
+// parseRange reads ?start=/?stop= (default 0/-1, Redis semantics).
+func parseRange(c *ReqCtx) (int, int) {
+	start, _ := strconv.Atoi(c.Queries.Get("start"))
+	stop := -1
+	if s, e := strconv.Atoi(c.Queries.Get("stop")); e == nil {
+		stop = s
+	}
+	return start, stop
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
