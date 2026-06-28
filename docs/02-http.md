@@ -1,100 +1,105 @@
-# 02 · HTTP 层与安全模型(URL · `@`-绑定 · 命令词表 · 权限 · 行级隔离 · watch)
+# 02 · HTTP layer & security model (URL · `@`-binding · command vocabulary · permissions · row-level isolation · watch)
 
-HTTP 层只把 schema 暴露成一组**闭合**的数据命令 + 函数式 API,并在边界强制 JWT `@`-绑定、行级隔离、权限。Go 在 `httpserve/`,TS 在 `ts/src/server.ts`,行为一致。
+The HTTP layer exposes the schema as a **closed** set of data commands plus a functional API, enforcing JWT `@`-binding, row-level isolation, and permissions at the boundary. Go lives in `httpserve/`, TS in `ts/src/server.ts`; behavior matches.
 
-## URL 方案
+## URL scheme
 
-- **数据命令**:`/api/<cmd>/<coll>` —— `/api/` 后两段,首段是命令、次段是集合。
-- **函数式 API**:`/api/<name>` —— `/api/` 后一段。
-- **数据源**:查询参数 `?ds=<name>`,缺省 `default`。**数据源不进路径**。
-- **键**:查询参数 `?f=`(可多值,用于 hmget/hdel 等);`?f=@uid` 触发 `@`-解析。
-- **查询**:`find/findone/count` 的过滤器走 **POST body**(JSON);`?limit= &skip= &s=<排序JSON> &p=<投影JSON>`。
+- **Data commands**: `/api/<cmd>/<coll>` — two segments after `/api/`: command, then collection.
+- **Functional API**: `/api/<name>` — one segment after `/api/`.
+- **Data source**: query parameter `?ds=<name>`, default `default`. **The source is not in the path.**
+- **Keys**: query parameter `?f=` (repeatable, for hmget/hdel/etc.); `?f=@uid` triggers `@`-resolution.
+- **Queries**: the filter for `find/findone/count` goes in the **POST body** (JSON); plus `?limit= &skip= &s=<sort JSON> &p=<projection JSON>`. Range/score params for List/ZSet via query (`?start=&stop=`, `?min=&max=`, `?count=`, `?withscores=1`).
 
-区分规则:`/api/` 后 ≥2 段且首段在命令词表内 → 数据命令;否则按 `/api/<name>` 当函数式 API。
+Disambiguation: `/api/` followed by ≥2 segments whose first is in the vocabulary → data command; otherwise it is treated as `/api/<name>` functional API.
 
-## 命令词表(闭合)
+## Command vocabulary (closed)
 
-```
-hget hset hsetnx hdel del hexists hgetall hkeys hvals hlen
-hincrby hincrbyfloat hmset hmget count find findone watch
-```
+**Hash**: `hget hset hsetnx hdel del hexists hgetall hkeys hvals hlen hincrby hincrbyfloat hmset hmget count find findone watch hscan hscannovalues hrandfield`
 
-| 命令 | 方法 | 语义 |
+**String**: `strget strset strsetall strgetall strdel` (STR* prefix avoids clashing with Set's S*)
+
+**List**: `lpush rpush lpop rpop lrange llen lindex lset lrem ltrim linsertbefore linsertafter` (blocking ops not implemented)
+
+**Set**: `sadd srem smembers sismember scard`
+
+**ZSet**: `zadd zrem zscore zcard zcount zincrby zrange zrevrange zrangebyscore zrevrangebyscore zrank zrevrank zpopmin zpopmax zremrangebyrank zremrangebyscore`
+
+Selected Hash semantics:
+
+| Command | Method | Semantics |
 |---|---|---|
-| `hget` | GET | 取一条(scoped:仅自己的,否则 404) |
-| `hset` | POST | upsert 一条(body 为值;scoped 写他人 id → 403) |
-| `hsetnx` | POST | 不存在才写 |
-| `hdel`/`del` | POST/GET | 删一/多条(`?f=` 多值) |
-| `hexists` | GET | 是否存在 |
-| `hgetall` | GET | 全部值(scoped 仅自己的) |
-| `hkeys`/`hvals`/`hlen` | GET | 键 / 值 / 计数 |
-| `hincrby`/`hincrbyfloat` | GET | 原子 `$inc`(整数 / 浮点) |
-| `hmset` | POST | 批量写,body 为 `{id: {字段...}, ...}` |
-| `hmget` | GET | 批量取,`?f=` 多值,按输入顺序对齐(缺失为 null) |
-| `count` | POST | 计数(可带过滤器 body;scoped 叠加) |
-| `find` | POST | 查询数组(过滤器 body + `limit/skip/s/p`) |
-| `findone` | POST | 查询首条(无则 404) |
-| `watch` | GET | change stream → SSE 实时订阅 |
+| `hget` | GET | get one (scoped: only mine, else 404) |
+| `hset` | POST | upsert one (body is the value; scoped write to another's id → 403) |
+| `hsetnx` | POST | write only if absent (existing → `{inserted:false}`, never 403) |
+| `hdel`/`del` | POST/GET | delete one/many (`?f=` repeatable) |
+| `hgetall`/`hkeys`/`hvals`/`hlen` | GET | all values / keys / count (scoped: only mine) |
+| `hincrby`/`hincrbyfloat` | GET | atomic `$inc` (int / float) |
+| `hmset`/`hmget` | POST/GET | batch write (`{id:{...}}`) / batch get (aligned to input, missing = null) |
+| `count`/`find`/`findone` | POST | count / array / first (filter in body; scoped AND-ed) |
+| `hscan`/`hscannovalues`/`hrandfield` | GET | glob scan (paginated) / random keys |
+| `watch` | GET | change stream → SSE |
 
-## `@`-绑定(防伪造的身份注入)
+Reads are GET, writes are POST, `watch` is GET + SSE. Every command is guarded by the Go↔TS conformance harness.
 
-服务端为每个请求构造上下文:已验证的 JWT claims + 服务端注入的 `@key`(集合名)、`@field`(默认=记录键)、`@remoteAddr`、`@host`、`@method`、`@path`、`@rawQuery`。
+## `@`-binding (anti-forgery identity injection)
 
-- 写入时,值里标了 `@uid` 等的字段由上下文填充,**客户端传来的 `@`-键一律剥除**——身份无法伪造。
-- 键里的 `@`-记号:`@uuid`/`@nanoid` 现场生成;`@<claim>` 取自 JWT。所以 `?f=@uid` 表示“我自己的那条记录”;对应 claim 缺失则**失败关闭**(拒绝)。
+For each request the server builds a context: verified JWT claims + server-injected `@key` (collection), `@field` (default = record key), `@remoteAddr`, `@host`, `@method`, `@path`, `@rawQuery`.
 
-## 行级隔离(owner scope)
+- On write, fields tagged with `@uid` etc. are filled from the context, and **any `@`-key sent by the client is stripped** — identity cannot be forged.
+- `@`-markers in keys: `@uuid`/`@nanoid` are generated on the fly; `@<claim>` comes from the JWT. So `?f=@uid` means "my own record"; a missing claim **fails closed** (rejected).
 
-Redis 时代靠 key 命名(如 `userInfo<uid>`)天然隔离;Mongo 没有键命名空间,隔离必须是显式谓词。
+## Row-level isolation (owner scope)
 
-- 声明:`dopdb.SetOwnerScope("orders", "owner", "uid")`(文档 `owner` 字段 == JWT claim `uid`)。TS:集合 `.ownerScope("owner")`。
-- 整集合读取(hgetall/hkeys/hlen/find/...)被强制 AND 上 `{owner: 我}`,客户端无法放宽。
-- 按键操作(hget/hset/hdel 的 scoped 版)用 `{_id, owner}` 交集 + 原子过滤 upsert,杜绝“先查再写”竞态;写他人 id → 403,读他人 id → 404。
-- 若集合声明了 scope 但请求无对应 claim → 一律拒绝。
+Under Redis, key naming (e.g. `userInfo<uid>`) isolated tenants naturally; Mongo has no key namespace, so isolation must be an explicit predicate.
 
-## 权限(默认拒绝)
+- Declare: `dopdb.SetOwnerScope("orders", "owner", "uid")` (document `owner` field == JWT claim `uid`). TS: collection `.ownerScope("owner")`.
+- Whole-collection reads (hgetall/hkeys/hlen/find/...) are forced to AND `{owner: me}`; the client cannot widen it.
+- Per-key ops (scoped hget/hset/hdel) use a `{_id, owner}` intersection + atomic filtered upsert, eliminating a "read-then-write" race; writing another's id → 403, reading another's id → 404.
+- If a collection declares a scope but the request lacks the claim → rejected. The same model applies to the String/List/Set/ZSet collections.
 
-键为 `COMMAND::collection`,**默认拒绝**:未显式授权的组合一律 403。函数式 API 用 `API::<name>` 同样受门控。
+## Permissions (expose + authorize via HttpOn)
+
+A collection is **off by default** on the HTTP side: until it calls `HttpOn(...)`, its data commands return 403. `HttpOn(...)` both registers the collection and declares which commands the client may call, as a bitmask:
 
 ```go
-p := httpserve.NewPermissions()      // 空集 = 全拒
-p.Grant("HGET", "users"); p.Grant("HSET", "users")
-p.Deny("DEL", "users")               // 显式拒(覆盖 Grant)
-p.SaveJSON("perm.json"); q, _ := httpserve.LoadJSON("perm.json")
+notes.HttpOn()                                 // no args = debug: ALL commands on
+notes.HttpOn(dopdb.ReadOnly)                    // reads only
+notes.HttpOn(dopdb.HGet | dopdb.HSet | dopdb.HDel) // exact set
 ```
 
-> 已**移除 AutoAuth**(首用即授权)。授权一律显式;集群可用共享集合承载同样的 Grant/Deny/Allowed。
+`Perm` is a `uint64` bitmask (one bit per command across all types); groups `ReadOnly` / `Writes` / `All` / `HashAll` (= All). Tighten at runtime with `dopdb.SetHttpPerm(coll, ...)`; introspect with `dopdb.HttpPermNames(p)`. The gate is `dopdb.HttpAllowed(cmd, coll)`. A legacy `httpserve.Permissions` map (`Grant`/`Deny`, JSON-persistable) still works as a runtime override and is OR-ed with the bitmask. The functional API is gated under `API::<name>`.
 
-## watch(change stream → SSE)
+## watch (change stream → SSE)
 
-`GET /api/watch/<coll>` 返回 `text/event-stream`,每个变更一行 `data: {"type","id","doc"}`。
+`GET /api/watch/<coll>` returns `text/event-stream`, one line per change `data: {"type","id","doc"}`.
 
-- owner-scope:管道按 `fullDocument.<owner>` 过滤;**delete 无 fullDocument,scoped 下不投递**。
-- 断线续传:Go 用 resume token 自动重连;TS 客户端发 `Last-Event-ID`,服务端 `resumeAfter`。
-- **需要 MongoDB 以副本集运行**(change stream 的前提)。
+- owner-scope: the pipeline filters on `fullDocument.<owner>`; **a delete has no fullDocument, so it is not delivered under scope**.
+- Reconnect: Go auto-reconnects with a resume token; the TS client sends `Last-Event-ID`, the server `resumeAfter`s.
+- **Requires MongoDB running as a replica set** (the prerequisite for change streams).
 
 ## JWT
 
-`Authorization: Bearer <token>`。支持 **HS256**(HMAC 密钥)与 **RS256**(PEM/SPKI 公钥验签),拒绝 `none` 与未知算法;校验 `exp`。
-## 错误线协议
+`Authorization: Bearer <token>`. Supports **HS256** (HMAC secret) and **RS256** (PEM/SPKI public-key verification); rejects `none` and unknown algorithms; checks `exp`.
 
-所有非 2xx 响应统一格式: `{ "error": "...", "code": "..." }`。状态码 ↔ `code` 固定 5 类:
+## Error wire protocol
 
-| 状态码 | code | 语义 |
+Every non-2xx response uses a uniform shape: `{ "error": "...", "code": "..." }`. Status ↔ `code` is fixed at 5 classes:
+
+| Status | code | Meaning |
 |---|---|---|
-| 400 | `validation` | 请求参数/输入不合法;可能额外带 `fields` 逐字段说明 |
-| 401 | `unauthorized` | 未认证或 JWT 无效 |
-| 403 | `forbidden` | 权限不足或行级隔离拒(写他人 → 403) |
-| 404 | `not_found` | 文档不存在或集合未注册 |
-| 409 | `conflict` | 唯一索引冲突或 `hsetnx` 命中已存在 |
-| 500 | `error` | 服务端内部错误兜底 |
+| 400 | `validation` | invalid params/input; may also carry `fields` per-field detail |
+| 401 | `unauthorized` | not authenticated / invalid JWT |
+| 403 | `forbidden` | not authorized, or row-level isolation denial (write to another → 403) |
+| 404 | `not_found` | document missing or collection not registered |
+| 409 | `conflict` | unique-index conflict, or `hsetnx` hitting an existing key |
+| 500 | `error` | internal server error fallback |
 
-Go 与 TS 两端实现一致:客户端按 `code`(优先)→`status` 反构 typed error(供 `instanceof` 分支)。
+Both engines match; the client reconstructs a typed error from `code` (preferred) → `status` for `instanceof` branching.
 
-## 一行起服务(Go)
+## One-line serve (Go)
 
 ```go
-cfg, _ := config.Load("config.toml")            // 读所有 [[mongo]]
-log.Fatal(httpserve.Serve(cfg, httpserve.WithPermissions(perms)))
-// 连接所有数据源 → SetDatasources → NewHandler → CORS → ListenAndServe
+cfg, _ := config.Load("config.toml")            // read all [[mongo]]
+log.Fatal(httpserve.Serve(cfg))
+// connect all sources → SetDatasources → NewHandler → CORS → ListenAndServe
 ```

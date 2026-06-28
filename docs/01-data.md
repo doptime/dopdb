@@ -1,14 +1,14 @@
-# 01 · 数据层(Collection · 方法 · modifiers · 索引 · 查询 · 数据源)
+# 01 · Data layer (Collection · methods · modifiers · indexes · queries · data sources)
 
-数据层是可信面:服务端代码直接读写,无 owner-scope、无 JWT。Go 是泛型 `Collection[K, V]`,TS 是 `serverDb(schema, db)` 返回的带类型 `db`。
+The data layer is the trusted face: server code reads/writes directly, with no owner-scope and no JWT. In Go it is the generic `Collection[K, V]` (Hash) plus the String/List/Set/ZSet collection types; in TS it is the typed `db` returned by `serverDb(schema, db)`.
 
-## 直连 MongoDB(无 Store 抽象)
+## Direct to MongoDB (no Store abstraction)
 
-dopdb **不再有 `Store`/`Codec` 抽象**,也没有 `memstore`/`mongostore`。根包直接用 `go.mongodb.org/mongo-driver/v2`:`mongo.go` 里的具体 `mongoBackend{db *mongo.Database}` 内联了原 mongostore 的全部 driver-v2 写法(ReplaceOne/UpdateOne upsert、FindOne.Raw、Find 游标、CountDocuments、BulkWrite、唯一索引、`IsDuplicateKeyError` 等)。
+dopdb **no longer has a `Store`/`Codec` abstraction**, nor `memstore`/`mongostore`. The root package uses `go.mongodb.org/mongo-driver/v2` directly: the concrete `mongoBackend{db *mongo.Database}` in `mongo.go` inlines all of the former mongostore driver-v2 logic (ReplaceOne/UpdateOne upsert, FindOne.Raw, Find cursor, CountDocuments, BulkWrite, unique indexes, `IsDuplicateKeyError`, plus `sample`/`scan` for HRANDFIELD/HSCAN).
 
-编解码直接走 `bson.Marshal`/`bson.Unmarshal`;字符串键即文档 `_id`。
+Encoding goes straight through `bson.Marshal`/`bson.Unmarshal`; the string key is the document `_id`.
 
-## 定义集合
+## Defining a collection (Hash)
 
 ```go
 type User struct {
@@ -20,52 +20,73 @@ type User struct {
 users := dopdb.New[string, *User](dopdb.WithCollection("users"))
 ```
 
-`New[K,V]` 选项:`WithCollection(name)`(= `WithKey`)、`WithDB(name)`(绑定数据源,用于原生方法;HTTP 侧由 `?ds=` 决定)。`New` 只登记索引规格,不建立连接;首次实际操作某数据源时按需建索引(每数据源一次)。
+`New[K,V]` options: `WithCollection(name)` (= `WithKey`), `WithDB(name)` (binds a data source, for native methods; on the HTTP side `?ds=` decides). `New` only registers index specs and does not open a connection; indexes are built on demand the first time a data source is used (once per source).
 
-索引来自结构体 tag `index:"..."`:`"unique"` 唯一、`"1"`/`"-1"` 升/降序、`"text"` 文本、`"2dsphere"` 地理(走 `IndexSpec.Geo`)、TTL 等。
+Indexes come from the struct tag `index:"..."`: `"unique"`, `"1"`/`"-1"` (asc/desc), `"text"`, `"2dsphere"` (geo, via `IndexSpec.Geo`), TTL, etc.
 
-## 原生方法(签名)
+## Native methods (Hash, signatures)
 
 ```
-HSet(k, v) / Save(v)                 upsert(Save 从 v._id 取键)
-HSetNX(k, v) (bool, err)             不存在才写
-HSetScoped(k, v, ownerField, val)    过滤 upsert(行级隔离的底座)
-HGet(k) (V, err)                     取一条(无 → ErrNoDoc)
-HMGet(...k) ([]V, err)               批量取(对齐,缺失为零值)
-HMSet(map[K]V)                       批量写
-HGetAll() (map[K]V, err)             全部
-HDel(...k) / Del(k)                  删
+HSet(k, v) / Save(v)                 upsert (Save reads the key from v._id)
+HSetNX(k, v) (bool, err)             write only if absent
+HSetScoped(k, v, ownerField, val)    filtered upsert (the basis of row-level isolation)
+HGet(k) (V, err)                     get one (missing → ErrNoDoc)
+HMGet(...k) ([]V, err)               batch get (aligned; missing = zero value)
+HMSet(map[K]V)                       batch write
+HGetAll() (map[K]V, err)             all
+HDel(...k) / Del(k)                  delete
 HExists(k) (bool, err)
 HKeys() ([]K, err) / HVals() ([]V, err) / HLen() (int64, err)
-HIncrBy(k, fieldPath, int64)         原子整数 $inc
-HIncrByFloat(k, fieldPath, float64)  原子浮点 $inc
+HIncrBy(k, fieldPath, int64)         atomic integer $inc
+HIncrByFloat(k, fieldPath, float64)  atomic float $inc
+HRandField(count) ([]K, err)         random field keys ($sample)
+HScan(cursor, match, count) ([]K, []V, next, err)   glob-matched, offset-cursor pagination
+HScanNoValues(cursor, match, count) ([]K, next, err)
 Find(filter M, opt FindOpt) ([]V, err)
 FindOne(filter M) (V, err)
 ```
 
-TS 端等价方法名一致(`hget/hset/.../find/findone/watch` + `get/set/save` 别名)。
+The TS engine mirrors the names (`hget/hset/.../find/findone/watch/hscan/hrandfield` + `get/set/save` aliases on the server).
 
-## 写入修饰器(modifiers)
+## The Redis-compatible data structures (String / List / Set / ZSet)
 
-`modifiers.go` 在写入前对值做处理:填充时间戳(如 `createdAt`/`updatedAt`)、按 `@`-绑定填充服务端字段(身份等)。可信路径默认信任传入值;HTTP 路径会先剥除客户端 `@`-键再填充。
+Beyond Hash, four more key types — each a first-class Go collection backed by its own Mongo collection, declared with its own constructor + `HttpOn`, reached over the wire commands in `02-http`:
 
-## 查询与消毒
+```go
+cfg   := dopdb.NewString[string](dopdb.WithCollection("cfg")).HttpOn()       // String: {_id,v,expireAt?}
+queue := dopdb.NewList[string, *Job](dopdb.WithCollection("queue")).HttpOn() // List:   {_id,items[]}
+tags  := dopdb.NewSet[string](dopdb.WithCollection("tags")).HttpOn()         // Set:    {_id,members[]}
+board := dopdb.NewZSet[string](dopdb.WithCollection("board")).HttpOn()       // ZSet:   {_id,members:[{m,score}]}
+```
 
-`Find`/`FindOne`/`Count` 接受 Mongo 风格过滤器(`dopdb.M`)。`FindOpt`:`SortKeys []SortKey{Field, Asc}`(多键有序)、`Sort`(单键 map)、`Limit`、`Skip`、`Projection`。
+- These types expose the **HTTP command layer** (handlers `HttpStrGet`, `HttpSAdd`, `HttpLPush`, `HttpZAdd`, …) and are reached via the wire commands; the Hash family additionally has native non-HTTP Go methods.
+- **Owner-scope** applies identically (owner at the document top level; the gate ANDs `{_id, owner}`).
+- **TTL** (String): `NewString(...).EnsureTTL(ctx, ds)` builds a TTL index; `strset` with an expiration sets `expireAt`.
+- List pops are atomic (`findOneAndUpdate` + `$pop`). ZSet keeps a derived order (score asc, member asc). Blocking list ops are not implemented.
 
-所有外来过滤器先过 `sanitize.go`:拒绝把 `$`-运算符当作字段键注入(防注入),`$in`/`$and` 等作为值的运算符按需放行。
+See `REDISDB-COMPAT` for the full per-method Mongo mapping.
 
-## 多数据源
+## Write modifiers
 
-`mongo.go` 维护 `Datasources` 注册表(名 → `*mongo.Database`,缺省名 `default`):
+`modifiers.go` processes a value before writing: filling timestamps (e.g. `createdAt`/`updatedAt`), populating server-side fields per `@`-binding (identity, etc.). The trusted path trusts the incoming value by default; the HTTP path first strips client `@`-keys, then fills them.
+
+## Queries and sanitization
+
+`Find`/`FindOne`/`Count` take a Mongo-style filter (`dopdb.M`). `FindOpt`: `SortKeys []SortKey{Field, Asc}` (ordered multi-key), `Sort` (single-key map), `Limit`, `Skip`, `Projection`.
+
+Every external filter first passes `sanitize.go`: it rejects `$`-operators injected as field keys (injection defense); operators used as values (`$in`/`$and`, etc.) are allowed as needed.
+
+## Multiple data sources
+
+`mongo.go` keeps a `Datasources` registry (name → `*mongo.Database`, default name `default`):
 
 ```go
 ds := dopdb.NewDatasources()
 ds.Add("default", client.Database("appdb"))
 ds.Add("analytics", client.Database("analytics"))
 dopdb.SetDatasources(ds)
-// 或从配置一次性连接:
+// or connect once from config:
 ds, _ := dopdb.ConnectDatasources(ctx, []dopdb.DatasourceConfig{{Name:"default", URI:uri, DB:"appdb"}})
 ```
 
-原生方法用集合绑定的数据源(`WithDB`,缺省 `default`);HTTP 请求用 `?ds=<name>` 选择,缺省 `default`,**请求参数对 HTTP 优先**。
+Native methods use the collection's bound source (`WithDB`, default `default`); HTTP requests select with `?ds=<name>` (default `default`) — **the request parameter wins on the HTTP side**.

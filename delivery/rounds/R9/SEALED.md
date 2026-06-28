@@ -1,6 +1,6 @@
-# SEAL(草稿 · pending-opus)· dopdb · R9 (2026-06-28)
+# SEAL · dopdb · R9 / M6 (2026-06-28) · ✅ Opus 终判联签 · M6 封板
 
-> **状态:`pending-opus`** —— 本机实证全部 PASS,但承重终判归 Opus。本文件为本地起草,等操作者上传 → Opus 据真实输出落终判联签后方生效。
+> **状态:SEALED(Opus 已终判联签)** —— 本机实证全 PASS,Opus 独立复核佐证通过,M6 redisdb-compat(Hash 三法 + String/List/Set/ZSet)成立。**M6 封板。**
 
 ## 范围
 R9 = M6 redisdb-compat 收尾验证回合:把 Hash 三法 + String/List/Set/ZSet 四新类型从"工作树/未验证"转为"真实输出可终判"。Opus 此前已交接 Hash 三法 Go 实现盲写 + TS Perm 同步;String/Set/List 已分三次提交落地;**ZSet 整族此前未提交**——本回合完成 ZSet(Go+TS)+ 修一个承重门 bug + 补 conformance 完备性,全部提交并真跑。
@@ -45,6 +45,20 @@ R9 的实证目标是"M6 两端逐命令一致 + 既有无回归":**conformance 
 
 **承重终判归 Opus**:请据 `receipt-verify.md` 真实输出对 M6 落终判联签。
 
+## Opus 终判(2026-06-28 · 全新上下文独立复核)
+
+承重门终审。**裁决:M6 成立,封板。**
+
+**Opus 沙箱内亲验**:① TS 亲跑——tsc 干净,npm test 74/0/1(与回执一致);② 交叉核对——15 个 conformance 测试函数(String/Set/List/ZSet/HScan/HRandField + 原 Hash)在 conformance_test.go 全部实存,与回执 15/15 吻合;③ 核实承重修复——perms.go ReadOnly/Writes 现含全部 S*/L*/Z* 命令位,TS CMD_BIT 补 35 个新命令,All 缺位 bug 确已两端修复;④ 直读四个新类型 Go 源真实完整,zset.go 已提交(c8f5be2),工作树干净。
+
+**据本地真实输出 + git 联签**(沙箱无 Go/Mongo):§3.1 build/vet/gofmt/tsc 零错;§3.5 conformance 15/15(ZSet 16/16)真 Mongo 两端逐命令一致;§3.7 go test 四包零 FAIL（testcache 清后真跑)+ npm test 74/0/1。
+
+**佐证强度最高**:本地跑真 conformance 时 ZADD 真的返回 403 → 定位 All 分组漏新位 → 两端修复(我已核实代码确含全部新位)。"跑了、真失败、根因、修复"无法伪造,我能验的全部对得上,无 facade 迹象。
+
+**两个标注缺口的裁量(非阻塞)**:① TS 客户端方法仅 tsc 类型保证——承重核心是服务端两端一致(已实证),客户端方法是类型安全的请求构造器,目标协议已被 conformance 钉死,接受,记可选跟进;② TTL 过期无独立测试——写路径(expireAt+TTL 索引)已编译+STRSET 路径覆盖,Mongo 后台过期为 Mongo 职责,接受,记可选跟进。均不影响 M6 承重核心。
+
+**结论**:dopdb 的 DB API 已补齐到 redisdb 兼容——Hash 全族 + String/List/Set/ZSet,真 Mongo 上 Go↔TS 逐命令一致(conformance 15/15),HttpOn 对新命令生效,owner-scope 沿用,TTL 写路径就位。⛔ 阻塞 op 按设计不做。**M6 封板。**
+
 ## 签名
 - 本地 GLM-5.2(实证 + 承重修复 + 起草): ✅ 2026-06-28
-- Opus(承重终判联签): ⏳ **pending-opus**
+- Opus(承重终判联签): ✅ **2026-06-28 · SEALED**

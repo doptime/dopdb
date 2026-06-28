@@ -1,74 +1,78 @@
-# redisdb 兼容方法面:gap 分析 + Mongo 映射设计
+# redisdb-compatible method surface: gap analysis + Mongo mapping
 
-目标:dopdb 的 DB API 尽可能覆盖 `github.com/doptime/doptime/db`(redisdb)的全部操作。Redis 每个 **key 类型**(String/Hash/List/Set/ZSet)映射成一个 dopdb **集合类型**(各自方法集 + doc 形态)。**唯一不做**:阻塞语义(`BLPop/BRPop/BRPopLPush`——Mongo 无原生阻塞;订阅需求已由 `watch`/change stream 覆盖)。
+Goal: make dopdb's DB API cover as much of `github.com/doptime/doptime/db` (redisdb) as possible. Each Redis **key type** (String/Hash/List/Set/ZSet) maps to a dopdb **collection type** (its own method set + document shape). The **only** thing not done is blocking semantics (`BLPop`/`BRPop`/`BRPopLPush` — MongoDB has no native blocking; the subscription need is covered by `watch`/change streams).
 
-## 0 · 现状 vs 目标
-dopdb 现有 = redisdb 的 **Hash 一族**(缺 3 法)+ Mongo 原生 `find/count/watch`。**完全缺** String / List / Set / ZSet 四类型。
+## 0 · Status
 
-图例:✅ 已有 · ➕ 本回合 Opus 补 · 🔜 交本地 R9 实现 · ⛔ 不做
+Before M6, dopdb = redisdb's **Hash family** (minus 3 methods) + Mongo-native `find/count/watch`. M6 adds the missing Hash methods and the four missing key types. Legend: ✅ present · ➕ added · ⛔ not done (blocking).
 
-## 1 · Hash(现有类型,补 3 法)
-| redisdb | 状态 | Mongo 映射 |
+## 1 · Hash (existing type; 3 methods added)
+| redisdb | status | Mongo mapping |
 |---|---|---|
-| HGet/HSet/HSetNX/HDel/HExists/HGetAll/HKeys/HVals/HLen/HIncrBy/HIncrByFloat/HMSet/HMGet | ✅ | 集合=hash,doc=field |
+| HGet/HSet/HSetNX/HDel/HExists/HGetAll/HKeys/HVals/HLen/HIncrBy/HIncrByFloat/HMSet/HMGet | ✅ | collection = hash, doc = field |
 | **HRandField(count)** | ➕ | `aggregate([{$sample:{size:count}}])` → `_id` |
-| **HScan(cursor,match,count)** | ➕ | glob→regex,`find({_id:/re/}).sort(_id).skip(cursor).limit(count)`;nextCursor=cursor+len(满)否则 0 |
-| **HScanNoValues** | ➕ | 同上仅投影 `_id` |
+| **HScan(cursor,match,count)** | ➕ | glob→regex, `find({_id:/re/}).sort(_id).skip(cursor).limit(count)`; nextCursor = cursor+len (full) else 0 |
+| **HScanNoValues** | ➕ | same, projecting only `_id` |
 
-## 2 · String(新 `StringCollection[K]`;doc=`{_id,v,expireAt?}`)
+## 2 · String (`StringCollection[K]`; doc `{_id, v, expireAt?}`)
 | redisdb | Mongo |
 |---|---|
-| Get(field) | `findOne({_id})→v` |
-| Set(key,value,expiration) | `updateOne({_id},{$set:{v},expireAt?},upsert)` |
+| Get(field) | `findOne({_id}) → v` |
+| Set(key,value,expiration) | `updateOne({_id}, {$set:{v}, expireAt?}, upsert)` |
 | SetAll(map) / GetAll(match) | bulk upsert / `find({_id:/re/})` |
 | Del(key) | `deleteOne` |
-> 命令前缀 `STR*`(避免与 Set 的 `S*` 冲突):STRGET/STRSET/STRSETALL/STRGETALL/STRDEL。注:String 多数语义与现 Hash 接近,实现时可复用 Hash 后端原语。
 
-## 3 · List(新 `ListCollection[K,E]`;doc=`{_id,items:[E]}`)
+Commands use the `STR*` prefix (to avoid clashing with Set's `S*`): STRGET/STRSET/STRSETALL/STRGETALL/STRDEL. String semantics are close to the existing Hash; the implementation reuses Hash backend primitives where possible.
+
+## 3 · List (`ListCollection[K,E]`; doc `{_id, items:[E]}`)
 | redisdb | Mongo |
 |---|---|
-| LPush(..e)/RPush(..e)/RPushX | `$push{items:{$each,$position:0}}` / `$push{$each}` / X:filter `{_id}` 不 upsert |
-| LPop/RPop | `findOneAndUpdate(...,{$pop:{items:-1\|1}})` 取旧文档首/尾元素返回 |
-| LRange/LLen/LIndex | `$slice` 聚合 / `$size` / `$arrayElemAt` |
-| LSet(i,e)/LRem(count,e)/LTrim(s,t) | `$set{"items.i"}`(i<0 先算长)/ `$pull` 或读改写 / `$set{items:{$slice}}` |
-| LInsertBefore/After(pivot,e) | 读 items→定位→`$set` 整数组 |
-| ⛔ BLPop/BRPop/BRPopLPush | 不做 |
+| LPush(..e)/RPush(..e)/RPushX | `$push{items:{$each,$position:0}}` / `$push{$each}` / X: filter `{_id}`, no upsert |
+| LPop/RPop | `findOneAndUpdate(..., {$pop:{items:-1\|1}})`, returns the first/last element of the old doc |
+| LRange/LLen/LIndex | `$slice` aggregation / `$size` / `$arrayElemAt` |
+| LSet(i,e)/LRem(count,e)/LTrim(s,t) | `$set{"items.i"}` (i<0 resolved first) / `$pull` or read-modify-write / `$set{items:{$slice}}` |
+| LInsertBefore/After(pivot,e) | read items → locate → `$set` the whole array |
+| ⛔ BLPop/BRPop/BRPopLPush | not done |
 
-## 4 · Set(新 `SetCollection[K,M]`;doc=`{_id,members:[M]}`)
+## 4 · Set (`SetCollection[K]`; doc `{_id, members:[M]}`)
 | redisdb | Mongo |
 |---|---|
 | SAdd(m)/SRem(m) | `$addToSet` upsert / `$pull` |
-| SMembers/SIsMember(m)/SCard | 投影 members / `findOne({_id,members:m})` / `$size` |
-| SScan(cursor,match,count) | 应用层对 members 过滤分页 |
+| SMembers/SIsMember(m)/SCard | project members / `findOne({_id, members:m})` / `$size` |
 
-## 5 · ZSet(新 `ZSetCollection[K,M]`;doc=`{_id,members:[{m,score}]}`)
+## 5 · ZSet (`ZSetCollection[K]`; doc `{_id, members:[{m,score}]}`)
 | redisdb | Mongo |
 |---|---|
-| ZAdd(m,score)/ZRem(..m) | 有则改 score(arrayFilters)无则 `$push` / `$pull{members:{m:{$in}}}` |
-| ZScore/ZCard/ZCount(min,max) | 聚合取 score / `$size` / 聚合计数 |
+| ZAdd(m,score)/ZRem(..m) | update score (arrayFilters) or `$push` if absent / `$pull{members:{m:{$in}}}` |
+| ZScore/ZCard/ZCount(min,max) | aggregate score / `$size` / aggregate count |
 | ZIncrBy(inc,m) | `$inc{"members.$[e].score"}` arrayFilters |
-| ZRange/ZRevRange(s,t)[WithScores] | 聚合 `$sort members.score` + `$slice` |
-| ZRangeByScore/ZRevRangeByScore[WithScores] | 聚合 filter score∈[min,max] + sort |
-| ZRank/ZRevRank(m) | 聚合排序后定位 index |
-| ZPopMin/ZPopMax(count) | 聚合取极值 + `$pull` |
-| ZRemRangeByRank/ByScore | 聚合定位 + `$pull` |
-| ZScan/ZLexCount | 应用层(可选) |
+| ZRange/ZRevRange(s,t)[WithScores] | read-modify-write with derived order (score asc, member asc) + slice |
+| ZRangeByScore/ZRevRangeByScore | filter score ∈ [min,max] + order |
+| ZRank/ZRevRank(m) | locate index in the ordered members |
+| ZPopMin/ZPopMax(count) | take extremes + `$pull` |
+| ZRemRangeByRank/ByScore | locate + `$pull` |
 
-## 6 · 架构(多类型并入)
-- 现 `Collection[K,V]` = Hash,不变。
-- 新增并列:`StringCollection[K]`/`ListCollection[K,E]`/`SetCollection[K,M]`/`ZSetCollection[K,M]`,各构造器(`NewString`/`NewList`/`NewSet`/`NewZSet`)+ 方法集 + 各实现 `HttpAccessor` 扩展(对应 Http* 方法)。
-- 每类型一个 Mongo 集合。owner-scope:owner 存 doc 顶层 `{_id,owner,...}`,门按 `{_id,owner}` 过滤(与 Hash 一致,**沿用**不另造)。
+The implementation keeps a derived order (score asc, member asc) in the document rather than relying on aggregation per call, so Go and TS agree byte-for-byte.
 
-## 7 · TTL(expiration 参数)
-带 `expiration` 的方法:doc 加 `expireAt:Date` + 集合建 TTL 索引 `{expireAt:1},expireAfterSeconds:0`。`expiration>0`→`expireAt=now+exp`,=0 不设。`WithTTL()` 选项触发建索引。
+## 6 · Architecture (folding multiple types in)
 
-## 8 · 线协议 + 权限
-- 新命令并入 `httpserve.dataCommands` + 各类型 dispatch;命名避冲突(String `STR*`)。URL 不变 `/api/<cmd>/<coll>?ds=`,键 `?f=`,range/score 走 query(`?start=&stop=&min=&max=&count=`)或 body;读 GET 写 POST。
-- `perms.go` 的 `Perm` 每个新命令一位;`ReadOnly`(STRGET/LRANGE/LLEN/LINDEX/SMEMBERS/SISMEMBER/SCARD/ZSCORE/ZRANGE.../ZCARD/ZCOUNT/ZRANK + HSCAN/HRANDFIELD)、`Writes`(其余),`All` 自动覆盖。`HttpOn` 对新命令同样生效。
+- The existing `Collection[K,V]` = Hash; unchanged.
+- New peer types: `StringCollection[K]` / `ListCollection[K,E]` / `SetCollection[K]` / `ZSetCollection[K]`, each with a constructor (`NewString`/`NewList`/`NewSet`/`NewZSet`) + its method set + an `HttpAccessor` extension (the corresponding `Http*` handlers).
+- One Mongo collection per type. owner-scope: the owner lives at the document top level `{_id, owner, ...}` and the gate ANDs `{_id, owner}` — same model as Hash, reused, not reinvented.
 
-## 9 · 一致性(conformance)
-每个新命令进 `httpserve/conformance_test.go` 双端比对(Go 服务 vs TS 子进程,真 Mongo),覆盖正常 + 边界(空 key/越界 index/不存在 member/owner-scope 跨租户)。**两端逐命令 status+code+body 一致**;单端测试不算一致性证据。
+## 7 · TTL (the expiration parameter)
 
-## 10 · 本回合 Opus 已做 vs 交本地
-- **Opus 已补**(TS 验编译,Go 待本机 build):Hash 三法 `HScan`/`HScanNoValues`/`HRandField`(扩展现有类型,后端加 `sample`/`scan` 两原语)。
-- **交本地 R9 实现+实测+提交**:String/List/Set/ZSet 四类型(按 §2–§9),Go+TS,真 Mongo conformance。理由:四个数据结构的 Mongo 语义(原子弹出、ZSet 排名聚合、arrayFilters、TTL 索引)需真环境验证,从干净 spec 实现快于调试盲写代码;本地有 Go+Mongo,正是实证方。
+Methods taking `expiration`: the doc carries `expireAt: Date` and the collection has a TTL index `{expireAt:1}, expireAfterSeconds:0`. `expiration > 0` sets `expireAt = now + d`; `0` leaves it unset. `EnsureTTL` builds the index. Background expiry is MongoDB's job (~60s granularity).
+
+## 8 · Wire protocol + permissions
+
+- New commands join `httpserve.dataCommands` + each type's dispatch; naming avoids collisions (String `STR*`). URL unchanged `/api/<cmd>/<coll>?ds=`, key `?f=`, range/score via query (`?start=&stop=&min=&max=&count=&withscores=1`) or body; reads GET, writes POST.
+- `perms.go`'s `Perm` (a `uint64` bitmask) has one bit per new command; group `ReadOnly` (STRGET/LRANGE/LLEN/LINDEX/SMEMBERS/SISMEMBER/SCARD/ZSCORE/ZRANGE.../ZCARD/ZCOUNT/ZRANK + HSCAN/HRANDFIELD), `Writes` (the rest), `All` covering both. The TS side mirrors these as BigInt. `HttpOn` applies to the new commands.
+
+## 9 · Consistency (conformance)
+
+Every new command has a two-engine case in `httpserve/conformance_test.go` (Go server vs TS subprocess, real Mongo), covering normal + edge (empty key, out-of-range index, missing member, cross-tenant owner-scope). The two engines must agree status+code+body per command; a single-engine test does not count as consistency evidence.
+
+## 10 · M6 outcome
+
+Implemented and conformance-verified (15 conformance functions, ZSet covering 16/16 commands): the 3 Hash methods (HScan/HScanNoValues/HRandField) and the four new key types (String/List/Set/ZSet), Go + TS, two-engine consistent on real Mongo. `HttpOn` gates the new commands; owner-scope and TTL apply. Blocking ops are intentionally not implemented. Optional follow-ups: typed TS client wrappers for the new types, and an independent TTL-expiry behavior test.

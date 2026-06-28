@@ -1,78 +1,94 @@
 # dopdb
 
-**写一份 schema,前后端的类型、校验、客户端、服务端就都有了——不生成代码,不前后端各写一遍。**
+**Write one schema; get the types, validation, typed client, and HTTP server for both Go and TypeScript — no codegen, no writing it twice.**
 
-dopdb 把 `doptime` + `redisdb` + `doptime-client` 合并重写,数据后端换成 **MongoDB**。它的目标只有一个:**消灭"为了存取一条数据,要在五个地方写五遍"的胶水代码。**
+dopdb is a merge-rewrite of `doptime` + `redisdb` + `doptime-client`, with the data backend swapped to **MongoDB**. Its single goal: **eliminate the glue code you write five times just to store and fetch a piece of data.**
 
 ---
 
-## 你现在的痛点
+## The pain it removes
 
-做一个普通的"用户能增删改查自己的数据"的功能,传统上你要写:
+For an ordinary "users can CRUD their own data" feature you traditionally write:
 
-1. 数据库集合结构;
-2. 后端的类型定义;
-3. 后端的校验逻辑;
-4. 一层 REST/RPC 接口(controller → service → DAO);
-5. 前端再抄一遍类型 + 写 fetch 封装 + 处理鉴权和多租户隔离。
+1. the database collection shape;
+2. the backend types;
+3. the backend validation;
+4. a REST/RPC layer (controller → service → DAO);
+5. the same types again on the frontend, plus fetch wrappers, auth, and tenant isolation.
 
-五处要手动保持一致,改一个字段五个地方跟着改,还容易漏掉"别让 A 用户读到 B 用户的数据"。
+Five places to keep in sync by hand; change one field and five places must follow — and it's easy to forget "don't let user A read user B's rows."
 
-## dopdb 给你什么
+## What dopdb gives you
 
-| 你写的 | 你免费得到的 |
+| You write | You get for free |
 |---|---|
-| **一份 schema**(字段 + 校验 + 谁拥有这行数据) | 后端类型、前端类型、运行时校验、带类型的客户端、HTTP 服务端 |
-| `collection(...).httpOn()` 一行 | 这个集合就能被前端安全直连,无需写任何接口 |
-| `.ownerScope("owner")` 一行 | 自动多租户隔离——每个用户只看得到自己的数据,客户端改不了 |
+| **one schema** (fields + validation + who owns the row) | backend types, frontend types, runtime validation, a typed client, an HTTP server |
+| `collection(...).httpOn()` (one line) | that collection is safely callable from the frontend — no endpoints to write |
+| `.ownerScope("owner")` (one line) | automatic multi-tenant isolation — each user sees only their own rows, and the client can't widen it |
 
-- **零胶水代码**:没有手写的 API 端点,没有 fetch 封装。前端直接"调数据库"(`db.users.hGet(...)`),框架负责鉴权、隔离、上线。
-- **不生成代码**:不是 codegen,没有"生成后被手改、再生成又冲突"的循环。一份 schema 在运行时同时驱动两端。
-- **前后端同一套类型**:字段改了两端类型一起变,编译期就报错,而不是上线后才发现对不上。
-- **多租户是默认能力**:`@`-绑定 + owner-scope 把"这是我自己的数据"做进框架,而不是靠你每个查询都记得加 `WHERE owner = me`。
-- **把 Mongo 当 Mongo 用**:直连官方驱动,`$inc` 原子自增、change stream 实时推送、唯一索引、地理索引都能用,没有中间抽象层挡路。
+- **Zero glue code**: no hand-written API endpoints, no fetch wrappers. The frontend "calls the database" (`db.users.hGet(...)`); the framework handles auth, isolation, and routing.
+- **No codegen**: not a code generator — there's no "generated, then hand-edited, then regenerated and conflicts" cycle. One schema drives both engines at runtime.
+- **One set of types across front and back**: change a field and both engines' types move together — a compile error, not a production surprise.
+- **Multi-tenancy by default**: `@`-binding + owner-scope bake "this is my own data" into the framework, instead of relying on you to remember `WHERE owner = me` on every query.
+- **Mongo used as Mongo**: bound directly to the official driver — atomic `$inc`, change streams, unique indexes, geo indexes all work, with no abstraction layer in the way.
 
-## 心智模型(一句话)
+## A Redis-compatible data layer
 
-> **一份 schema,两个对等的引擎(Go 和 TypeScript),一套线协议。前端不是在"调用后端 API",而是在"安全地直接操作数据库"。**
+dopdb covers the **redisdb-compatible data structures**, each mapped onto MongoDB:
+
+| Type | Commands | Backing doc |
+|---|---|---|
+| **Hash** (the core type) | HGet/HSet/HSetNX/HDel/HExists/HGetAll/HKeys/HVals/HLen/HIncrBy/HIncrByFloat/HMSet/HMGet/HScan/HScanNoValues/HRandField | a Mongo collection of documents |
+| **String** | STRGET/STRSET/STRSETALL/STRGETALL/STRDEL (+ TTL) | `{_id, v, expireAt?}` |
+| **List** | LPUSH/RPUSH/LPOP/RPOP/LRANGE/LLEN/LINDEX/LSET/LREM/LTRIM/LINSERTBEFORE/LINSERTAFTER | `{_id, items[]}` |
+| **Set** | SADD/SREM/SMEMBERS/SISMEMBER/SCARD | `{_id, members[]}` |
+| **ZSet** | ZADD/ZREM/ZSCORE/ZCARD/ZCOUNT/ZINCRBY/ZRANGE/ZREVRANGE/ZRANGEBYSCORE/ZREVRANGEBYSCORE/ZRANK/ZREVRANK/ZPOPMIN/ZPOPMAX/ZREMRANGEBYRANK/ZREMRANGEBYSCORE | `{_id, members:[{m,score}]}` |
+
+Every command is verified to behave identically across the Go and TypeScript engines (a cross-implementation conformance harness runs both and diffs them). Blocking ops (`BLPop`/`BRPop`/`BRPopLPush`) are intentionally not implemented — MongoDB has no native blocking, and the subscription need is covered by `watch` (change streams).
+
+## Mental model (one sentence)
+
+> **One schema, two equivalent engines (Go and TypeScript), one wire protocol. The frontend isn't "calling a backend API" — it's safely operating on the database directly.**
 
 ```
-            一份 schema
+            one schema
           /            \
         Go              TypeScript
-   (服务端,直连 Mongo)   (服务端 同款 / 浏览器 带类型客户端)
+   (server, direct      (same server, or a
+    to Mongo)            typed browser client)
           \            /
-       同一套 URL 线协议(可混用:Go 服务 + TS 客户端,或反之)
+       the same URL wire protocol
+       (mix freely: Go server + TS client, or vice versa)
 ```
 
-TypeScript 不是"客户端 SDK",是 Go 的**等效重写**:同样的 URL 方案、同样的命令词表、同样的 `@`-绑定与隔离与权限模型。两端逐命令行为一致(有跨实现 conformance 测试守着)。
+TypeScript is not a "client SDK" — it's an **equivalent re-implementation** of Go: same URL scheme, same command vocabulary, same `@`-binding, isolation, and permission model. The two engines behave identically command-for-command (a conformance test guards this).
 
-## 一点感觉
+## A taste
 
-后端声明一次(Go):
+Declare once on the backend (Go):
 
 ```go
 notes := dopdb.New[string, *Note](dopdb.WithCollection("notes")).
-    HttpOn() // 先全开,联调顺了再用 agent 收紧权限
+    HttpOn() // debug: everything on; tighten with an agent once it works
 ```
 
-前端直接用(TypeScript,无需任何接口代码):
+Use it directly on the frontend (TypeScript, no endpoint code):
 
 ```ts
-await db.notes.hSet("@uuid", { text: "买牛奶" }); // 新建(后端生成 id)
-const mine = await db.notes.hGetAll();            // 只会拿到我自己的 notes
+await db.notes.hSet("@uuid", { text: "buy milk" }); // create (server generates the id)
+const mine = await db.notes.hGetAll();              // only ever returns my own notes
 ```
 
-中间那层"接口"——没有了。
+The "API layer" in the middle — gone.
 
-## 适合 / 不适合
+## Good fit / not a fit
 
-**适合**:数据驱动的应用(SaaS、工具、后台、带用户隔离的 CRUD),想要前后端类型统一、想省掉接口层、用 MongoDB。
+**Good fit**: data-driven apps (SaaS, tools, dashboards, CRUD with per-user isolation) that want unified front/back types, no API layer, and MongoDB.
 
-**不适合**:以复杂多表事务/联表查询为核心的系统;不接受"把存取暴露到边缘"安全模型的场景;非 MongoDB 后端。
+**Not a fit**: systems centered on complex multi-document transactions / joins; cases that can't accept the "push access to the edge" security model; non-MongoDB backends.
 
-## 接下来
+## Next
 
-- **想知道怎么用** → 看 [`AGENTS.md`](./AGENTS.md):精炼、全覆盖的用法手册(给人或 AI 编码代理照着写)。
-- **想看每个主题的细节** → 看 [`docs/`](./docs/):数据模型、HTTP 线协议、配置、TypeScript、运行手册。
-- **想跑测试** → 看 [`docs/TESTING.md`](./docs/TESTING.md)。
+- **How to use it** → see [`AGENTS.md`](./AGENTS.md): a terse, full-coverage usage manual (for a human or an AI coding agent to follow).
+- **Per-topic detail** → see [`docs/`](./docs/): data model, HTTP wire protocol, configuration, TypeScript, runbook.
+- **Run the tests** → see [`docs/TESTING.md`](./docs/TESTING.md).

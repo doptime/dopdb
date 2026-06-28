@@ -177,3 +177,13 @@ R8 封的 M0–M5+HttpOn **仍有效**。新增承重里程碑 **M6**:把 DB API
 **环境性发现(非代码缺陷)**:默认 node v19 坏 `--import tsx`;本轮**代码侧根因修**(conformance 子进程优先用本地 `node_modules/.bin/tsx`,回退 `node --import tsx`)+ npm test 用 `/opt/homebrew/bin/node`(v25.2.1)。
 
 **承重终判归 Opus**:R9 承重核心(真 Mongo 四族逐命令两端一致)以真实输出通过;两处 directive 明列但未达 100% 的项已如实标注。Opus 据真实输出对 M6 落终判联签后,M6 完成。
+
+## 13 · M6 封板(2026-06-28 · Opus 终判)
+
+**✅ SEALED —— M6 redisdb-compat 完成。** 详见 `rounds/R9/SEALED.md`(Opus 终判联签)。
+
+Opus 独立复核:TS 亲跑 tsc 干净 + 74/0/1;15 个 conformance 测试函数实存(与 15/15 吻合);承重 bug(`All` 缺新命令位)确已两端修复;四类型 Go 源真实完整、已提交、树干净。真实输出:build/vet/gofmt+tsc 零错;conformance 15/15(ZSet 16/16)真 Mongo 两端一致;go test 四包零 FAIL;npm test 74/0/1。
+
+**M6 交付**:Hash 全族(补 HScan/HScanNoValues/HRandField)+ String/List/Set/ZSet 四类型(Go+TS),真 Mongo 两端逐命令一致,HttpOn 生效,owner-scope 沿用,TTL 写路径就位。⛔ 阻塞 op 不做。可选跟进(本地已诚实标注):① TS 客户端方法行为测试;② TTL 过期独立测试。
+
+**项目状态**:M0–M5 + HttpOn(R8 封)+ M6 redisdb-compat(R9 封)均已 Opus 终判。文档(README/AGENTS + docs/)本轮更新为英文并反映四新类型。

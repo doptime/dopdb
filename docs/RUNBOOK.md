@@ -1,43 +1,44 @@
-# RUNBOOK · dopdb 构建 / 测试 / 运行 / 迁移
+# RUNBOOK · dopdb build / test / run / migrate
 
-## 前置
+## Prerequisites
 
-- **Go** ≥ 1.22(driver `go.mongodb.org/mongo-driver/v2`)。
-- **Node** ≥ 20(TS 实现;`mongodb` ^6 为 peer 依赖)。
-- **MongoDB**:普通实例即可跑大部分集成测试;**`watch`(change stream)需副本集**。
+- **Go** ≥ 1.22 (driver `go.mongodb.org/mongo-driver/v2`).
+- **Node** ≥ 20 (the TS implementation; `mongodb` ^6 is a peer dependency). For the conformance test's TS subprocess, **Node ≥ 20.6** (the `--import tsx` loader); older defaults: run via the local `node_modules/.bin/tsx`, or set `DOPDB_TS_NODE` to a newer node.
+- **MongoDB**: a plain instance runs most integration tests; **`watch` (change streams) needs a replica set**.
 
-## Go:构建与测试
+## Go: build and test
 
 ```bash
-make build         # go build ./...(根包直连 driver,需联网拉取一次 driver 模块)
+make build         # go build ./... (root binds the driver; one network fetch of the driver module)
 make vet           # go vet ./...
-make fmt-check     # gofmt 校验
-make test          # go test ./...(集成测试在未设 DOPDB_TEST_MONGO_URI 时自动跳过)
-make test-mongo    # DOPDB_TEST_MONGO_URI=mongodb://... 跑集成测试(watch 需副本集)
+make fmt-check     # gofmt check
+make test          # go test ./... (integration tests auto-skip when DOPDB_TEST_MONGO_URI is unset)
+make test-mongo    # DOPDB_TEST_MONGO_URI=mongodb://... runs integration tests (watch needs a replica set)
 ```
 
-- **单测**(`api/`、`config/`、`httpserve/` 的 api-dispatch/permission):无需数据库。
-- **集成测试**(根包 `dopdb_test.go`、`httpserve/integration_test.go`):需 `DOPDB_TEST_MONGO_URI`,各自用一次性数据库,结束即 drop。
+- **Unit tests** (`api/`, `config/`, `httpserve/` api-dispatch/permission): no database needed.
+- **Integration tests** (root `dopdb_test.go`, `httpserve/integration_test.go`): need `DOPDB_TEST_MONGO_URI`, each uses a throwaway database and drops it at the end.
+- **Conformance** (`httpserve/conformance_test.go`): needs `DOPDB_TEST_MONGO_URI` and starts a TS subprocess; covers every command including all String/List/Set/ZSet.
 
 ```bash
-# 例:本地副本集(单节点)便于跑 watch
+# e.g. local single-node replica set for watch
 DOPDB_TEST_MONGO_URI="mongodb://localhost:27017/?replicaSet=rs0" make test-mongo
 ```
 
-## TypeScript:构建与测试
+## TypeScript: build and test
 
 ```bash
 make ts            # cd ts && npm install && npm run build
-make ts-typecheck  # tsc -p tsconfig.json --noEmit(strict)
+make ts-typecheck  # tsc -p tsconfig.json --noEmit (strict)
 make ts-test       # node --import tsx --test test/*.test.ts
 ```
 
-TS 单测多数无需真库(`server.test.ts` 用注入的内存假 Mongo;`config.test.ts` 仅解析 TOML)。
+Most TS unit tests need no real DB (`server.test.ts` uses an injected in-memory fake Mongo; `config.test.ts` only parses TOML).
 
-## 运行(Go)
+## Run (Go)
 
 ```toml
-# config.toml(密钥从环境变量解析)
+# config.toml (secrets resolved from env)
 [http]
 addr = ":8080"
 jwt_secret_env = "DOPTIME_JWT_SECRET"
@@ -49,33 +50,36 @@ db = "appdb"
 ```
 
 ```bash
-export DOPTIME_JWT_SECRET="...HS256 密钥或 RS256 PEM..."
+export DOPTIME_JWT_SECRET="...HS256 secret or RS256 PEM..."
 export DOPTIME_MONGO_URI="mongodb://user:pw@host:27017/?authSource=admin"
-./your-server   # 内部:config.Load → httpserve.Serve(cfg, WithPermissions(perms))
+./your-server   # internally: config.Load → httpserve.Serve(cfg)
 ```
 
-请求示例:
+Example requests:
 
 ```bash
 TOKEN="Bearer <jwt>"
-# 写(默认数据源)
+# write (default source)
 curl -XPOST "localhost:8080/api/hset/users?f=u1" -H "Authorization: $TOKEN" -d '{"name":"Ada","email":"ada@x.io","age":30}'
-# 读(指定数据源)
+# read (specific source)
 curl "localhost:8080/api/hget/users?ds=analytics&f=u1" -H "Authorization: $TOKEN"
-# 我自己的记录
+# my own record
 curl "localhost:8080/api/hget/profiles?f=@uid" -H "Authorization: $TOKEN"
-# 查询(过滤器走 body)
+# query (filter in the body)
 curl -XPOST "localhost:8080/api/find/users?limit=20" -H "Authorization: $TOKEN" -d '{"age":{"$gte":18}}'
-# 实时订阅(SSE)
+# list push / range
+curl -XPOST "localhost:8080/api/rpush/queue?f=jobs" -H "Authorization: $TOKEN" -d '{"item":"job1"}'
+curl "localhost:8080/api/lrange/queue?f=jobs&start=0&stop=-1" -H "Authorization: $TOKEN"
+# live subscribe (SSE)
 curl -N "localhost:8080/api/watch/users" -H "Authorization: $TOKEN"
 ```
 
-## 从旧版本迁移(要点)
+## Migrating from older versions (highlights)
 
-- **URL**:数据命令从旧的 `CMD-KEY` 段改为 `/api/<cmd>/<coll>`;数据源从路径段改为 `?ds=<name>`。
-- **Store/Codec**:已删除;若曾依赖 `memstore`/`mongostore`/`WithStore`,改为直接 `New[...]` + `SetDatasources`/`ConnectDatasources`。
-- **权限**:`auto_auth` 已移除;改为显式 `Grant`(或加载 JSON)。默认拒绝。
-- **WASM**:已退场;TS 是独立等效实现,直接用 `dopdb/client` 与 `dopdb/server`。
-- **API 钩子**:`ParamEnhancer/ResultSaver/ResponseModifier` 已去除,仅保留 `Validate`。
+- **URL**: data commands move from the old `CMD-KEY` segment to `/api/<cmd>/<coll>`; the data source moves from a path segment to `?ds=<name>`.
+- **Store/Codec**: removed; if you relied on `memstore`/`mongostore`/`WithStore`, switch to plain `New[...]` + `SetDatasources`/`ConnectDatasources`.
+- **Permissions**: `auto_auth` removed; expose a collection with `.HttpOn(...)` (default off). The legacy `Permissions` map still works as a runtime override.
+- **WASM**: retired; TS is a standalone equivalent — use `dopdb/client` and `dopdb/server`.
+- **API hooks**: `ParamEnhancer/ResultSaver/ResponseModifier` removed; only `Validate` remains.
 
-> 注意:本仓库 Go 代码绑定 driver v2,请在本机 `go build ./...` 确认 API 细节;TS 已通过严格类型检查与全部单测。
+> Note: the Go code binds driver v2 — run `go build ./...` locally to confirm API details; the TS side passes strict type-checking and all unit tests.

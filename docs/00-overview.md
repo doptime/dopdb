@@ -1,52 +1,58 @@
-# 00 · dopdb 总览(架构 · 取舍 · 包地图)
+# 00 · Overview (architecture · trade-offs · package map)
 
-## 它是什么
+## What it is
 
-dopdb 把 `doptime` + `redisdb` + `doptime-client` 合并重写,后端换成 MongoDB。核心主张:**一份 schema 同时产出类型、校验、带类型的客户端、服务端**,不生成代码、不前后端各写一遍。
+dopdb is a merge-rewrite of `doptime` + `redisdb` + `doptime-client`, with the backend swapped to MongoDB. Core thesis: **one schema produces the types, validation, typed client, and server at once** — no codegen, no writing it twice on front and back.
 
-## 两套对等实现
+## Two equivalent implementations
 
-dopdb 不是“一个 Go 服务 + 一个 TS 客户端”,而是 **两套对等的完整实现**,共享同一线协议与全部特性:
+dopdb is not "a Go server + a TS client" — it is **two equivalent, complete implementations** sharing one wire protocol and every feature:
 
-- **Go**(根包 `dopdb` + `api/` + `httpserve/` + `config/`):服务端,直连 MongoDB 驱动。
-- **TypeScript**(`ts/`):既能在 Node 跑同样的服务端,也能在浏览器做带类型客户端。
+- **Go** (root package `dopdb` + `api/` + `httpserve/` + `config/`): the server, bound directly to the MongoDB driver.
+- **TypeScript** (`ts/`): runs the same server on Node, and provides a typed browser client.
 
-同样的 URL 方案(`/api/<cmd>/<coll>` + `?ds=`)、同样的命令词表、同样的 `@`-绑定 / 行级隔离 / 权限模型。两端可混用。
+Same URL scheme (`/api/<cmd>/<coll>` + `?ds=`), same command vocabulary, same `@`-binding / row-level isolation / permission model. The two engines may be mixed.
 
-## 关键取舍(本轮确定)
+## Key trade-offs
 
-| 取舍 | 说明 |
+| Trade-off | Note |
 |---|---|
-| 直连 Mongo,删 Store 抽象 | 删除 `Store`/`Codec` 接口与 `memstore`/`mongostore`;根包直接用 driver v2,把 Mongo 当 Mongo 用 |
-| 多数据源 + `?ds=` | 配置可多个 `[[mongo]]`;请求用 `?ds=<name>` 选源,缺省 `default`;源不进路径 |
-| 闭合命令词表 | 见 `02-http`;新增 `hmset/hmget/count/findone/watch` |
-| `@`-绑定 | 服务端注入身份/上下文,客户端 `@`-键剥除(防伪造) |
-| 行级隔离 | owner-scope:整集合读取强制 `{owner: 我}` |
-| 权限默认拒绝 | `Grant/Deny/Allowed` + JSON 持久化;**无 AutoAuth** |
-| JWT | HS256 + RS256;拒绝 `none` |
-| watch | change stream → SSE(需副本集) |
-| API 极简 | `decode → Validate → Func`,去掉钩子链 |
-| WASM 退场 | TS 是独立等效实现,不再 WASM 桥接 |
+| Direct to Mongo, no Store abstraction | the `Store`/`Codec` interfaces and `memstore`/`mongostore` are gone; the root package uses driver v2 directly — Mongo used as Mongo |
+| Multiple data sources + `?ds=` | config may hold several `[[mongo]]`; a request selects one with `?ds=<name>` (default `default`); the source is not in the path |
+| Closed command vocabulary | see `02-http`; covers Hash + String/List/Set/ZSet |
+| Redis-compatible data structures | beyond Hash, dopdb implements String/List/Set/ZSet on Mongo; blocking ops (BLPop/BRPop/BRPopLPush) are intentionally not implemented (see `REDISDB-COMPAT`) |
+| `@`-binding | the server injects identity/context; client `@`-keys are stripped (anti-forgery) |
+| Row-level isolation | owner-scope: whole-collection reads are forced to AND `{owner: me}` |
+| Expose + authorize in one line | `HttpOn(...)` registers a collection to HTTP and declares the allowed commands (bitmask); default off until called |
+| JWT | HS256 + RS256; `none` rejected |
+| watch | change stream → SSE (needs a replica set) |
+| Minimal functional API | `decode → Validate → Func`, no hook chain |
+| WASM retired | TS is a standalone equivalent implementation, no WASM bridge |
 
-## 包地图(Go)
+## Package map (Go)
 
 ```
-dopdb.go          泛型 Collection[K,V]:原生可信 API(HGet/HSet/Find/HIncrBy/...)
+dopdb.go          generic Collection[K,V]: native trusted API (HGet/HSet/Find/HIncrBy/HScan/HRandField/...)
+string.go         StringCollection[K]: String type (STR* commands) + TTL
+list.go           ListCollection[K,E]: List type (L*/R* commands, atomic pop)
+set.go            SetCollection[K]: Set type (S* commands)
+zset.go           ZSetCollection[K]: ZSet type (Z* commands)
 types.go          M / FindOpt / SortKey / IndexSpec / ErrNoDoc / ErrForbidden
-mongo.go          mongoBackend(直连 driver v2 的 CRUD/索引/watch)+ Datasources 注册表
-http_accessor.go  HttpAccessor:类型擦除桥(把 V 装箱成 any 供 HTTP 派发)+ owner-scope 策略
-modifiers.go      写入修饰器(时间戳、@-绑定字段)
-sanitize.go       过滤器消毒(拒绝 $-运算符注入到键)
-api/api.go        函数式 API 端点注册与派发
-httpserve/        context(路由+JWT+@-解析) / serve(派发+watch) / permission / jwt / bootstrap(Serve)
-config/config.go  TOML 读取(多 [[mongo]];密钥从环境变量解析,绝不入文件)
+mongo.go          mongoBackend (CRUD/indexes/watch/sample/scan via driver v2) + Datasources registry
+http_accessor.go  HttpAccessor: type-erasure bridge (box V as any for HTTP dispatch) + owner-scope policy
+perms.go          Perm bitmask (uint64; one bit per command) + groups + HttpOn gate
+modifiers.go      write modifiers (timestamps, @-bound fields)
+sanitize.go       filter sanitization (reject $-operators injected as keys)
+api/api.go        functional API endpoint registration + dispatch
+httpserve/        context (routing+JWT+@-parse) / serve (dispatch+watch) / permission / jwt / bootstrap (Serve)
+config/config.go  TOML loading (multiple [[mongo]]; secrets from env, never in files)
 ```
 
-> 已删除的包/文件:`store.go`、`memstore/`、`mongostore/`(逻辑内联进 `mongo.go`)、`wasm/`、旧的 `clients/`(WASM 版)。
+> Deleted packages/files: `store.go`, `memstore/`, `mongostore/` (inlined into `mongo.go`), `wasm/`, the old WASM `clients/`.
 
-## 两个面(Go 与 TS 一致)
+## Two faces (Go and TS alike)
 
-- **可信面**:服务端内部直接读写,无 scope、无 JWT。Go 用 `Collection` 原生方法;TS 用 `serverDb(schema, db)`。
-- **受控面**:对外 HTTP,强制 JWT `@`-绑定、owner-scope、权限。Go 用 `httpserve`;TS 用 `serve(cfg)`。
+- **Trusted face**: the server reads/writes internally — no scope, no JWT. Go uses `Collection` native methods; TS uses `serverDb(schema, db)`.
+- **Controlled face**: the outward HTTP boundary enforces JWT `@`-binding, owner-scope, and permissions. Go uses `httpserve`; TS uses `serve(cfg)`.
 
-继续阅读:`01-data`(数据层)、`02-http`(HTTP/安全)、`03-config`(配置)、`04-typescript`(TS 等效实现)、`RUNBOOK`。
+Read on: `01-data` (data layer), `02-http` (HTTP/security), `03-config` (configuration), `04-typescript` (TS equivalent), `REDISDB-COMPAT` (Redis-compatible data structures), `RUNBOOK`.
