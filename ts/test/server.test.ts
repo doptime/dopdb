@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
 import type { AddressInfo } from "node:net";
 
-import { f, collection } from "../src/schema.js";
+import { f, collection, ReadOnly } from "../src/schema.js";
 import { defineApi, _clearApiRegistry } from "../src/api.js";
 import { serve, type DopdbServer } from "../src/server.js";
 import { clientDb } from "../src/client.js";
@@ -547,4 +547,41 @@ test("srv.listener can handle a fake HTTP request", async () => {
   srv.listener(req, res);
   await sleep(50);
   assert.ok(res._body.length > 0, "listener should produce a response body");
+});
+
+// ---- httpOn permission gate (Task 2) ----------------------------------------
+// A collection's .httpOn(...) bitmask is the grant; no permit function needed.
+test("httpOn gates data commands without a permit function", async () => {
+  const ronly = collection({ _id: f.string(), text: f.string() }).named("ronly").httpOn(ReadOnly);
+  const full = collection({ _id: f.string(), text: f.string() }).named("full").httpOn(); // debug: all on
+  const s = await serve({
+    schema: { Ronly: ronly, Full: full },
+    mongo: fakeMongo() as any,
+    jwtSecret: SECRET,
+    // NO permit / permissions — the httpOn bitmask is the only grant.
+    port: 0,
+  });
+  try {
+    const addr = s.http!.address() as AddressInfo;
+    const b = `http://127.0.0.1:${addr.port}`;
+    const tok = makeJWT({ uid: "alice" }, SECRET);
+    const req = async (m: string, p: string, body?: unknown) => {
+      const r = await fetch(b + p, {
+        method: m,
+        headers: {
+          Authorization: `Bearer ${tok}`,
+          ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
+        },
+        body: body !== undefined ? JSON.stringify(body) : undefined,
+      });
+      return r.status;
+    };
+    // ReadOnly collection: writes forbidden, reads allowed (404 for missing, not 403).
+    assert.equal(await req("POST", "/api/hset/ronly?f=k1", { text: "x" }), 403, "hset on ReadOnly httpOn → 403");
+    assert.notEqual(await req("GET", "/api/hget/ronly?f=k1"), 403, "hget on ReadOnly httpOn → not 403");
+    // Debug-all collection: writes allowed.
+    assert.equal(await req("POST", "/api/hset/full?f=k1", { text: "x" }), 200, "hset on httpOn() all → 200");
+  } finally {
+    await s.close();
+  }
 });

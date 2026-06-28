@@ -9,6 +9,11 @@ import {
   specOf,
   buildSpec,
   nanoid,
+  HGet,
+  HSet,
+  ReadOnly,
+  Writes,
+  All,
 } from "../src/schema.js";
 import { ValidationError } from "../src/errors.js";
 
@@ -97,4 +102,15 @@ test("buildSpec: emits the whole schema as one data document", () => {
   // round-trips through JSON (it is the artifact a Go engine would read)
   const json = JSON.parse(JSON.stringify(spec));
   assert.equal(json.collections.find((c: any) => c.name === "orders").ownerField, "owner");
+});
+
+test("httpOn declares the command bitmask; no args = All", () => {
+  const c1 = collection({ _id: f.string() }).named("a").httpOn(HGet, HSet);
+  assert.equal(c1.opts.httpPerm, HGet | HSet);
+  const c2 = collection({ _id: f.string() }).named("b").httpOn();
+  assert.equal(c2.opts.httpPerm, All);
+  const c3 = collection({ _id: f.string() }).named("c").httpOn(ReadOnly);
+  assert.equal(c3.opts.httpPerm, ReadOnly);
+  // Writes is disjoint from ReadOnly; together they make All.
+  assert.equal(ReadOnly | Writes, All);
 });

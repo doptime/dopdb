@@ -17,6 +17,7 @@ import {
   prepareWrite,
   resolveToken,
   specOf,
+  CMD_BIT,
   type CollectionSpec,
 } from "./schema.js";
 import { sanitizeFilter, type Filter } from "./sanitize.js";
@@ -637,6 +638,15 @@ async function buildRuntime(cfg: ServeConfig): Promise<Runtime> {
     byName.set(storage, { coll, storage });
   }
 
+  // httpOn bitmask check (mirrors Go dopdb.HttpAllowed): a collection's
+  // .httpOn(...) flags are the primary grant for data commands; the `gate`
+  // (permit / permissions / deny-all) still applies as a fallback / override.
+  const httpAllows = (cmd: string, coll: string): boolean => {
+    const perm = byName.get(coll)?.coll.opts.httpPerm ?? 0;
+    const bit = CMD_BIT[cmd.toUpperCase()] ?? 0;
+    return bit !== 0 && (perm & bit) !== 0;
+  };
+
   async function resolve(input: ReqInput): Promise<Outcome> {
     const r = input.segments ? routeSegments(input.segments) : routePath(input.url.pathname, basePath);
     if (!r) return { kind: "json", status: 404, body: { error: "not a dopdb route", code: "not_found" } };
@@ -670,7 +680,7 @@ async function buildRuntime(cfg: ServeConfig): Promise<Runtime> {
     const entry = byName.get(r.coll);
     if (!entry) return { kind: "json", status: 404, body: { error: `collection not registered: ${r.coll}`, code: "not_found" } };
     const coll = entry.coll;
-    if (!gate(r.cmd, r.coll, claims)) throw new ForbiddenError(`not permitted: ${r.cmd}::${r.coll}`);
+    if (!httpAllows(r.cmd, r.coll) && !gate(r.cmd, r.coll, claims)) throw new ForbiddenError(`not permitted: ${r.cmd}::${r.coll}`);
 
     const scope = ownerScope(coll, claims);
     const ds = input.url.searchParams.get("ds") || "default";

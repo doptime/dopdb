@@ -149,10 +149,48 @@ export const f = {
 
 export type Shape = Record<string, Field<any, any, any>>;
 
+// ---- HTTP permission bitmask (mirrors Go dopdb.Perm) -----------------------
+// One bit per command in the closed vocabulary; use with collection.httpOn().
+export const HGet = 1 << 0;
+export const HSet = 1 << 1;
+export const HSetNX = 1 << 2;
+export const HDel = 1 << 3;
+export const Del = 1 << 4;
+export const HExists = 1 << 5;
+export const HGetAll = 1 << 6;
+export const HKeys = 1 << 7;
+export const HVals = 1 << 8;
+export const HLen = 1 << 9;
+export const HIncrBy = 1 << 10;
+export const HIncrByFloat = 1 << 11;
+export const HMSet = 1 << 12;
+export const HMGet = 1 << 13;
+export const Count = 1 << 14;
+export const Find = 1 << 15;
+export const FindOne = 1 << 16;
+export const Watch = 1 << 17;
+/** Every non-mutating command. */
+export const ReadOnly =
+  HGet | HExists | HGetAll | HKeys | HVals | HLen | HMGet | Count | Find | FindOne | Watch;
+/** Every mutating command. */
+export const Writes = HSet | HSetNX | HDel | Del | HIncrBy | HIncrByFloat | HMSet;
+/** Everything — the httpOn() debug default. */
+export const All = ReadOnly | Writes;
+/** doptime-compatible alias for All. */
+export const HashAll = All;
+/** Map an HTTP command string (upper-case) to its Perm bit. */
+export const CMD_BIT: Record<string, number> = {
+  HGET: HGet, HSET: HSet, HSETNX: HSetNX, HDEL: HDel, DEL: Del, HEXISTS: HExists,
+  HGETALL: HGetAll, HKEYS: HKeys, HVALS: HVals, HLEN: HLen, HINCRBY: HIncrBy,
+  HINCRBYFLOAT: HIncrByFloat, HMSET: HMSet, HMGET: HMGet, COUNT: Count, FIND: Find,
+  FINDONE: FindOne, WATCH: Watch,
+};
+
 export interface CollectionOpts {
   name?: string; // collection name (defaults to the variable name via define())
   ownerField?: string; // row-level owner scope field
   db?: string; // non-default datasource/database
+  httpPerm?: number; // HTTP command bitmask declared by .httpOn() (mirrors Go dopdb.Perm)
 }
 
 export class Collection<S extends Shape> {
@@ -172,6 +210,14 @@ export class Collection<S extends Shape> {
    * `field == <caller's claim>`, so users only ever see their own rows. */
   ownerScope(field: keyof S & string): Collection<S> {
     return new Collection(this.shape, { ...this.opts, ownerField: field });
+  }
+  /** Expose this collection over HTTP and declare which commands the client may
+   * call — doptime/redisdb style. No arguments enables EVERYTHING (the debug
+   * default); tighten later, e.g. `.httpOn(HGet | HGetAll | HSet | HDel)` or
+   * `.httpOn(ReadOnly)`. Mirrors the Go `Collection.HttpOn(...dopdb.Perm)`. */
+  httpOn(...perms: number[]): Collection<S> {
+    const p = perms.length ? perms.reduce((a, b) => a | b, 0) : All;
+    return new Collection(this.shape, { ...this.opts, httpPerm: p });
   }
 }
 

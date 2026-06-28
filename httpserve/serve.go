@@ -95,8 +95,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Permission gate: command :: collection.
-	if !h.Perms.Allowed(c.Cmd, c.Coll) {
+	// Permission gate: command :: collection. A collection's HttpOn(...) bitmask
+	// is the primary source of truth (debug default = all on); the legacy
+	// Perms grant/deny map still works for back-compat and runtime overrides.
+	if !dopdb.HttpAllowed(c.Cmd, c.Coll) && !h.Perms.Allowed(c.Cmd, c.Coll) {
 		writeErr(w, http.StatusForbidden, "forbidden", errors.New("not permitted: "+c.Cmd+"::"+c.Coll))
 		return
 	}

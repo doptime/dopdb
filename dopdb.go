@@ -136,6 +136,32 @@ func (c *Collection[K, V]) ensureIndexes(b *mongoBackend, ds string) {
 // Collection returns the underlying collection name.
 func (c *Collection[K, V]) Collection() string { return c.coll }
 
+// HttpOn exposes this collection to the HTTP data-command layer and declares
+// which commands the client may call — doptime/redisdb style, e.g.
+//
+//	dopdb.New[string, *Note](dopdb.WithCollection("notes")).HttpOn()                       // debug: ALL commands on
+//	dopdb.New[string, *Note](dopdb.WithCollection("notes")).HttpOn(dopdb.ReadOnly)          // reads only
+//	dopdb.New[string, *Note](dopdb.WithCollection("notes")).HttpOn(dopdb.HGet | dopdb.HGetAll | dopdb.HSet | dopdb.HDel)
+//
+// With NO arguments it enables EVERYTHING (the debug default) — convenient to
+// get moving, then have an audit agent tighten it (edit the flags here, or call
+// dopdb.SetHttpPerm at runtime). It registers the collection too (no separate
+// RegisterHttp call needed) and returns the collection so the call chains.
+// Authorization for data commands is decided solely by this bitmask — see
+// HttpAllowed; the old per-command Grant/Deny bookkeeping is no longer required.
+func (c *Collection[K, V]) HttpOn(perms ...Perm) *Collection[K, V] {
+	p := All // debug default: every command on
+	if len(perms) > 0 {
+		p = 0
+		for _, x := range perms {
+			p |= x
+		}
+	}
+	setHTTPPerm(c.coll, p)
+	RegisterHttp(c)
+	return c
+}
+
 // ---- key serialization (one canonical codec; fixes redisdb's 3-way split) ----
 
 // serializeKey produces the string _id for a key. Strings pass through;
