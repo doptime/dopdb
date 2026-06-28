@@ -42,12 +42,21 @@ Server 入口(`import { serve } from "dopdb/server"`)是 **Node 侧**:需 `@type
   `hSet/hGet/hGetAll/hDel` → `hset/hget/hgetall/hdel`;`{ token }` → `{ getToken }`;`Map<id,Note>` → `Record<id,Note>`。
 - **修复后冒烟 tsc 退出 0**(对应 doc 示例与实际 `DbApi` 一致)。
 
-## §2.3 真实发布(npm publish)—— ⏳ 待用户
-**未执行**。`npm publish` 需发布凭证(用户的 npm 账号 automation token,有 `dopdb` 包发布权)。本机无该凭证,不臆造、不假跑。
-**建议执行**(用户):
-1. `npm login`(或设 `~/.npmrc` 的 `//registry.npmjs.org/:_authToken=<token>`)。
-2. `cd ts && npm publish --dry-run` 再 `npm publish --access public --tag alpha`(alpha 用 tag 避占 `latest`)。
-3. 用户 app:`npm install dopdb@alpha`,跑本回执 §2.4 同款冒烟确认。
+## §2.3 真实发布(npm publish)—— 经 GitHub Action(用户选)
+**发布路径 = GitHub Action** `.github/workflows/publish-npm.yml`(用户在 GitHub 后台填 `NPM_TOKEN` secret)。本机已将该 workflow **加固**:
+- **provenance 自动降级**:public repo 带 `--provenance`,private 退回无 provenance(`pipefail` 确保上游 npm 失败被 `if` 捕获 → 回退;已本地验证 `set -euo pipefail` + 管道语义正确)。
+- **dist-tag 可选**(`alpha`/`latest`/`beta`,手动触发时选;alpha 默认,避免占 `latest`)。
+- **dry_run 输入**(只 pack 不 publish,先试)。
+- **version 提示**:npm 拒绝重发同版本——README §Publishing 已写明每次发布前 bump `ts/package.json` 的 `version`。
+- **tarball 永久 artifact**(无论 publish 成败,`ts/*.tgz` 上传为 artifact,便于排查)。
+- YAML + publish-step bash 经 `js-yaml` 解析 + `bash -n` 校验通过。
+
+**用户操作步骤**(已写入 repo README §"Publishing the TypeScript package to npm"):
+1. npm 建 Automation token(有 `dopdb` 发布权)→ GitHub repo Settings → Secrets → Actions → `NPM_TOKEN`。
+2. 每次 bump `ts/package.json` 版本 → 发 GitHub Release 或 Actions 手动 Run(选 `npm_tag`)。
+3. 消费端 `npm install dopdb@alpha`。
+
+本机无用户 npm 凭证,**真实 publish 由用户经 Action 触发**;Action 跑通后用户把 run 日志贴回即可发终审。
 
 ## §3 验收
 - ✅ §2.1 lockfile 同步、§2.2 本机 typecheck/build/test 全绿、§2.3 pack 产物正确(63.5 kB,无源/测试/配置)、§2.4 **app 安装冒烟通过**(三入口类型解析;且抓出并修复了文档驼峰 bug)。

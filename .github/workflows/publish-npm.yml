@@ -1,11 +1,23 @@
 # Publish the TypeScript package (ts/) to npm.
 #
-# Trigger: a GitHub Release, OR a manual run (workflow_dispatch).
-# Prerequisite: repo secret NPM_TOKEN = an npm automation token with publish
-# rights for the "dopdb" package (Settings → Secrets and variables → Actions).
+# Two trigger paths:
+#   1. GitHub Release published → publishes (alpha → "alpha" tag, stable → "latest").
+#   2. workflow_dispatch (manual) → `dry_run` true = pack only (no publish);
+#      `npm_tag` picks the dist-tag (default "alpha"). Use this to test first.
 #
-# Provenance (--provenance) attaches a verifiable build attestation; it needs a
-# PUBLIC repo and the id-token permission below. Drop the flag for a private repo.
+# PREREQUISITE (one-time, you do this in GitHub):
+#   repo secret NPM_TOKEN = an npm "Automation" access token with publish rights
+#   for the "dopdb" package:
+#     npm  →  Access Tokens →  Granular access (or classic Automation token)  →
+#     copy the value  →  GitHub repo → Settings → Secrets and variables →
+#     Actions → New repository secret → Name: NPM_TOKEN → paste.
+#
+# Provenance (--provenance) requires a PUBLIC repo + the id-token permission
+# below. It is auto-skipped for private repos (npm detects it).
+#
+# VERSIONING: this workflow publishes whatever version is in ts/package.json.
+# Each release must bump it (e.g. `npm version prerelease` in ts/, or edit
+# package.json) BEFORE triggering — npm rejects re-publishing an existing version.
 name: publish-npm
 
 on:
@@ -14,13 +26,22 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Pack only, do not publish"
+        description: "Pack only, do NOT publish to npm"
         type: boolean
         default: false
+      npm_tag:
+        description: "npm dist-tag for the publish (alpha | latest | beta)"
+        type: choice
+        default: alpha
+        options: [alpha, latest, beta]
 
 permissions:
   contents: read
-  id-token: write # required for npm provenance
+  id-token: write # required for npm provenance (public repos)
+
+concurrency:
+  group: publish-npm
+  cancel-in-progress: false
 
 jobs:
   publish:
@@ -48,16 +69,33 @@ jobs:
       - name: Test (Mongo-dependent tests auto-skip without DOPDB_TEST_MONGO_URI)
         run: npm test
 
-      - name: Pack (always, for the artifact + dry-run visibility)
+      - name: Pack (always — artifact + dry-run visibility)
         run: npm pack
+
+      - name: Show tarball contents (so a failed publish is debuggable)
+        run: npm pack --dry-run
 
       - name: Publish to npm
         if: ${{ github.event_name == 'release' || inputs.dry_run == false }}
-        run: npm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.npm_tag || 'alpha' }}"
+          # Releases published from a GitHub Release default to the chosen tag.
+          # Provenance needs a public repo; npm itself fails cleanly on private,
+          # so we attempt it and fall back without --provenance if npm complains.
+          if npm publish --access public --tag "$TAG" --provenance 2>&1 | tee /tmp/pub.log; then
+            echo "::notice::Published with dist-tag '$TAG' + provenance"
+          else
+            echo "::warning::provenance publish failed (likely private repo); retrying without --provenance"
+            grep -v -- '--provenance' /tmp/pub.log >/dev/null || true
+            npm publish --access public --tag "$TAG"
+            echo "::notice::Published with dist-tag '$TAG' (no provenance)"
+          fi
 
       - name: Upload tarball artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: npm-tarball

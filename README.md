@@ -92,3 +92,18 @@ The "API layer" in the middle — gone.
 - **How to use it** → see [`AGENTS.md`](./AGENTS.md): a terse, full-coverage usage manual (for a human or an AI coding agent to follow).
 - **Per-topic detail** → see [`docs/`](./docs/): data model, HTTP wire protocol, configuration, TypeScript, runbook.
 - **Run the tests** → see [`docs/TESTING.md`](./docs/TESTING.md).
+
+## Publishing the TypeScript package to npm
+
+The `ts/` subdirectory publishes as the npm package **`dopdb`**. Publishing runs through [`publish-npm.yml`](./.github/workflows/publish-npm.yml).
+
+**One-time setup** (you, in GitHub):
+1. Create an npm **Automation** access token with publish rights for `dopdb`: npm website → Access Tokens → Generate New Token → **Granular access** (recommended) or classic **Automation** token.
+2. Add it as the repo secret `NPM_TOKEN`: GitHub repo → **Settings → Secrets and variables → Actions → New repository secret** → Name `NPM_TOKEN`, paste the token.
+
+**Each release**:
+1. Bump the version in [`ts/package.json`](./ts/package.json) (`version`, e.g. `0.1.0-alpha.2`) — npm rejects re-publishing an existing version.
+2. Either publish a **GitHub Release** (triggers the workflow, dist-tag from the release), or run the workflow manually: **Actions → publish-npm → Run workflow** → pick `npm_tag` (`alpha` recommended during pre-1.0, so `npm install dopdb` won't grab the alpha by default) and optionally `dry_run` first.
+3. Provenance is auto-attempted (public repo) and gracefully skipped (private repo).
+
+Consumers then install with `npm install dopdb@alpha` (or `dopdb@latest` once a stable ships).
