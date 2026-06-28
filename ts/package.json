@@ -1,8 +1,39 @@
 {
   "name": "dopdb",
   "version": "0.1.0-alpha.1",
-  "description": "One TypeScript source of truth for DB + API: native types, no codegen, no double-write. Browser client (fetch) and Node server (MongoDB) from the same schema.",
+  "description": "One schema, two equivalent engines (Go + TypeScript), one wire protocol. Declare a collection once and get native types, runtime validation, a typed browser client (fetch), and a Node + MongoDB server — no codegen, no double-write. Redis-compatible data structures (Hash/String/List/Set/ZSet) on MongoDB.",
   "type": "module",
+  "license": "MIT",
+  "author": "doptime",
+  "homepage": "https://github.com/doptime/dopdb/tree/main/ts#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/doptime/dopdb.git",
+    "directory": "ts"
+  },
+  "bugs": {
+    "url": "https://github.com/doptime/dopdb/issues"
+  },
+  "keywords": [
+    "mongodb",
+    "typescript",
+    "schema",
+    "orm",
+    "odm",
+    "redis",
+    "redisdb",
+    "doptime",
+    "typed-client",
+    "fullstack",
+    "nextjs",
+    "rpc",
+    "multi-tenant",
+    "jwt"
+  ],
+  "sideEffects": false,
+  "main": "./dist/src/index.js",
+  "module": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
   "exports": {
     ".": {
       "types": "./dist/src/index.d.ts",
@@ -15,23 +46,36 @@
     "./server": {
       "types": "./dist/src/server.d.ts",
       "import": "./dist/src/server.js"
-    }
+    },
+    "./package.json": "./package.json"
   },
-  "files": ["dist/src", "dist/bin"],
+  "files": [
+    "dist/src",
+    "dist/bin",
+    "README.md",
+    "LICENSE"
+  ],
   "bin": {
     "dopdb-spec": "./dist/bin/spec.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf dist",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --import tsx --test test/*.test.ts",
-    "test:types": "tsc -p tsconfig.json --noEmit"
+    "test:types": "tsc -p tsconfig.json --noEmit",
+    "prepublishOnly": "npm run clean && npm run typecheck && npm run build"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "peerDependencies": {
     "mongodb": "^6.0.0"
   },
   "peerDependenciesMeta": {
-    "mongodb": { "optional": true }
+    "mongodb": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
@@ -41,6 +85,5 @@
   },
   "engines": {
     "node": ">=20"
-  },
-  "license": "MIT"
+  }
 }

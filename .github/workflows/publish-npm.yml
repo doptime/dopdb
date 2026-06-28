@@ -1,0 +1,64 @@
+# Publish the TypeScript package (ts/) to npm.
+#
+# Trigger: a GitHub Release, OR a manual run (workflow_dispatch).
+# Prerequisite: repo secret NPM_TOKEN = an npm automation token with publish
+# rights for the "dopdb" package (Settings → Secrets and variables → Actions).
+#
+# Provenance (--provenance) attaches a verifiable build attestation; it needs a
+# PUBLIC repo and the id-token permission below. Drop the flag for a private repo.
+name: publish-npm
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Pack only, do not publish"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write # required for npm provenance
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ts # the package lives in the ts/ subdirectory
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: Install
+        run: npm ci || npm install
+
+      - name: Type-check
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      - name: Test (Mongo-dependent tests auto-skip without DOPDB_TEST_MONGO_URI)
+        run: npm test
+
+      - name: Pack (always, for the artifact + dry-run visibility)
+        run: npm pack
+
+      - name: Publish to npm
+        if: ${{ github.event_name == 'release' || inputs.dry_run == false }}
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Upload tarball artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-tarball
+          path: ts/*.tgz
