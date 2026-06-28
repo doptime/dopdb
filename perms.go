@@ -31,12 +31,15 @@ const (
 	Find
 	FindOne
 	Watch
+	HScan
+	HScanNoValues
+	HRandField
 )
 
 // Convenience groups.
 const (
 	// ReadOnly = every non-mutating command.
-	ReadOnly Perm = HGet | HExists | HGetAll | HKeys | HVals | HLen | HMGet | Count | Find | FindOne | Watch
+	ReadOnly Perm = HGet | HExists | HGetAll | HKeys | HVals | HLen | HMGet | Count | Find | FindOne | Watch | HScan | HScanNoValues | HRandField
 	// Writes = every mutating command.
 	Writes Perm = HSet | HSetNX | HDel | Del | HIncrBy | HIncrByFloat | HMSet
 	// All = everything. This is the HttpOn() debug default.
@@ -52,6 +55,7 @@ var cmdPerm = map[string]Perm{
 	"HLEN": HLen, "HINCRBY": HIncrBy, "HINCRBYFLOAT": HIncrByFloat,
 	"HMSET": HMSet, "HMGET": HMGet, "COUNT": Count, "FIND": Find,
 	"FINDONE": FindOne, "WATCH": Watch,
+	"HSCAN": HScan, "HSCANNOVALUES": HScanNoValues, "HRANDFIELD": HRandField,
 }
 
 var (
@@ -115,6 +119,7 @@ func HttpPermNames(p Perm) []string {
 		{HLen, "hlen"}, {HIncrBy, "hincrby"}, {HIncrByFloat, "hincrbyfloat"},
 		{HMSet, "hmset"}, {HMGet, "hmget"}, {Count, "count"}, {Find, "find"},
 		{FindOne, "findone"}, {Watch, "watch"},
+		{HScan, "hscan"}, {HScanNoValues, "hscannovalues"}, {HRandField, "hrandfield"},
 	}
 	var out []string
 	for _, o := range order {

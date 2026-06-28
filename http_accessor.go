@@ -70,6 +70,12 @@ type HttpAccessor interface {
 	// HttpWatch streams change events; emit is called per event and returns a
 	// non-nil error to stop the stream (e.g. the client disconnected).
 	HttpWatch(ctx context.Context, ds string, scope M, emit func(op, id string, doc any) error) error
+
+	// Hash scan/sample (Redis HSCAN / HSCANNOVALUES / HRANDFIELD). scope, when
+	// non-nil, restricts to the caller's own rows (owner-scope).
+	HttpRandField(ctx context.Context, ds string, count int, scope M) (any, error)
+	HttpScan(ctx context.Context, ds, match string, cursor uint64, count int64, scope M) (any, error)
+	HttpScanNoValues(ctx context.Context, ds, match string, cursor uint64, count int64, scope M) (any, error)
 }
 
 var (
@@ -558,4 +564,47 @@ func IsOwnerScoped(coll string) bool {
 	defer ownerScopesMu.RUnlock()
 	_, ok := ownerScopes[coll]
 	return ok
+}
+
+// ---- Hash scan/sample HTTP handlers ----------------------------------------
+
+// HttpRandField returns up to count random field keys (Redis HRANDFIELD).
+func (c *Collection[K, V]) HttpRandField(ctx context.Context, ds string, count int, scope M) (any, error) {
+	ids, err := c.backend(ds).sample(ctx, c.coll, count, scope)
+	if err != nil {
+		return nil, err
+	}
+	return c.idsToKeys(ids)
+}
+
+// HttpScan paginates keys + values (Redis HSCAN). Returns {cursor, keys, values}.
+func (c *Collection[K, V]) HttpScan(ctx context.Context, ds, match string, cursor uint64, count int64, scope M) (any, error) {
+	ids, docs, next, err := c.backend(ds).scan(ctx, c.coll, match, cursor, count, scope)
+	if err != nil {
+		return nil, err
+	}
+	keys, err := c.keysFromIDs(ids)
+	if err != nil {
+		return nil, err
+	}
+	vals := make([]V, len(docs))
+	for i := range docs {
+		if vals[i], err = c.decode(docs[i]); err != nil {
+			return nil, fmt.Errorf("dopdb: decode %s[%s]: %w", c.coll, ids[i], err)
+		}
+	}
+	return map[string]any{"cursor": next, "keys": keys, "values": vals}, nil
+}
+
+// HttpScanNoValues paginates keys only (Redis HSCAN NOVALUES). Returns {cursor, keys}.
+func (c *Collection[K, V]) HttpScanNoValues(ctx context.Context, ds, match string, cursor uint64, count int64, scope M) (any, error) {
+	ids, _, next, err := c.backend(ds).scan(ctx, c.coll, match, cursor, count, scope)
+	if err != nil {
+		return nil, err
+	}
+	keys, err := c.keysFromIDs(ids)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"cursor": next, "keys": keys}, nil
 }

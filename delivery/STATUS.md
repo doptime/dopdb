@@ -136,3 +136,17 @@ go test ./httpserve -run IntegrationWatch -v             # M3(watch E2E)
 6. `( cd ts && npm test )` 回归(应 74 过 / 1 skip)
 
 **到 R8 真实输出回传、Opus 对 M1/M2/M3/M5 + HttpOn-Go 落终判联签后,项目即可封包结束。** 在此之前不可宣布完成——M1/M2/M3/M5 从未经 Opus 凭真实输出终判。
+
+## 11 · 项目重开 · M6 redisdb-compat(2026-06-28)
+
+R8 封的 M0–M5+HttpOn **仍有效**。新增承重里程碑 **M6**:把 DB API 补齐到尽可能全的 redisdb 兼容(设计见 `docs/REDISDB-COMPAT.md`)。
+
+**gap**:dopdb 现有 = redisdb 的 Hash 一族(缺 3 法)+ Mongo 原生 find/count/watch;**完全缺** String/List/Set/ZSet 四类型。redisdb 全表约 60+ 方法,dopdb 实现约 16。
+
+**Opus 本回合已做**:
+- 实现 **Go Hash 三法** `HScan`/`HScanNoValues`/`HRandField`(`mongo.go` 加 `sample`/`scan`/`globToRegex`;`dopdb.go`+`http_accessor.go`+`serve.go`+`perms.go` 全链)——**未编译验证**(沙箱无 Go)。
+- **TS 同步 Perm 常量**(位值与 Go 一致)——tsc + 既有测试绿(74/0/1)。
+
+**交本地 R9**(见 `rounds/R9/directive.md`):① 编译验证 + 收尾 Hash 三法的 TS 方法接线 + conformance;② 实现四个新类型 String/List/Set/ZSet(Go+TS,真 Mongo conformance、HttpOn、owner-scope、TTL)。⛔ 阻塞 op 不做。
+
+**到 R9 真实输出回传、Opus 对 M6 落终判联签后,M6 完成。** 在此之前 M6 未验证。

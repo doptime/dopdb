@@ -38,6 +38,7 @@ var dataCommands = map[string]bool{
 	"HEXISTS": true, "HGETALL": true, "HKEYS": true, "HVALS": true,
 	"HLEN": true, "HINCRBY": true, "HINCRBYFLOAT": true, "FIND": true,
 	"HMSET": true, "HMGET": true, "COUNT": true, "FINDONE": true, "WATCH": true,
+	"HSCAN": true, "HSCANNOVALUES": true, "HRANDFIELD": true,
 }
 
 // Guardrails (mirrored on the TypeScript side: server.ts MAX_BODY/DEFAULT_LIMIT/
@@ -225,6 +226,32 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 		}
 		n, err := acc.HttpLen(ctx, c.DB)
 		writeResult(w, map[string]any{"len": n}, err)
+
+	case "HRANDFIELD":
+		count := 1
+		if n, e := strconv.Atoi(c.Queries.Get("count")); e == nil {
+			count = n
+		}
+		v, err := acc.HttpRandField(ctx, c.DB, count, scope)
+		writeResult(w, v, err)
+
+	case "HSCAN", "HSCANNOVALUES":
+		var cursor uint64
+		if cu, e := strconv.ParseUint(c.Queries.Get("cursor"), 10, 64); e == nil {
+			cursor = cu
+		}
+		count := int64(10)
+		if cn, e := strconv.ParseInt(c.Queries.Get("count"), 10, 64); e == nil && cn > 0 {
+			count = cn
+		}
+		match := c.Queries.Get("match")
+		if c.Cmd == "HSCANNOVALUES" {
+			v, err := acc.HttpScanNoValues(ctx, c.DB, match, cursor, count, scope)
+			writeResult(w, v, err)
+			return
+		}
+		v, err := acc.HttpScan(ctx, c.DB, match, cursor, count, scope)
+		writeResult(w, v, err)
 
 	case "HINCRBY", "HINCRBYFLOAT":
 		if key == "" {

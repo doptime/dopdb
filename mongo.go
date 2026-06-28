@@ -2,6 +2,7 @@ package dopdb
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"time"
 
@@ -424,4 +425,84 @@ func (b *mongoBackend) watch(ctx context.Context, coll string, scope M, emit fun
 		}
 		time.Sleep(time.Second) // transient error: back off, then resume from token
 	}
+}
+
+// ---- Hash scan/sample primitives (Redis HSCAN / HRANDFIELD on Mongo) --------
+
+// globToRegex converts a Redis glob (used by HSCAN match) to an anchored regex.
+func globToRegex(glob string) string {
+	var b strings.Builder
+	b.WriteString("^")
+	for _, r := range glob {
+		switch r {
+		case '*':
+			b.WriteString(".*")
+		case '?':
+			b.WriteString(".")
+		case '.', '+', '(', ')', '|', '[', ']', '{', '}', '^', '$', '\\':
+			b.WriteByte('\\')
+			b.WriteRune(r)
+		default:
+			b.WriteRune(r)
+		}
+	}
+	b.WriteString("$")
+	return b.String()
+}
+
+// sample returns up to count random _ids (Redis HRANDFIELD). scope, when
+// non-nil, restricts the population (owner-scope) via a $match stage.
+func (b *mongoBackend) sample(ctx context.Context, coll string, count int, scope M) ([]string, error) {
+	if count <= 0 {
+		count = 1
+	}
+	pipe := mongo.Pipeline{}
+	if len(scope) > 0 {
+		pipe = append(pipe, bson.D{{Key: "$match", Value: bson.M(scope)}})
+	}
+	pipe = append(pipe,
+		bson.D{{Key: "$sample", Value: bson.D{{Key: "size", Value: count}}}},
+		bson.D{{Key: "$project", Value: bson.D{{Key: "_id", Value: 1}}}},
+	)
+	cur, err := b.c(coll).Aggregate(ctx, pipe)
+	if err != nil {
+		return nil, err
+	}
+	defer cur.Close(ctx)
+	var ids []string
+	for cur.Next(ctx) {
+		if id, ok := cur.Current.Lookup("_id").StringValueOK(); ok {
+			ids = append(ids, id)
+		}
+	}
+	return ids, cur.Err()
+}
+
+// scan emulates Redis HSCAN over Mongo: glob match -> regex on _id, paginated by
+// a numeric cursor (offset). Returns (ids, docs, nextCursor); nextCursor 0 = done.
+// scope, when non-nil, AND-filters by owner (owner-scope).
+func (b *mongoBackend) scan(ctx context.Context, coll, match string, cursor uint64, count int64, scope M) ([]string, [][]byte, uint64, error) {
+	if count <= 0 {
+		count = 10
+	}
+	filter := M{}
+	for k, v := range scope {
+		filter[k] = v
+	}
+	if match != "" && match != "*" {
+		filter["_id"] = M{"$regex": globToRegex(match)}
+	}
+	ids, docs, err := b.find(ctx, coll, filter, FindOpt{
+		SortKeys: []SortKey{{Field: "_id", Asc: true}},
+		Skip:     int64(cursor),
+		Limit:    count,
+	})
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	next := uint64(0)
+	if int64(len(ids)) == count {
+		next = cursor + uint64(len(ids))
+	}
+	return ids, docs, next, nil
 }

@@ -578,3 +578,57 @@ func indexSpecsFromTags(t reflect.Type) []IndexSpec {
 	}
 	return specs
 }
+
+// ---- Hash scan/sample (Redis HSCAN / HSCANNOVALUES / HRANDFIELD) ------------
+
+// keysFromIDs deserializes raw _id strings into typed keys.
+func (c *Collection[K, V]) keysFromIDs(ids []string) ([]K, error) {
+	out := make([]K, len(ids))
+	var err error
+	for i, id := range ids {
+		if out[i], err = c.deserializeKey(id); err != nil {
+			return nil, fmt.Errorf("dopdb: bad key %q in %s: %w", id, c.coll, err)
+		}
+	}
+	return out, nil
+}
+
+// HRandField returns up to count random field keys (Redis HRANDFIELD). count<=0
+// yields one. Negative-count duplicate semantics are not emulated.
+func (c *Collection[K, V]) HRandField(count int) ([]K, error) {
+	ids, err := c.backend("").sample(context.Background(), c.coll, count, nil)
+	if err != nil {
+		return nil, err
+	}
+	return c.keysFromIDs(ids)
+}
+
+// HScan paginates field keys with their values (Redis HSCAN). cursor 0 starts
+// iteration; the returned cursor is 0 when complete. match is a Redis glob.
+func (c *Collection[K, V]) HScan(cursor uint64, match string, count int64) ([]K, []V, uint64, error) {
+	ids, docs, next, err := c.backend("").scan(context.Background(), c.coll, match, cursor, count, nil)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	keys, err := c.keysFromIDs(ids)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	vals := make([]V, len(docs))
+	for i := range docs {
+		if vals[i], err = c.decode(docs[i]); err != nil {
+			return nil, nil, 0, fmt.Errorf("dopdb: decode %s[%s]: %w", c.coll, ids[i], err)
+		}
+	}
+	return keys, vals, next, nil
+}
+
+// HScanNoValues paginates field keys only (Redis HSCAN NOVALUES).
+func (c *Collection[K, V]) HScanNoValues(cursor uint64, match string, count int64) ([]K, uint64, error) {
+	ids, _, next, err := c.backend("").scan(context.Background(), c.coll, match, cursor, count, nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	keys, err := c.keysFromIDs(ids)
+	return keys, next, err
+}

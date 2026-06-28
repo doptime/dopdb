@@ -108,6 +108,7 @@
 | **M4** Next.js App-Router E2E | 🔴 承重 | M2 | I-TS1,I-TS4,I-TS6 | 最小 Next.js app 挂 `createNextHandler`,client 打通 hset/hget/find;前缀改名+`apiBase` 验;OPTIONS 不连库 |
 | **M5** Go↔TS 一致性 | 🔴 承重 | M2 | I-P1,I-P4,I-P5,I-W7,I-W8,I-S9 | conformance 套件:同请求两端响应**语义 + 状态码 + code + 方法 + 错误 body 形状**一致;尤其 **scope-merge(AND)、错误 5 类、GET/POST 分流** 两端 diff 为空 |
 | **并行 🟢 轨**(随主线跑) | 🟢 | — | I-Q4/I-Q5/I-Q6/I-Q7 | 文档同步(0 MISS)、最小示例 app、schema-as-data 导出核对、打包单层核对 |
+| **M6** redisdb-compat key 类型(R9 新增) | 🔴 承重 | M2 | I-RC1 | 按 `docs/REDISDB-COMPAT.md` 补齐:Hash 三法(HScan/HScanNoValues/HRandField)+ 四新类型 String/List/Set/ZSet(Go+TS);每个新命令 conformance 双端一致(真 Mongo)、HttpOn 生效、owner-scope 沿用、TTL;⛔ 阻塞 BLPop/BRPop/BRPopLPush 不做。Opus 已实现 Hash 三法 Go(待本机 build)+ TS 常量;四类型交本地 |
 
 > Next.js 真实测试(你后续要做的)= 站在 **M4** 上;M4 依赖 M2(真 Mongo)依赖 M1(编译)。承重链 M1→M2→{M3,M4,M5} 决定人工 Opus 检查点的节奏。
 
