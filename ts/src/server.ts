@@ -145,6 +145,10 @@ interface ExecArgs {
   index?: number;
   start?: number;
   stop?: number;
+  pairs?: Record<string, number>;
+  min?: number;
+  max?: number;
+  withscores?: boolean;
   opt?: FindOpt;
 }
 
@@ -456,6 +460,108 @@ async function exec(m: MongoCollection<Doc>, cmd: string, a: ExecArgs, scope: Fi
       if (!doc) throw new NotFoundError();
       return doc;
     }
+    // ---- ZSet (Z*) family ----
+    case "zadd": {
+      const ms = await zLoad(m, a.key, scope);
+      const idx = new Map(ms.map((x, i) => [x.m, i]));
+      let added = 0;
+      for (const [k, v] of Object.entries(a.pairs ?? {})) {
+        const i = idx.get(k);
+        if (i !== undefined) ms[i].score = v;
+        else { ms.push({ m: k, score: v }); idx.set(k, ms.length - 1); added++; }
+      }
+      zSort(ms, false);
+      await zSave(m, a.key, scope, ms);
+      return added;
+    }
+    case "zrem": {
+      const ms = await zLoad(m, a.key, scope);
+      const gone = new Set((a.members as string[] | undefined) ?? []);
+      let removed = 0;
+      const kept = ms.filter((x) => { if (gone.has(x.m)) { removed++; return false; } return true; });
+      await zSave(m, a.key, scope, kept);
+      return removed;
+    }
+    case "zscore": {
+      const ms = await zLoad(m, a.key, scope);
+      const hit = ms.find((x) => x.m === (a.member as string | undefined));
+      if (!hit) throw new NotFoundError();
+      return hit.score;
+    }
+    case "zcard": {
+      const ms = await zLoad(m, a.key, scope);
+      return { card: ms.length };
+    }
+    case "zcount": {
+      const ms = await zLoad(m, a.key, scope);
+      const min = a.min ?? -Infinity, max = a.max ?? Infinity;
+      return { count: ms.filter((x) => x.score >= min && x.score <= max).length };
+    }
+    case "zincrby": {
+      const ms = await zLoad(m, a.key, scope);
+      const member = a.member as string;
+      const inc = a.n ?? 0;
+      const hit = ms.find((x) => x.m === member);
+      let ns: number;
+      if (hit) { hit.score += inc; ns = hit.score; }
+      else { ms.push({ m: member, score: inc }); ns = inc; }
+      zSort(ms, false);
+      await zSave(m, a.key, scope, ms);
+      return ns;
+    }
+    case "zrange":
+    case "zrevrange": {
+      const ms = await zLoad(m, a.key, scope);
+      zSort(ms, cmd === "zrevrange");
+      const n = ms.length;
+      let st = listIdx(n, a.start ?? 0), en = listIdx(n, a.stop ?? -1) + 1;
+      if (st < 0) st = 0; if (en > n) en = n; if (en < st) en = st;
+      return zRender(st >= n ? [] : ms.slice(st, en), !!a.withscores);
+    }
+    case "zrangebyscore":
+    case "zrevrangebyscore": {
+      const ms = await zLoad(m, a.key, scope);
+      const min = a.min ?? -Infinity, max = a.max ?? Infinity;
+      const sub = ms.filter((x) => x.score >= min && x.score <= max);
+      zSort(sub, cmd === "zrevrangebyscore");
+      return zRender(sub, !!a.withscores);
+    }
+    case "zrank":
+    case "zrevrank": {
+      const ms = await zLoad(m, a.key, scope);
+      zSort(ms, cmd === "zrevrank");
+      return { rank: ms.findIndex((x) => x.m === (a.member as string | undefined)) };
+    }
+    case "zpopmin":
+    case "zpopmax": {
+      const ms = await zLoad(m, a.key, scope);
+      zSort(ms, cmd === "zpopmax");
+      let count = a.count ?? 1;
+      if (count <= 0) count = 1;
+      if (count > ms.length) count = ms.length;
+      const popped = ms.slice(0, count);
+      await zSave(m, a.key, scope, ms.slice(count));
+      return zRender(popped, true);
+    }
+    case "zremrangebyrank": {
+      const ms = await zLoad(m, a.key, scope);
+      zSort(ms, false);
+      const n = ms.length;
+      let st = listIdx(n, a.start ?? 0), en = listIdx(n, a.stop ?? -1) + 1;
+      if (st < 0) st = 0; if (en > n) en = n; if (en < st) en = st;
+      let removed = 0;
+      const kept = ms.filter((_x, i) => { if (st < n && i >= st && i < en) { removed++; return false; } return true; });
+      await zSave(m, a.key, scope, kept);
+      return removed;
+    }
+    case "zremrangebyscore": {
+      const ms = await zLoad(m, a.key, scope);
+      const min = a.min ?? -Infinity, max = a.max ?? Infinity;
+      let removed = 0;
+      const kept = ms.filter((x) => { if (x.score >= min && x.score <= max) { removed++; return false; } return true; });
+      await zSave(m, a.key, scope, kept);
+      return removed;
+    }
     default:
       throw new NotFoundError(`unknown command: ${cmd}`);
   }
@@ -464,6 +570,20 @@ async function exec(m: MongoCollection<Doc>, cmd: string, a: ExecArgs, scope: Fi
 // globToRegex converts a Redis glob (used by HSCAN match) to an anchored regex,
 // mirroring Go's globToRegex.
 function listIdx(n: number, i: number): number { return i < 0 ? n + i : i; }
+type ZM = { m: string; score: number };
+async function zLoad(m: MongoCollection<Doc>, key: string | undefined, scope: Filter): Promise<ZM[]> {
+  const doc = await m.findOne({ _id: key, ...scope } as Filter) as Doc | null;
+  return ((doc?.members as ZM[]) ?? []);
+}
+async function zSave(m: MongoCollection<Doc>, key: string | undefined, scope: Filter, ms: ZM[]): Promise<void> {
+  await m.updateOne({ _id: key, ...scope } as Filter, { $set: { members: ms } } as never, { upsert: true });
+}
+function zSort(ms: ZM[], rev: boolean): void {
+  ms.sort((x, y) => x.score !== y.score ? (rev ? y.score - x.score : x.score - y.score) : (rev ? (y.m > x.m ? 1 : -1) : (x.m < y.m ? -1 : 1)));
+}
+function zRender(ms: ZM[], withScores: boolean): unknown {
+  return withScores ? ms.map((x) => ({ m: x.m, score: x.score })) : ms.map((x) => x.m);
+}
 
 function globToRegex(glob: string): string {
   let r = "^";
@@ -597,6 +717,8 @@ const DATA_COMMANDS = new Set([
   "strget", "strset", "strsetall", "strgetall", "strdel",
   "sadd", "srem", "smembers", "sismember", "scard",
   "lpush", "rpush", "lpop", "rpop", "lrange", "llen", "lindex", "lset", "lrem", "ltrim", "linsertbefore", "linsertafter",
+  "zadd", "zrem", "zscore", "zcard", "zcount", "zincrby", "zrange", "zrevrange", "zrangebyscore", "zrevrangebyscore",
+  "zrank", "zrevrank", "zpopmin", "zpopmax", "zremrangebyrank", "zremrangebyscore",
 ]);
 const STREAM_COMMANDS = new Set(["watch"]);
 const ROUTED_COMMANDS = new Set([...DATA_COMMANDS, ...STREAM_COMMANDS]);
@@ -950,6 +1072,7 @@ async function buildRuntime(cfg: ServeConfig): Promise<Runtime> {
     let items: unknown[] | undefined;
     let item: unknown;
     let pivot: unknown;
+    let pairs: Record<string, number> | undefined;
     if (r.cmd === "hmset") {
       let body: Record<string, Doc> = {};
       if (bodyText) {
@@ -979,7 +1102,7 @@ async function buildRuntime(cfg: ServeConfig): Promise<Runtime> {
       }
       entries = body as Record<string, Doc>; // {key:value} raw
     }
-    if (r.cmd === "sadd" || r.cmd === "srem") {
+    if (r.cmd === "sadd" || r.cmd === "srem" || r.cmd === "zrem") {
       let body: { members?: unknown[] } = {};
       if (bodyText) {
         try { body = JSON.parse(bodyText); }
@@ -1003,6 +1126,18 @@ async function buildRuntime(cfg: ServeConfig): Promise<Runtime> {
       }
       item = body.item;
       pivot = body.pivot;
+    }
+    if (r.cmd === "zadd") {
+      let body: Record<string, unknown> = {};
+      if (bodyText) {
+        try { body = JSON.parse(bodyText); }
+        catch { return { kind: "json", status: 400, body: { error: "invalid JSON body", code: "validation" } }; }
+      }
+      pairs = {} as Record<string, number>;
+      for (const [k, v] of Object.entries(body)) {
+        const n = typeof v === "number" ? v : Number(v);
+        if (Number.isFinite(n)) (pairs as Record<string, number>)[k] = n;
+      }
     }
 
     let filter: Filter | undefined;
@@ -1047,6 +1182,10 @@ async function buildRuntime(cfg: ServeConfig): Promise<Runtime> {
       index: input.url.searchParams.has("index") ? Number(input.url.searchParams.get("index")) : undefined,
       start: input.url.searchParams.has("start") ? Number(input.url.searchParams.get("start")) : undefined,
       stop: input.url.searchParams.has("stop") ? Number(input.url.searchParams.get("stop")) : undefined,
+      pairs,
+      min: input.url.searchParams.has("min") ? Number(input.url.searchParams.get("min")) : undefined,
+      max: input.url.searchParams.has("max") ? Number(input.url.searchParams.get("max")) : undefined,
+      withscores: input.url.searchParams.get("withscores") === "true" || input.url.searchParams.get("withscores") === "1",
       opt,
     }, scope);
     return { kind: "json", status: 200, body: out ?? null };

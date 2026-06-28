@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -78,6 +79,7 @@ func setupConformance(t *testing.T) *tsConformance {
 	dopdb.NewString[string](dopdb.WithCollection("strvals")).HttpOn()        // String family (STR*), non-scoped
 	dopdb.NewSet[string](dopdb.WithCollection("setvals")).HttpOn()           // Set family (S*), non-scoped
 	dopdb.NewList[string, string](dopdb.WithCollection("listvals")).HttpOn() // List family (L*/R*), non-scoped
+	dopdb.NewZSet[string](dopdb.WithCollection("zsetvals")).HttpOn()         // ZSet family (Z*), non-scoped
 	dopdb.SetOwnerScope("notes", "owner", "uid")
 	perms := NewPermissions()
 	for _, c := range []string{
@@ -96,8 +98,18 @@ func setupConformance(t *testing.T) *tsConformance {
 	if nodeBin == "" {
 		nodeBin = "node" // resolved via PATH; override with DOPDB_TS_NODE if elsewhere
 	}
-	cmd := exec.Command(nodeBin, "--import", "tsx", tsScript)
-	cmd.Dir = "../ts"
+	// Prefer the local tsx bin — it runs .ts entry scripts on any node version.
+	// `node --import tsx` needs node >= 20.6 and fails with
+	// ERR_UNKNOWN_FILE_EXTENSION on older node.
+	tsDir, _ := filepath.Abs("../ts")
+	tsxBin := filepath.Join(tsDir, "node_modules", ".bin", "tsx")
+	var cmd *exec.Cmd
+	if _, err := os.Stat(tsxBin); err == nil {
+		cmd = exec.Command(tsxBin, tsScript)
+	} else {
+		cmd = exec.Command(nodeBin, "--import", "tsx", tsScript)
+	}
+	cmd.Dir = tsDir
 	cmd.Env = append(os.Environ(),
 		"PORT="+fmt.Sprint(tsPort),
 		"MONGO_URI="+uri,
@@ -858,6 +870,201 @@ func sliceEq(a, b []string) bool {
 	}
 	for i := range a {
 		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// TestConformanceZSet: Z* family two-engine parity over zsetvals. Order is
+// derived (score asc, then m asc) so both engines return identical sequences.
+func TestConformanceZSet(t *testing.T) {
+	c := setupConformance(t)
+	defer c.close()
+	tok := tokenFor(t, "alice")
+
+	// ZADD {a:1,b:2,c:3} -> added 3.
+	for _, base := range []string{c.goBase, c.tsBase} {
+		if st, body := httpCall(t, base, "POST", "/api/zadd/zsetvals?f=z1", tok, `{"a":1,"b":2,"c":3}`); st != 200 {
+			t.Fatalf("zadd %s: %d %v", base, st, body)
+		}
+	}
+
+	// ZRANGE 0 -1 -> [a b c].
+	_, gb := httpCall(t, c.goBase, "GET", "/api/zrange/zsetvals?f=z1&start=0&stop=-1", tok, "")
+	_, tb := httpCall(t, c.tsBase, "GET", "/api/zrange/zsetvals?f=z1&start=0&stop=-1", tok, "")
+	if !sliceEq(toStrSlice(gb), toStrSlice(tb)) {
+		t.Errorf("zrange: Go=%v TS=%v", gb, tb)
+	}
+	if got := toStrSlice(gb); len(got) != 3 || got[0] != "a" || got[2] != "c" {
+		t.Errorf("zrange content: %v", got)
+	}
+
+	// ZSCORE b -> 2.
+	_, gb = httpCall(t, c.goBase, "GET", "/api/zscore/zsetvals?f=z1&member=b", tok, "")
+	_, tb = httpCall(t, c.tsBase, "GET", "/api/zscore/zsetvals?f=z1&member=b", tok, "")
+	if gb != 2.0 || gb != tb {
+		t.Errorf("zscore b: Go=%v TS=%v", gb, tb)
+	}
+
+	// ZCARD 3.
+	_, gb = httpCall(t, c.goBase, "GET", "/api/zcard/zsetvals?f=z1", tok, "")
+	_, tb = httpCall(t, c.tsBase, "GET", "/api/zcard/zsetvals?f=z1", tok, "")
+	if numField(gb, "card") != 3 || numField(gb, "card") != numField(tb, "card") {
+		t.Errorf("zcard: Go=%v TS=%v", gb, tb)
+	}
+
+	// ZRANK a -> 0, c -> 2.
+	_, gb = httpCall(t, c.goBase, "GET", "/api/zrank/zsetvals?f=z1&member=a", tok, "")
+	_, tb = httpCall(t, c.tsBase, "GET", "/api/zrank/zsetvals?f=z1&member=a", tok, "")
+	if numField(gb, "rank") != 0 || numField(gb, "rank") != numField(tb, "rank") {
+		t.Errorf("zrank a: Go=%v TS=%v", gb, tb)
+	}
+
+	// ZINCRBY a +10 -> 11.
+	for _, base := range []string{c.goBase, c.tsBase} {
+		httpCall(t, base, "POST", "/api/zincrby/zsetvals?f=z1&member=a&n=10", tok, "")
+	}
+	_, gb = httpCall(t, c.goBase, "GET", "/api/zscore/zsetvals?f=z1&member=a", tok, "")
+	_, tb = httpCall(t, c.tsBase, "GET", "/api/zscore/zsetvals?f=z1&member=a", tok, "")
+	if gb != 11.0 || gb != tb {
+		t.Errorf("zincrby a: Go=%v TS=%v", gb, tb)
+	}
+
+	// ZRANGE now -> [b c a] (a has score 11).
+	_, gb = httpCall(t, c.goBase, "GET", "/api/zrange/zsetvals?f=z1&start=0&stop=-1", tok, "")
+	_, tb = httpCall(t, c.tsBase, "GET", "/api/zrange/zsetvals?f=z1&start=0&stop=-1", tok, "")
+	want := []string{"b", "c", "a"}
+	if !sliceEq(toStrSlice(gb), want) || !sliceEq(toStrSlice(tb), want) {
+		t.Errorf("zrange after incr: Go=%v TS=%v want %v", gb, tb, want)
+	}
+
+	// ZPOPMIN 1 -> [{b 2}] (lowest score).
+	_, gb = httpCall(t, c.goBase, "GET", "/api/zpopmin/zsetvals?f=z1&count=1", tok, "")
+	_, tb = httpCall(t, c.tsBase, "GET", "/api/zpopmin/zsetvals?f=z1&count=1", tok, "")
+	if gm, ok := gb.([]any); ok && len(gm) == 1 {
+		pair := gm[0].(map[string]any)
+		if pair["m"] != "b" || pair["score"] != 2.0 {
+			t.Errorf("zpopmin Go: %v", gb)
+		}
+	} else {
+		t.Errorf("zpopmin Go not [{m,score}]: %v", gb)
+	}
+	if !samePop(gb, tb) {
+		t.Errorf("zpopmin differ: Go=%v TS=%v", gb, tb)
+	}
+
+	// After pop: 2 left [c, a]. ZREMRANGEBYSCORE 10 12 -> removes a (11).
+	for _, base := range []string{c.goBase, c.tsBase} {
+		httpCall(t, base, "POST", "/api/zremrangebyscore/zsetvals?f=z1&min=10&max=12", tok, "")
+	}
+	_, gb = httpCall(t, c.goBase, "GET", "/api/zrange/zsetvals?f=z1&start=0&stop=-1", tok, "")
+	_, tb = httpCall(t, c.tsBase, "GET", "/api/zrange/zsetvals?f=z1&start=0&stop=-1", tok, "")
+	want2 := []string{"c"}
+	if !sliceEq(toStrSlice(gb), want2) || !sliceEq(toStrSlice(tb), want2) {
+		t.Errorf("after zremrangebyscore: Go=%v TS=%v want %v", gb, tb, want2)
+	}
+
+	// ---- second key z2: cover the remaining Z* commands (rev / by-score /
+	// by-rank variants, withscores, zrem, zcount, zpopmax, zremrangebyrank) ----
+	for _, base := range []string{c.goBase, c.tsBase} {
+		if st, body := httpCall(t, base, "POST", "/api/zadd/zsetvals?f=z2", tok, `{"a":1,"b":2,"c":3,"d":4}`); st != 200 {
+			t.Fatalf("zadd z2 %s: %d %v", base, st, body)
+		}
+	}
+
+	// ZRANGE withscores=true -> [{a,1},{b,2},{c,3},{d,4}] (Go≡TS).
+	_, gb = httpCall(t, c.goBase, "GET", "/api/zrange/zsetvals?f=z2&start=0&stop=-1&withscores=true", tok, "")
+	_, tb = httpCall(t, c.tsBase, "GET", "/api/zrange/zsetvals?f=z2&start=0&stop=-1&withscores=true", tok, "")
+	if !samePop(gb, tb) {
+		t.Errorf("zrange withscores differ: Go=%v TS=%v", gb, tb)
+	}
+
+	// ZREVRANGE 0 -1 -> [d,c,b,a].
+	_, gb = httpCall(t, c.goBase, "GET", "/api/zrevrange/zsetvals?f=z2&start=0&stop=-1", tok, "")
+	_, tb = httpCall(t, c.tsBase, "GET", "/api/zrevrange/zsetvals?f=z2&start=0&stop=-1", tok, "")
+	if want := []string{"d", "c", "b", "a"}; !sliceEq(toStrSlice(gb), want) || !sliceEq(toStrSlice(tb), want) {
+		t.Errorf("zrevrange: Go=%v TS=%v want %v", gb, tb, want)
+	}
+
+	// ZCOUNT 2 3 -> 2 (b,c).
+	_, gb = httpCall(t, c.goBase, "GET", "/api/zcount/zsetvals?f=z2&min=2&max=3", tok, "")
+	_, tb = httpCall(t, c.tsBase, "GET", "/api/zcount/zsetvals?f=z2&min=2&max=3", tok, "")
+	if numField(gb, "count") != 2 || numField(gb, "count") != numField(tb, "count") {
+		t.Errorf("zcount: Go=%v TS=%v", gb, tb)
+	}
+
+	// ZRANGEBYSCORE 2 3 -> [b,c]; ZREVRANGEBYSCORE 2 3 -> [c,b].
+	_, gb = httpCall(t, c.goBase, "GET", "/api/zrangebyscore/zsetvals?f=z2&min=2&max=3", tok, "")
+	_, tb = httpCall(t, c.tsBase, "GET", "/api/zrangebyscore/zsetvals?f=z2&min=2&max=3", tok, "")
+	if want := []string{"b", "c"}; !sliceEq(toStrSlice(gb), want) || !sliceEq(toStrSlice(tb), want) {
+		t.Errorf("zrangebyscore: Go=%v TS=%v want %v", gb, tb, want)
+	}
+	_, gb = httpCall(t, c.goBase, "GET", "/api/zrevrangebyscore/zsetvals?f=z2&min=2&max=3", tok, "")
+	_, tb = httpCall(t, c.tsBase, "GET", "/api/zrevrangebyscore/zsetvals?f=z2&min=2&max=3", tok, "")
+	if want := []string{"c", "b"}; !sliceEq(toStrSlice(gb), want) || !sliceEq(toStrSlice(tb), want) {
+		t.Errorf("zrevrangebyscore: Go=%v TS=%v want %v", gb, tb, want)
+	}
+
+	// ZRANK b -> 1; ZREVRANK b -> 2 (4 members: a1 b2 c3 d4).
+	_, gb = httpCall(t, c.goBase, "GET", "/api/zrank/zsetvals?f=z2&member=b", tok, "")
+	_, tb = httpCall(t, c.tsBase, "GET", "/api/zrank/zsetvals?f=z2&member=b", tok, "")
+	if numField(gb, "rank") != 1 || numField(gb, "rank") != numField(tb, "rank") {
+		t.Errorf("zrank b: Go=%v TS=%v", gb, tb)
+	}
+	_, gb = httpCall(t, c.goBase, "GET", "/api/zrevrank/zsetvals?f=z2&member=b", tok, "")
+	_, tb = httpCall(t, c.tsBase, "GET", "/api/zrevrank/zsetvals?f=z2&member=b", tok, "")
+	if numField(gb, "rank") != 2 || numField(gb, "rank") != numField(tb, "rank") {
+		t.Errorf("zrevrank b: Go=%v TS=%v", gb, tb)
+	}
+
+	// ZREMRANGEBYRANK 0 1 -> removes a,b (2 gone); left [c,d].
+	for _, base := range []string{c.goBase, c.tsBase} {
+		httpCall(t, base, "POST", "/api/zremrangebyrank/zsetvals?f=z2&start=0&stop=1", tok, "")
+	}
+	_, gb = httpCall(t, c.goBase, "GET", "/api/zrange/zsetvals?f=z2&start=0&stop=-1", tok, "")
+	_, tb = httpCall(t, c.tsBase, "GET", "/api/zrange/zsetvals?f=z2&start=0&stop=-1", tok, "")
+	if want := []string{"c", "d"}; !sliceEq(toStrSlice(gb), want) || !sliceEq(toStrSlice(tb), want) {
+		t.Errorf("after zremrangebyrank: Go=%v TS=%v want %v", gb, tb, want)
+	}
+
+	// ZREM d -> 1 removed; left [c].
+	for _, base := range []string{c.goBase, c.tsBase} {
+		httpCall(t, base, "POST", "/api/zrem/zsetvals?f=z2", tok, `{"members":["d"]}`)
+	}
+	_, gb = httpCall(t, c.goBase, "GET", "/api/zrange/zsetvals?f=z2&start=0&stop=-1", tok, "")
+	_, tb = httpCall(t, c.tsBase, "GET", "/api/zrange/zsetvals?f=z2&start=0&stop=-1", tok, "")
+	if want := []string{"c"}; !sliceEq(toStrSlice(gb), want) || !sliceEq(toStrSlice(tb), want) {
+		t.Errorf("after zrem: Go=%v TS=%v want %v", gb, tb, want)
+	}
+
+	// ZPOPMAX 1 -> [{c,3}] (highest); empties the key.
+	_, gb = httpCall(t, c.goBase, "GET", "/api/zpopmax/zsetvals?f=z2&count=1", tok, "")
+	_, tb = httpCall(t, c.tsBase, "GET", "/api/zpopmax/zsetvals?f=z2&count=1", tok, "")
+	if gm, ok := gb.([]any); ok && len(gm) == 1 {
+		pair := gm[0].(map[string]any)
+		if pair["m"] != "c" || pair["score"] != 3.0 {
+			t.Errorf("zpopmax Go: %v", gb)
+		}
+	} else {
+		t.Errorf("zpopmax Go not [{m,score}]: %v", gb)
+	}
+	if !samePop(gb, tb) {
+		t.Errorf("zpopmax differ: Go=%v TS=%v", gb, tb)
+	}
+}
+
+// samePop compares two [{m,score}] arrays.
+func samePop(a, b any) bool {
+	aa, _ := a.([]any)
+	bb, _ := b.([]any)
+	if len(aa) != len(bb) {
+		return false
+	}
+	for i := range aa {
+		x, _ := aa[i].(map[string]any)
+		y, _ := bb[i].(map[string]any)
+		if x["m"] != y["m"] || x["score"] != y["score"] {
 			return false
 		}
 	}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -44,6 +45,10 @@ var dataCommands = map[string]bool{
 	"SADD": true, "SREM": true, "SMEMBERS": true, "SISMEMBER": true, "SCARD": true,
 	"LPUSH": true, "RPUSH": true, "LPOP": true, "RPOP": true, "LRANGE": true, "LLEN": true,
 	"LINDEX": true, "LSET": true, "LREM": true, "LTRIM": true, "LINSERTBEFORE": true, "LINSERTAFTER": true,
+	"ZADD": true, "ZREM": true, "ZSCORE": true, "ZCARD": true, "ZCOUNT": true, "ZINCRBY": true,
+	"ZRANGE": true, "ZREVRANGE": true, "ZRANGEBYSCORE": true, "ZREVRANGEBYSCORE": true,
+	"ZRANK": true, "ZREVRANK": true, "ZPOPMIN": true, "ZPOPMAX": true,
+	"ZREMRANGEBYRANK": true, "ZREMRANGEBYSCORE": true,
 }
 
 // Guardrails (mirrored on the TypeScript side: server.ts MAX_BODY/DEFAULT_LIMIT/
@@ -626,6 +631,193 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 		n, err := sa.HttpSCard(ctx, c.DB, key, scope)
 		writeResult(w, map[string]any{"card": n}, err)
 
+	// ---- ZSet (Z*) family ----
+	case "ZADD":
+		za, ok := acc.(dopdb.ZSetAccessor)
+		if !ok {
+			writeErr(w, http.StatusNotFound, "not_found", errors.New("not a zset collection: "+c.Coll))
+			return
+		}
+		if key == "" {
+			writeErr(w, http.StatusBadRequest, "validation", errors.New("ZADD requires ?f="))
+			return
+		}
+		var pairs map[string]float64
+		if err := json.Unmarshal(c.Body, &pairs); err != nil {
+			writeErr(w, http.StatusBadRequest, "validation", errors.New(`ZADD body needs {"member":score,...}`))
+			return
+		}
+		added, err := za.HttpZAdd(ctx, c.DB, key, pairs, scope)
+		writeResult(w, added, err)
+
+	case "ZREM":
+		za, ok := acc.(dopdb.ZSetAccessor)
+		if !ok {
+			writeErr(w, http.StatusNotFound, "not_found", errors.New("not a zset collection: "+c.Coll))
+			return
+		}
+		if key == "" {
+			writeErr(w, http.StatusBadRequest, "validation", errors.New("ZREM requires ?f="))
+			return
+		}
+		var body map[string]any
+		if err := json.Unmarshal(c.Body, &body); err != nil {
+			writeErr(w, http.StatusBadRequest, "validation", errors.New(`ZREM body needs {"members":[...]}`))
+			return
+		}
+		raw, _ := body["members"].([]any)
+		members := make([]string, 0, len(raw))
+		for _, x := range raw {
+			if s, ok := x.(string); ok {
+				members = append(members, s)
+			}
+		}
+		removed, err := za.HttpZRem(ctx, c.DB, key, members, scope)
+		writeResult(w, removed, err)
+
+	case "ZSCORE":
+		za, ok := acc.(dopdb.ZSetAccessor)
+		if !ok {
+			writeErr(w, http.StatusNotFound, "not_found", errors.New("not a zset collection: "+c.Coll))
+			return
+		}
+		if key == "" {
+			writeErr(w, http.StatusBadRequest, "validation", errors.New("ZSCORE requires ?f="))
+			return
+		}
+		sc, err := za.HttpZScore(ctx, c.DB, key, c.Queries.Get("member"), scope)
+		writeResult(w, sc, err)
+
+	case "ZCARD":
+		za, ok := acc.(dopdb.ZSetAccessor)
+		if !ok {
+			writeErr(w, http.StatusNotFound, "not_found", errors.New("not a zset collection: "+c.Coll))
+			return
+		}
+		if key == "" {
+			writeErr(w, http.StatusBadRequest, "validation", errors.New("ZCARD requires ?f="))
+			return
+		}
+		card, err := za.HttpZCard(ctx, c.DB, key, scope)
+		writeResult(w, map[string]any{"card": card}, err)
+
+	case "ZCOUNT":
+		za, ok := acc.(dopdb.ZSetAccessor)
+		if !ok {
+			writeErr(w, http.StatusNotFound, "not_found", errors.New("not a zset collection: "+c.Coll))
+			return
+		}
+		if key == "" {
+			writeErr(w, http.StatusBadRequest, "validation", errors.New("ZCOUNT requires ?f="))
+			return
+		}
+		min, max := parseMinMax(c)
+		cnt, err := za.HttpZCount(ctx, c.DB, key, min, max, scope)
+		writeResult(w, map[string]any{"count": cnt}, err)
+
+	case "ZINCRBY":
+		za, ok := acc.(dopdb.ZSetAccessor)
+		if !ok {
+			writeErr(w, http.StatusNotFound, "not_found", errors.New("not a zset collection: "+c.Coll))
+			return
+		}
+		if key == "" {
+			writeErr(w, http.StatusBadRequest, "validation", errors.New("ZINCRBY requires ?f="))
+			return
+		}
+		inc, perr := strconv.ParseFloat(c.Queries.Get("n"), 64)
+		if perr != nil {
+			writeErr(w, http.StatusBadRequest, "validation", errors.New("ZINCRBY requires ?n=<number>"))
+			return
+		}
+		ns, err := za.HttpZIncrBy(ctx, c.DB, key, c.Queries.Get("member"), inc, scope)
+		writeResult(w, ns, err)
+
+	case "ZRANGE", "ZREVRANGE":
+		za, ok := acc.(dopdb.ZSetAccessor)
+		if !ok {
+			writeErr(w, http.StatusNotFound, "not_found", errors.New("not a zset collection: "+c.Coll))
+			return
+		}
+		if key == "" {
+			writeErr(w, http.StatusBadRequest, "validation", errors.New(c.Cmd+" requires ?f="))
+			return
+		}
+		start, stop := parseRange(c)
+		ws := c.Queries.Get("withscores")
+		v, err := za.HttpZRange(ctx, c.DB, key, start, stop, c.Cmd == "ZREVRANGE", ws == "true" || ws == "1", scope)
+		writeResult(w, v, err)
+
+	case "ZRANGEBYSCORE", "ZREVRANGEBYSCORE":
+		za, ok := acc.(dopdb.ZSetAccessor)
+		if !ok {
+			writeErr(w, http.StatusNotFound, "not_found", errors.New("not a zset collection: "+c.Coll))
+			return
+		}
+		if key == "" {
+			writeErr(w, http.StatusBadRequest, "validation", errors.New(c.Cmd+" requires ?f="))
+			return
+		}
+		min, max := parseMinMax(c)
+		ws := c.Queries.Get("withscores")
+		v, err := za.HttpZRangeByScore(ctx, c.DB, key, min, max, c.Cmd == "ZREVRANGEBYSCORE", ws == "true" || ws == "1", scope)
+		writeResult(w, v, err)
+
+	case "ZRANK", "ZREVRANK":
+		za, ok := acc.(dopdb.ZSetAccessor)
+		if !ok {
+			writeErr(w, http.StatusNotFound, "not_found", errors.New("not a zset collection: "+c.Coll))
+			return
+		}
+		if key == "" {
+			writeErr(w, http.StatusBadRequest, "validation", errors.New(c.Cmd+" requires ?f="))
+			return
+		}
+		rk, err := za.HttpZRank(ctx, c.DB, key, c.Queries.Get("member"), c.Cmd == "ZREVRANK", scope)
+		writeResult(w, map[string]any{"rank": rk}, err)
+
+	case "ZPOPMIN", "ZPOPMAX":
+		za, ok := acc.(dopdb.ZSetAccessor)
+		if !ok {
+			writeErr(w, http.StatusNotFound, "not_found", errors.New("not a zset collection: "+c.Coll))
+			return
+		}
+		if key == "" {
+			writeErr(w, http.StatusBadRequest, "validation", errors.New(c.Cmd+" requires ?f="))
+			return
+		}
+		count, _ := strconv.Atoi(c.Queries.Get("count"))
+		v, err := za.HttpZPop(ctx, c.DB, key, count, c.Cmd == "ZPOPMAX", scope)
+		writeResult(w, v, err)
+
+	case "ZREMRANGEBYRANK":
+		za, ok := acc.(dopdb.ZSetAccessor)
+		if !ok {
+			writeErr(w, http.StatusNotFound, "not_found", errors.New("not a zset collection: "+c.Coll))
+			return
+		}
+		if key == "" {
+			writeErr(w, http.StatusBadRequest, "validation", errors.New("ZREMRANGEBYRANK requires ?f="))
+			return
+		}
+		start, stop := parseRange(c)
+		removed, err := za.HttpZRemRangeByRank(ctx, c.DB, key, start, stop, scope)
+		writeResult(w, removed, err)
+
+	case "ZREMRANGEBYSCORE":
+		za, ok := acc.(dopdb.ZSetAccessor)
+		if !ok {
+			writeErr(w, http.StatusNotFound, "not_found", errors.New("not a zset collection: "+c.Coll))
+			return
+		}
+		if key == "" {
+			writeErr(w, http.StatusBadRequest, "validation", errors.New("ZREMRANGEBYSCORE requires ?f="))
+			return
+		}
+		min, max := parseMinMax(c)
+		removed, err := za.HttpZRemRangeByScore(ctx, c.DB, key, min, max, scope)
+		writeResult(w, removed, err)
+
 	case "WATCH":
 		flusher, ok := w.(http.Flusher)
 		if !ok {
@@ -718,6 +910,20 @@ func writeErr(w http.ResponseWriter, status int, code string, err error) {
 }
 
 // parseRange reads ?start=/?stop= (default 0/-1, Redis semantics).
+// toFloat coerces a JSON number (float64) or numeric string to float64.
+func toFloat(v any) (float64, bool) {
+	switch x := v.(type) {
+	case float64:
+		return x, true
+	case int64:
+		return float64(x), true
+	case string:
+		f, err := strconv.ParseFloat(x, 64)
+		return f, err == nil
+	}
+	return 0, false
+}
+
 func parseRange(c *ReqCtx) (int, int) {
 	start, _ := strconv.Atoi(c.Queries.Get("start"))
 	stop := -1
@@ -725,6 +931,22 @@ func parseRange(c *ReqCtx) (int, int) {
 		stop = s
 	}
 	return start, stop
+}
+
+// parseMinMax reads ?min=/?max= (default -Inf/+Inf, Redis Z* score-range semantics).
+func parseMinMax(c *ReqCtx) (float64, float64) {
+	min, max := math.Inf(-1), math.Inf(1)
+	if s := c.Queries.Get("min"); s != "" {
+		if f, err := strconv.ParseFloat(s, 64); err == nil {
+			min = f
+		}
+	}
+	if s := c.Queries.Get("max"); s != "" {
+		if f, err := strconv.ParseFloat(s, 64); err == nil {
+			max = f
+		}
+	}
+	return min, max
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

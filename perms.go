@@ -56,14 +56,30 @@ const (
 	LTrim
 	LInsertBefore
 	LInsertAfter
+	ZAdd
+	ZRem
+	ZScore
+	ZCard
+	ZCount
+	ZIncrBy
+	ZRange
+	ZRevRange
+	ZRangeByScore
+	ZRevRangeByScore
+	ZRank
+	ZRevRank
+	ZPopMin
+	ZPopMax
+	ZRemRangeByRank
+	ZRemRangeByScore
 )
 
 // Convenience groups.
 const (
 	// ReadOnly = every non-mutating command.
-	ReadOnly Perm = HGet | HExists | HGetAll | HKeys | HVals | HLen | HMGet | Count | Find | FindOne | Watch | HScan | HScanNoValues | HRandField | StrGet | StrGetAll | SMembers | SIsMember | SCard | LRange | LLen | LIndex
+	ReadOnly Perm = HGet | HExists | HGetAll | HKeys | HVals | HLen | HMGet | Count | Find | FindOne | Watch | HScan | HScanNoValues | HRandField | StrGet | StrGetAll | SMembers | SIsMember | SCard | LRange | LLen | LIndex | ZScore | ZCard | ZCount | ZRange | ZRevRange | ZRangeByScore | ZRevRangeByScore | ZRank | ZRevRank
 	// Writes = every mutating command.
-	Writes Perm = HSet | HSetNX | HDel | Del | HIncrBy | HIncrByFloat | HMSet | StrSet | StrSetAll | StrDel | SAdd | SRem | LPush | RPush | LPop | RPop | LSet | LRem | LTrim | LInsertBefore | LInsertAfter
+	Writes Perm = HSet | HSetNX | HDel | Del | HIncrBy | HIncrByFloat | HMSet | StrSet | StrSetAll | StrDel | SAdd | SRem | LPush | RPush | LPop | RPop | LSet | LRem | LTrim | LInsertBefore | LInsertAfter | ZAdd | ZRem | ZIncrBy | ZPopMin | ZPopMax | ZRemRangeByRank | ZRemRangeByScore
 	// All = everything. This is the HttpOn() debug default.
 	All Perm = ReadOnly | Writes
 	// HashAll is a doptime-compatible alias for All.
@@ -83,6 +99,10 @@ var cmdPerm = map[string]Perm{
 	"LPUSH": LPush, "RPUSH": RPush, "LPOP": LPop, "RPOP": RPop, "LRANGE": LRange,
 	"LLEN": LLen, "LINDEX": LIndex, "LSET": LSet, "LREM": LRem, "LTRIM": LTrim,
 	"LINSERTBEFORE": LInsertBefore, "LINSERTAFTER": LInsertAfter,
+	"ZADD": ZAdd, "ZREM": ZRem, "ZSCORE": ZScore, "ZCARD": ZCard, "ZCOUNT": ZCount, "ZINCRBY": ZIncrBy,
+	"ZRANGE": ZRange, "ZREVRANGE": ZRevRange, "ZRANGEBYSCORE": ZRangeByScore, "ZREVRANGEBYSCORE": ZRevRangeByScore,
+	"ZRANK": ZRank, "ZREVRANK": ZRevRank, "ZPOPMIN": ZPopMin, "ZPOPMAX": ZPopMax,
+	"ZREMRANGEBYRANK": ZRemRangeByRank, "ZREMRANGEBYSCORE": ZRemRangeByScore,
 }
 
 var (
@@ -147,7 +167,7 @@ func HttpPermNames(p Perm) []string {
 		{HMSet, "hmset"}, {HMGet, "hmget"}, {Count, "count"}, {Find, "find"},
 		{FindOne, "findone"}, {Watch, "watch"},
 		{HScan, "hscan"}, {HScanNoValues, "hscannovalues"}, {HRandField, "hrandfield"},
-		{StrGet, "strget"}, {StrSet, "strset"}, {StrSetAll, "strsetall"}, {StrGetAll, "strgetall"}, {StrDel, "strdel"}, {SAdd, "sadd"}, {SRem, "srem"}, {SMembers, "smembers"}, {SIsMember, "sismember"}, {SCard, "scard"}, {LPush, "lpush"}, {RPush, "rpush"}, {LPop, "lpop"}, {RPop, "rpop"}, {LRange, "lrange"}, {LLen, "llen"}, {LIndex, "lindex"}, {LSet, "lset"}, {LRem, "lrem"}, {LTrim, "ltrim"}, {LInsertBefore, "linsertbefore"}, {LInsertAfter, "linsertafter"},
+		{StrGet, "strget"}, {StrSet, "strset"}, {StrSetAll, "strsetall"}, {StrGetAll, "strgetall"}, {StrDel, "strdel"}, {SAdd, "sadd"}, {SRem, "srem"}, {SMembers, "smembers"}, {SIsMember, "sismember"}, {SCard, "scard"}, {LPush, "lpush"}, {RPush, "rpush"}, {LPop, "lpop"}, {RPop, "rpop"}, {LRange, "lrange"}, {LLen, "llen"}, {LIndex, "lindex"}, {LSet, "lset"}, {LRem, "lrem"}, {LTrim, "ltrim"}, {LInsertBefore, "linsertbefore"}, {LInsertAfter, "linsertafter"}, {ZAdd, "zadd"}, {ZRem, "zrem"}, {ZScore, "zscore"}, {ZCard, "zcard"}, {ZCount, "zcount"}, {ZIncrBy, "zincrby"}, {ZRange, "zrange"}, {ZRevRange, "zrevrange"}, {ZRangeByScore, "zrangebyscore"}, {ZRevRangeByScore, "zrevrangebyscore"}, {ZRank, "zrank"}, {ZRevRank, "zrevrank"}, {ZPopMin, "zpopmin"}, {ZPopMax, "zpopmax"}, {ZRemRangeByRank, "zremrangebyrank"}, {ZRemRangeByScore, "zremrangebyscore"},
 	}
 	var out []string
 	for _, o := range order {

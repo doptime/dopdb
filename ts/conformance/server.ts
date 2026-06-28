@@ -41,6 +41,11 @@ const schema = {
     _id: f.string(),
     items: f.string(), // array via wire
   }).named("listvals"),
+  // ZSet family (Z*): members [{m,score}], non-scoped.
+  Zsetvals: collection({
+    _id: f.string(),
+    members: f.string(), // array via wire
+  }).named("zsetvals"),
 };
 
 async function main(): Promise<void> {

@@ -194,11 +194,18 @@ export const LRem = 1n << 39n;
 export const LTrim = 1n << 40n;
 export const LInsertBefore = 1n << 41n;
 export const LInsertAfter = 1n << 42n;
+export const ZAdd = 1n << 43n; export const ZRem = 1n << 44n; export const ZScore = 1n << 45n;
+export const ZCard = 1n << 46n; export const ZCount = 1n << 47n; export const ZIncrBy = 1n << 48n;
+export const ZRange = 1n << 49n; export const ZRevRange = 1n << 50n;
+export const ZRangeByScore = 1n << 51n; export const ZRevRangeByScore = 1n << 52n;
+export const ZRank = 1n << 53n; export const ZRevRank = 1n << 54n;
+export const ZPopMin = 1n << 55n; export const ZPopMax = 1n << 56n;
+export const ZRemRangeByRank = 1n << 57n; export const ZRemRangeByScore = 1n << 58n;
 /** Every non-mutating command. */
 export const ReadOnly =
-  HGet | HExists | HGetAll | HKeys | HVals | HLen | HMGet | Count | Find | FindOne | Watch | HScan | HScanNoValues | HRandField | StrGet | StrGetAll | SMembers | SIsMember | SCard | LRange | LLen | LIndex;
+  HGet | HExists | HGetAll | HKeys | HVals | HLen | HMGet | Count | Find | FindOne | Watch | HScan | HScanNoValues | HRandField | StrGet | StrGetAll | SMembers | SIsMember | SCard | LRange | LLen | LIndex | ZScore | ZCard | ZCount | ZRange | ZRevRange | ZRangeByScore | ZRevRangeByScore | ZRank | ZRevRank;
 /** Every mutating command. */
-export const Writes = StrSet | StrSetAll | StrDel | LPush | RPush | LPop | RPop | LSet | LRem | LTrim | LInsertBefore | LInsertAfter | SAdd | SRem | HSet | HSetNX | HDel | Del | HIncrBy | HIncrByFloat | HMSet;
+export const Writes = StrSet | StrSetAll | StrDel | LPush | RPush | LPop | RPop | LSet | LRem | LTrim | LInsertBefore | LInsertAfter | SAdd | SRem | HSet | HSetNX | HDel | Del | HIncrBy | HIncrByFloat | HMSet | ZAdd | ZRem | ZIncrBy | ZPopMin | ZPopMax | ZRemRangeByRank | ZRemRangeByScore;
 /** Everything — the httpOn() debug default. */
 export const All = ReadOnly | Writes;
 /** doptime-compatible alias for All. */
@@ -211,6 +218,13 @@ export const CMD_BIT: Record<string, bigint> = {
   FINDONE: FindOne, WATCH: Watch,
   HSCAN: HScan, HSCANNOVALUES: HScanNoValues, HRANDFIELD: HRandField,
   STRGET: StrGet, STRSET: StrSet, STRSETALL: StrSetAll, STRGETALL: StrGetAll, STRDEL: StrDel,
+  SADD: SAdd, SREM: SRem, SMEMBERS: SMembers, SISMEMBER: SIsMember, SCARD: SCard,
+  LPUSH: LPush, RPUSH: RPush, LPOP: LPop, RPOP: RPop, LRANGE: LRange, LLEN: LLen, LINDEX: LIndex,
+  LSET: LSet, LREM: LRem, LTRIM: LTrim, LINSERTBEFORE: LInsertBefore, LINSERTAFTER: LInsertAfter,
+  ZADD: ZAdd, ZREM: ZRem, ZSCORE: ZScore, ZCARD: ZCard, ZCOUNT: ZCount, ZINCRBY: ZIncrBy,
+  ZRANGE: ZRange, ZREVRANGE: ZRevRange, ZRANGEBYSCORE: ZRangeByScore, ZREVRANGEBYSCORE: ZRevRangeByScore,
+  ZRANK: ZRank, ZREVRANK: ZRevRank, ZPOPMIN: ZPopMin, ZPOPMAX: ZPopMax,
+  ZREMRANGEBYRANK: ZRemRangeByRank, ZREMRANGEBYSCORE: ZRemRangeByScore,
 };
 
 export interface CollectionOpts {
