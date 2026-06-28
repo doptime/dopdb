@@ -177,11 +177,16 @@ export const StrSet = 1 << 22;
 export const StrSetAll = 1 << 23;
 export const StrGetAll = 1 << 24;
 export const StrDel = 1 << 25;
+export const SAdd = 1 << 26;
+export const SRem = 1 << 27;
+export const SMembers = 1 << 28;
+export const SIsMember = 1 << 29;
+export const SCard = 1 << 30;
 /** Every non-mutating command. */
 export const ReadOnly =
-  HGet | HExists | HGetAll | HKeys | HVals | HLen | HMGet | Count | Find | FindOne | Watch | HScan | HScanNoValues | HRandField | StrGet | StrGetAll;
+  HGet | HExists | HGetAll | HKeys | HVals | HLen | HMGet | Count | Find | FindOne | Watch | HScan | HScanNoValues | HRandField | StrGet | StrGetAll | SMembers | SIsMember | SCard;
 /** Every mutating command. */
-export const Writes = StrSet | StrSetAll | StrDel | HSet | HSetNX | HDel | Del | HIncrBy | HIncrByFloat | HMSet;
+export const Writes = StrSet | StrSetAll | StrDel | SAdd | SRem | HSet | HSetNX | HDel | Del | HIncrBy | HIncrByFloat | HMSet;
 /** Everything — the httpOn() debug default. */
 export const All = ReadOnly | Writes;
 /** doptime-compatible alias for All. */

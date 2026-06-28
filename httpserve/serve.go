@@ -41,6 +41,7 @@ var dataCommands = map[string]bool{
 	"HMSET": true, "HMGET": true, "COUNT": true, "FINDONE": true, "WATCH": true,
 	"HSCAN": true, "HSCANNOVALUES": true, "HRANDFIELD": true,
 	"STRGET": true, "STRSET": true, "STRSETALL": true, "STRGETALL": true, "STRDEL": true,
+	"SADD": true, "SREM": true, "SMEMBERS": true, "SISMEMBER": true, "SCARD": true,
 }
 
 // Guardrails (mirrored on the TypeScript side: server.ts MAX_BODY/DEFAULT_LIMIT/
@@ -427,6 +428,82 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 			return
 		}
 		writeOK(w, sa.HttpStrSetAll(ctx, c.DB, items, scope))
+
+	case "SADD":
+		sa, ok := acc.(dopdb.SetAccessor)
+		if !ok {
+			writeErr(w, http.StatusNotFound, "not_found", errors.New("not a set collection: "+c.Coll))
+			return
+		}
+		if key == "" {
+			writeErr(w, http.StatusBadRequest, "validation", errors.New("SADD requires ?f="))
+			return
+		}
+		var body map[string]any
+		if err := json.Unmarshal(c.Body, &body); err != nil {
+			writeErr(w, http.StatusBadRequest, "validation", errors.New("SADD body needs {\"members\":[...]}"))
+			return
+		}
+		ms, _ := body["members"].([]any)
+		writeOK(w, sa.HttpSAdd(ctx, c.DB, key, ms, scope))
+
+	case "SREM":
+		sa, ok := acc.(dopdb.SetAccessor)
+		if !ok {
+			writeErr(w, http.StatusNotFound, "not_found", errors.New("not a set collection: "+c.Coll))
+			return
+		}
+		if key == "" {
+			writeErr(w, http.StatusBadRequest, "validation", errors.New("SREM requires ?f="))
+			return
+		}
+		var body map[string]any
+		if err := json.Unmarshal(c.Body, &body); err != nil {
+			writeErr(w, http.StatusBadRequest, "validation", errors.New("SREM body needs {\"members\":[...]}"))
+			return
+		}
+		ms, _ := body["members"].([]any)
+		writeOK(w, sa.HttpSRem(ctx, c.DB, key, ms, scope))
+
+	case "SMEMBERS":
+		sa, ok := acc.(dopdb.SetAccessor)
+		if !ok {
+			writeErr(w, http.StatusNotFound, "not_found", errors.New("not a set collection: "+c.Coll))
+			return
+		}
+		if key == "" {
+			writeErr(w, http.StatusBadRequest, "validation", errors.New("SMEMBERS requires ?f="))
+			return
+		}
+		v, err := sa.HttpSMembers(ctx, c.DB, key, scope)
+		writeResult(w, v, err)
+
+	case "SISMEMBER":
+		sa, ok := acc.(dopdb.SetAccessor)
+		if !ok {
+			writeErr(w, http.StatusNotFound, "not_found", errors.New("not a set collection: "+c.Coll))
+			return
+		}
+		if key == "" {
+			writeErr(w, http.StatusBadRequest, "validation", errors.New("SISMEMBER requires ?f="))
+			return
+		}
+		member := c.Queries.Get("member")
+		ex, err := sa.HttpSIsMember(ctx, c.DB, key, member, scope)
+		writeResult(w, map[string]any{"member": ex}, err)
+
+	case "SCARD":
+		sa, ok := acc.(dopdb.SetAccessor)
+		if !ok {
+			writeErr(w, http.StatusNotFound, "not_found", errors.New("not a set collection: "+c.Coll))
+			return
+		}
+		if key == "" {
+			writeErr(w, http.StatusBadRequest, "validation", errors.New("SCARD requires ?f="))
+			return
+		}
+		n, err := sa.HttpSCard(ctx, c.DB, key, scope)
+		writeResult(w, map[string]any{"card": n}, err)
 
 	case "WATCH":
 		flusher, ok := w.(http.Flusher)

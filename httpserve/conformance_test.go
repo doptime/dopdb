@@ -76,6 +76,7 @@ func setupConformance(t *testing.T) *tsConformance {
 	dopdb.RegisterHttp(dopdb.New[string, confDoc](dopdb.WithCollection("notes")))
 	dopdb.RegisterHttp(dopdb.New[string, confItem](dopdb.WithCollection("items")))
 	dopdb.NewString[string](dopdb.WithCollection("strvals")).HttpOn() // String family (STR*), non-scoped
+dopdb.NewSet[string](dopdb.WithCollection("setvals")).HttpOn()    // Set family (S*), non-scoped
 	dopdb.SetOwnerScope("notes", "owner", "uid")
 	perms := NewPermissions()
 	for _, c := range []string{
@@ -631,5 +632,107 @@ func TestConformanceString(t *testing.T) {
 				t.Errorf("strgetall %s after del: m2=%v want y", base, m["m2"])
 			}
 		}
+	}
+}
+
+// ---- Set conformance helpers ----
+func toStrSet(body any) map[string]bool {
+	arr, _ := body.([]any)
+	m := map[string]bool{}
+	for _, e := range arr {
+		if s, ok := e.(string); ok {
+			m[s] = true
+		}
+	}
+	return m
+}
+func strSetEq(a, b map[string]bool) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k := range a {
+		if !b[k] {
+			return false
+		}
+	}
+	return true
+}
+func numField(body any, field string) int {
+	m, _ := body.(map[string]any)
+	if m == nil {
+		return -1
+	}
+	switch v := m[field].(type) {
+	case float64:
+		return int(v)
+	case int64:
+		return int(v)
+	}
+	return -1
+}
+func boolField(body any, field string) bool {
+	m, _ := body.(map[string]any)
+	b, _ := m[field].(bool)
+	return b
+}
+
+// TestConformanceSet: S* family two-engine parity over setvals (non-scoped).
+// SMEMBERS compared order-insensitively ($addToSet order should match, but we
+// don't depend on it).
+func TestConformanceSet(t *testing.T) {
+	c := setupConformance(t)
+	defer c.close()
+	tok := tokenFor(t, "alice")
+
+	// SADD then SMEMBERS.
+	for _, base := range []string{c.goBase, c.tsBase} {
+		if st, _ := httpCall(t, base, "POST", "/api/sadd/setvals?f=s1", tok, `{"members":["a","b","c"]}`); st != 200 {
+			t.Fatalf("sadd %s: %d", base, st)
+		}
+	}
+	_, gb := httpCall(t, c.goBase, "GET", "/api/smembers/setvals?f=s1", tok, "")
+	_, tb := httpCall(t, c.tsBase, "GET", "/api/smembers/setvals?f=s1", tok, "")
+	if !strSetEq(toStrSet(gb), toStrSet(tb)) {
+		t.Errorf("smembers differ: Go=%v TS=%v", gb, tb)
+	}
+	if len(toStrSet(gb)) != 3 {
+		t.Errorf("smembers count: got %d want 3 (%v)", len(toStrSet(gb)), gb)
+	}
+
+	// SCARD: 3.
+	_, gb = httpCall(t, c.goBase, "GET", "/api/scard/setvals?f=s1", tok, "")
+	_, tb = httpCall(t, c.tsBase, "GET", "/api/scard/setvals?f=s1", tok, "")
+	if numField(gb, "card") != numField(tb, "card") {
+		t.Errorf("scard differ: Go=%v TS=%v", gb, tb)
+	}
+	if numField(gb, "card") != 3 {
+		t.Errorf("scard: got %d want 3", numField(gb, "card"))
+	}
+
+	// SISMEMBER b → true, z → false.
+	_, gb = httpCall(t, c.goBase, "GET", "/api/sismember/setvals?f=s1&member=b", tok, "")
+	_, tb = httpCall(t, c.tsBase, "GET", "/api/sismember/setvals?f=s1&member=b", tok, "")
+	if boolField(gb, "member") != boolField(tb, "member") || !boolField(gb, "member") {
+		t.Errorf("sismember b: Go=%v TS=%v", gb, tb)
+	}
+
+	// SREM b, then SMEMBERS has 2 (a, c), SISMEMBER b → false.
+	for _, base := range []string{c.goBase, c.tsBase} {
+		if st, _ := httpCall(t, base, "POST", "/api/srem/setvals?f=s1", tok, `{"members":["b"]}`); st != 200 {
+			t.Errorf("srem %s: %d", base, st)
+		}
+	}
+	_, gb = httpCall(t, c.goBase, "GET", "/api/smembers/setvals?f=s1", tok, "")
+	_, tb = httpCall(t, c.tsBase, "GET", "/api/smembers/setvals?f=s1", tok, "")
+	if !strSetEq(toStrSet(gb), toStrSet(tb)) {
+		t.Errorf("after srem smembers differ: Go=%v TS=%v", gb, tb)
+	}
+	if len(toStrSet(gb)) != 2 {
+		t.Errorf("after srem count: got %d want 2", len(toStrSet(gb)))
+	}
+	_, gb = httpCall(t, c.goBase, "GET", "/api/sismember/setvals?f=s1&member=b", tok, "")
+	_, tb = httpCall(t, c.tsBase, "GET", "/api/sismember/setvals?f=s1&member=b", tok, "")
+	if boolField(gb, "member") != false || boolField(gb, "member") != boolField(tb, "member") {
+		t.Errorf("sismember b after srem: Go=%v TS=%v", gb, tb)
 	}
 }

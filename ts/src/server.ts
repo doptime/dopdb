@@ -137,6 +137,8 @@ interface ExecArgs {
   cursor?: number;
   count?: number;
   match?: string;
+  members?: unknown[];
+  member?: unknown;
   opt?: FindOpt;
 }
 
@@ -246,6 +248,26 @@ async function exec(m: MongoCollection<Doc>, cmd: string, a: ExecArgs, scope: Fi
       const next = docs.length === count ? cursor + docs.length : 0;
       if (cmd === "hscannovalues") return { cursor: next, keys };
       return { cursor: next, keys, values: docs };
+    }
+    case "sadd": {
+      await m.updateOne({ _id: a.key, ...scope } as Filter, { $addToSet: { members: { $each: a.members ?? [] } } } as never, { upsert: true });
+      return { ok: true };
+    }
+    case "srem": {
+      await m.updateOne({ _id: a.key, ...scope } as Filter, { $pull: { members: { $in: a.members ?? [] } } } as never);
+      return { ok: true };
+    }
+    case "smembers": {
+      const doc = await m.findOne({ _id: a.key, ...scope } as Filter);
+      return (doc as Doc | null)?.members ?? [];
+    }
+    case "sismember": {
+      const n = await m.countDocuments({ _id: a.key, ...scope, members: a.member } as Filter, { limit: 1 } as never);
+      return { member: n > 0 };
+    }
+    case "scard": {
+      const doc = await m.findOne({ _id: a.key, ...scope } as Filter);
+      return { card: ((doc as Doc | null)?.members as unknown[] | undefined)?.length ?? 0 };
     }
     case "strget": {
       const doc = await m.findOne({ _id: a.key, ...scope } as Filter);
@@ -476,6 +498,7 @@ const DATA_COMMANDS = new Set([
   "hkeys", "hvals", "hlen", "hincrby", "hincrbyfloat", "hmset", "hmget", "count", "find", "findone",
   "hrandfield", "hscan", "hscannovalues",
   "strget", "strset", "strsetall", "strgetall", "strdel",
+  "sadd", "srem", "smembers", "sismember", "scard",
 ]);
 const STREAM_COMMANDS = new Set(["watch"]);
 const ROUTED_COMMANDS = new Set([...DATA_COMMANDS, ...STREAM_COMMANDS]);
@@ -825,6 +848,7 @@ async function buildRuntime(cfg: ServeConfig): Promise<Runtime> {
     }
 
     let entries: Record<string, Doc> | undefined;
+    let members: unknown[] | undefined;
     if (r.cmd === "hmset") {
       let body: Record<string, Doc> = {};
       if (bodyText) {
@@ -853,6 +877,14 @@ async function buildRuntime(cfg: ServeConfig): Promise<Runtime> {
         catch { return { kind: "json", status: 400, body: { error: "invalid JSON body", code: "validation" } }; }
       }
       entries = body as Record<string, Doc>; // {key:value} raw
+    }
+    if (r.cmd === "sadd" || r.cmd === "srem") {
+      let body: { members?: unknown[] } = {};
+      if (bodyText) {
+        try { body = JSON.parse(bodyText); }
+        catch { return { kind: "json", status: 400, body: { error: "invalid JSON body", code: "validation" } }; }
+      }
+      members = body.members;
     }
 
     let filter: Filter | undefined;
@@ -891,6 +923,8 @@ async function buildRuntime(cfg: ServeConfig): Promise<Runtime> {
       cursor: input.url.searchParams.has("cursor") ? Number(input.url.searchParams.get("cursor")) : undefined,
       count: input.url.searchParams.has("count") ? Number(input.url.searchParams.get("count")) : undefined,
       match: input.url.searchParams.get("match") ?? undefined,
+      members,
+      member: input.url.searchParams.get("member") ?? undefined,
       opt,
     }, scope);
     return { kind: "json", status: 200, body: out ?? null };

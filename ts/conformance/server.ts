@@ -31,6 +31,11 @@ const schema = {
     _id: f.string(),
     v: f.string(),
   }).named("strvals"),
+  // Set family (S*): members array, non-scoped.
+  Setvals: collection({
+    _id: f.string(),
+    members: f.string(), // array via wire; not schema-validated for S*
+  }).named("setvals"),
 };
 
 async function main(): Promise<void> {
