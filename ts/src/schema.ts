@@ -172,11 +172,16 @@ export const Watch = 1 << 17;
 export const HScan = 1 << 18;
 export const HScanNoValues = 1 << 19;
 export const HRandField = 1 << 20;
+export const StrGet = 1 << 21;
+export const StrSet = 1 << 22;
+export const StrSetAll = 1 << 23;
+export const StrGetAll = 1 << 24;
+export const StrDel = 1 << 25;
 /** Every non-mutating command. */
 export const ReadOnly =
-  HGet | HExists | HGetAll | HKeys | HVals | HLen | HMGet | Count | Find | FindOne | Watch | HScan | HScanNoValues | HRandField;
+  HGet | HExists | HGetAll | HKeys | HVals | HLen | HMGet | Count | Find | FindOne | Watch | HScan | HScanNoValues | HRandField | StrGet | StrGetAll;
 /** Every mutating command. */
-export const Writes = HSet | HSetNX | HDel | Del | HIncrBy | HIncrByFloat | HMSet;
+export const Writes = StrSet | StrSetAll | StrDel | HSet | HSetNX | HDel | Del | HIncrBy | HIncrByFloat | HMSet;
 /** Everything — the httpOn() debug default. */
 export const All = ReadOnly | Writes;
 /** doptime-compatible alias for All. */
@@ -188,6 +193,7 @@ export const CMD_BIT: Record<string, number> = {
   HINCRBYFLOAT: HIncrByFloat, HMSET: HMSet, HMGET: HMGet, COUNT: Count, FIND: Find,
   FINDONE: FindOne, WATCH: Watch,
   HSCAN: HScan, HSCANNOVALUES: HScanNoValues, HRANDFIELD: HRandField,
+  STRGET: StrGet, STRSET: StrSet, STRSETALL: StrSetAll, STRGETALL: StrGetAll, STRDEL: StrDel,
 };
 
 export interface CollectionOpts {

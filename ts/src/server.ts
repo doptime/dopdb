@@ -247,6 +247,47 @@ async function exec(m: MongoCollection<Doc>, cmd: string, a: ExecArgs, scope: Fi
       if (cmd === "hscannovalues") return { cursor: next, keys };
       return { cursor: next, keys, values: docs };
     }
+    case "strget": {
+      const doc = await m.findOne({ _id: a.key, ...scope } as Filter);
+      if (!doc) throw new NotFoundError();
+      return (doc as Doc).v;
+    }
+    case "strset": {
+      const setDoc: Doc = { v: a.value };
+      if (a.n && a.n > 0) setDoc.expireAt = new Date(Date.now() + a.n * 1000);
+      try {
+        await m.updateOne({ _id: a.key, ...scope } as Filter, { $set: setDoc } as never, { upsert: true });
+      } catch (e) {
+        if (isDupKey(e) && !empty(scope)) throw new ForbiddenError();
+        throw e;
+      }
+      return { ok: true };
+    }
+    case "strdel": {
+      await m.deleteMany({ _id: { $in: a.keys ?? [] }, ...scope } as Filter);
+      return { ok: true };
+    }
+    case "strgetall": {
+      const f: Filter = { ...scope };
+      if (a.match && a.match !== "*") (f as Doc)._id = { $regex: globToRegex(a.match) };
+      const out: Record<string, unknown> = {};
+      for await (const d of m.find(f)) out[String((d as Doc)._id)] = (d as Doc).v;
+      return out;
+    }
+    case "strsetall": {
+      const entries = Object.entries(a.entries ?? {});
+      if (entries.length === 0) return { ok: true };
+      const ops = entries.map(([k, v]) => ({
+        updateOne: { filter: { _id: k, ...scope } as Filter, update: { $set: { v } } as never, upsert: true },
+      }));
+      try {
+        await m.bulkWrite(ops as never, { ordered: false });
+      } catch (e) {
+        if (isDupKey(e) && !empty(scope)) throw new ForbiddenError();
+        throw e;
+      }
+      return { ok: true };
+    }
     case "count": {
       const safe = sanitizeFilter(a.filter);
       return { count: await m.countDocuments(mergeScope(scope, safe)) };
@@ -434,6 +475,7 @@ const DATA_COMMANDS = new Set([
   "hget", "hset", "hsetnx", "hdel", "del", "hexists", "hgetall",
   "hkeys", "hvals", "hlen", "hincrby", "hincrbyfloat", "hmset", "hmget", "count", "find", "findone",
   "hrandfield", "hscan", "hscannovalues",
+  "strget", "strset", "strsetall", "strgetall", "strdel",
 ]);
 const STREAM_COMMANDS = new Set(["watch"]);
 const ROUTED_COMMANDS = new Set([...DATA_COMMANDS, ...STREAM_COMMANDS]);
@@ -796,6 +838,23 @@ async function buildRuntime(cfg: ServeConfig): Promise<Runtime> {
       }
     }
 
+    if (r.cmd === "strset") {
+      let body: Doc = {};
+      if (bodyText) {
+        try { body = JSON.parse(bodyText); }
+        catch { return { kind: "json", status: 400, body: { error: "invalid JSON body", code: "validation" } }; }
+      }
+      value = body.v as Doc; // raw value, no @-binding
+    }
+    if (r.cmd === "strsetall") {
+      let body: Record<string, unknown> = {};
+      if (bodyText) {
+        try { body = JSON.parse(bodyText); }
+        catch { return { kind: "json", status: 400, body: { error: "invalid JSON body", code: "validation" } }; }
+      }
+      entries = body as Record<string, Doc>; // {key:value} raw
+    }
+
     let filter: Filter | undefined;
     if (r.cmd === "find" || r.cmd === "findone" || r.cmd === "count") {
       if (bodyText) {
@@ -826,7 +885,9 @@ async function buildRuntime(cfg: ServeConfig): Promise<Runtime> {
       entries,
       filter,
       field: input.url.searchParams.get("field") ?? undefined,
-      n: input.url.searchParams.has("n") ? Number(input.url.searchParams.get("n")) : undefined,
+      n: input.url.searchParams.has("n") ? Number(input.url.searchParams.get("n"))
+        : input.url.searchParams.has("expiration") ? Number(input.url.searchParams.get("expiration"))
+        : undefined,
       cursor: input.url.searchParams.has("cursor") ? Number(input.url.searchParams.get("cursor")) : undefined,
       count: input.url.searchParams.has("count") ? Number(input.url.searchParams.get("count")) : undefined,
       match: input.url.searchParams.get("match") ?? undefined,

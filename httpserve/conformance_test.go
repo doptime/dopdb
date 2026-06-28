@@ -75,6 +75,7 @@ func setupConformance(t *testing.T) *tsConformance {
 	// Mirror the TS schema: notes (scoped) + items (plain).
 	dopdb.RegisterHttp(dopdb.New[string, confDoc](dopdb.WithCollection("notes")))
 	dopdb.RegisterHttp(dopdb.New[string, confItem](dopdb.WithCollection("items")))
+	dopdb.NewString[string](dopdb.WithCollection("strvals")).HttpOn() // String family (STR*), non-scoped
 	dopdb.SetOwnerScope("notes", "owner", "uid")
 	perms := NewPermissions()
 	for _, c := range []string{
@@ -564,6 +565,70 @@ func TestConformanceHRandField(t *testing.T) {
 			s, _ := e.(string)
 			if !valid[s] {
 				t.Errorf("%s hrandfield: %q not a seeded key", base, s)
+			}
+		}
+	}
+}
+
+// TestConformanceString: STR* family two-engine parity over strvals
+// (non-scoped). STRSET body {"v":<value>}; STRGET returns the bare value.
+func TestConformanceString(t *testing.T) {
+	c := setupConformance(t)
+	defer c.close()
+	tok := tokenFor(t, "alice")
+
+	// STRSET + STRGET: both engines store and return the bare value.
+	for _, base := range []string{c.goBase, c.tsBase} {
+		if st, _ := httpCall(t, base, "POST", "/api/strset/strvals?f=s1", tok, `{"v":"hello"}`); st != 200 {
+			t.Fatalf("strset %s: status=%d", base, st)
+		}
+	}
+	gs, gb := httpCall(t, c.goBase, "GET", "/api/strget/strvals?f=s1", tok, "")
+	ts, tb := httpCall(t, c.tsBase, "GET", "/api/strget/strvals?f=s1", tok, "")
+	if gs != ts {
+		t.Errorf("strget status: Go=%d TS=%d", gs, ts)
+	}
+	if gb != "hello" {
+		t.Errorf("strget Go: got %v want hello", gb)
+	}
+	if tb != "hello" {
+		t.Errorf("strget TS: got %v want hello", tb)
+	}
+
+	// STRGETALL: returns {key:value}; s1 present with the right value.
+	_, gb = httpCall(t, c.goBase, "GET", "/api/strgetall/strvals", tok, "")
+	_, tb = httpCall(t, c.tsBase, "GET", "/api/strgetall/strvals", tok, "")
+	if gm, ok := gb.(map[string]any); ok {
+		if gm["s1"] != "hello" {
+			t.Errorf("strgetall Go: s1=%v want hello", gm["s1"])
+		}
+	} else {
+		t.Errorf("strgetall Go: body not an object: %v", gb)
+	}
+	if tm, ok := tb.(map[string]any); ok {
+		if tm["s1"] != "hello" {
+			t.Errorf("strgetall TS: s1=%v want hello", tm["s1"])
+		}
+	} else {
+		t.Errorf("strgetall TS: body not an object: %v", tb)
+	}
+
+	// STRSETALL + STRDEL: write two, delete one — both engines agree.
+	for _, base := range []string{c.goBase, c.tsBase} {
+		if st, _ := httpCall(t, base, "POST", "/api/strsetall/strvals", tok, `{"m1":"x","m2":"y"}`); st != 200 {
+			t.Errorf("strsetall %s: status=%d", base, st)
+		}
+		if st, _ := httpCall(t, base, "GET", "/api/strdel/strvals?f=m1", tok, ""); st != 200 {
+			t.Errorf("strdel %s: status=%d", base, st)
+		}
+		// after del, m1 is gone (STRGETALL no longer has it).
+		_, body := httpCall(t, base, "GET", "/api/strgetall/strvals", tok, "")
+		if m, ok := body.(map[string]any); ok {
+			if _, stillThere := m["m1"]; stillThere {
+				t.Errorf("strdel %s: m1 still present after del", base)
+			}
+			if m["m2"] != "y" {
+				t.Errorf("strgetall %s after del: m2=%v want y", base, m["m2"])
 			}
 		}
 	}

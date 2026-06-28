@@ -34,14 +34,19 @@ const (
 	HScan
 	HScanNoValues
 	HRandField
+	StrGet
+	StrSet
+	StrSetAll
+	StrGetAll
+	StrDel
 )
 
 // Convenience groups.
 const (
 	// ReadOnly = every non-mutating command.
-	ReadOnly Perm = HGet | HExists | HGetAll | HKeys | HVals | HLen | HMGet | Count | Find | FindOne | Watch | HScan | HScanNoValues | HRandField
+	ReadOnly Perm = HGet | HExists | HGetAll | HKeys | HVals | HLen | HMGet | Count | Find | FindOne | Watch | HScan | HScanNoValues | HRandField | StrGet | StrGetAll
 	// Writes = every mutating command.
-	Writes Perm = HSet | HSetNX | HDel | Del | HIncrBy | HIncrByFloat | HMSet
+	Writes Perm = HSet | HSetNX | HDel | Del | HIncrBy | HIncrByFloat | HMSet | StrSet | StrSetAll | StrDel
 	// All = everything. This is the HttpOn() debug default.
 	All Perm = ReadOnly | Writes
 	// HashAll is a doptime-compatible alias for All.
@@ -56,6 +61,7 @@ var cmdPerm = map[string]Perm{
 	"HMSET": HMSet, "HMGET": HMGet, "COUNT": Count, "FIND": Find,
 	"FINDONE": FindOne, "WATCH": Watch,
 	"HSCAN": HScan, "HSCANNOVALUES": HScanNoValues, "HRANDFIELD": HRandField,
+	"STRGET": StrGet, "STRSET": StrSet, "STRSETALL": StrSetAll, "STRGETALL": StrGetAll, "STRDEL": StrDel,
 }
 
 var (
@@ -120,6 +126,7 @@ func HttpPermNames(p Perm) []string {
 		{HMSet, "hmset"}, {HMGet, "hmget"}, {Count, "count"}, {Find, "find"},
 		{FindOne, "findone"}, {Watch, "watch"},
 		{HScan, "hscan"}, {HScanNoValues, "hscannovalues"}, {HRandField, "hrandfield"},
+		{StrGet, "strget"}, {StrSet, "strset"}, {StrSetAll, "strsetall"}, {StrGetAll, "strgetall"}, {StrDel, "strdel"},
 	}
 	var out []string
 	for _, o := range order {

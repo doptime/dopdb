@@ -78,21 +78,29 @@ type HttpAccessor interface {
 	HttpScanNoValues(ctx context.Context, ds, match string, cursor uint64, count int64, scope M) (any, error)
 }
 
+// HttpKey is the minimal registration interface — any collection reachable
+// over HTTP. HttpAccessor (the Hash family) satisfies it; the
+// String/List/Set/ZSet collection types satisfy it via their own accessor
+// interfaces, and the dispatcher type-asserts to the right one per command.
+type HttpKey interface {
+	Collection() string
+}
+
 var (
-	httpAccessors   = map[string]HttpAccessor{}
+	httpAccessors   = map[string]HttpKey{}
 	httpAccessorsMu sync.RWMutex
 )
 
 // RegisterHttp exposes a collection to the HTTP data-command layer under its
 // collection name. Call once per collection you want reachable from the client.
-func RegisterHttp(a HttpAccessor) {
+func RegisterHttp(a HttpKey) {
 	httpAccessorsMu.Lock()
 	defer httpAccessorsMu.Unlock()
 	httpAccessors[a.Collection()] = a
 }
 
 // LookupHttp resolves a registered accessor by collection name.
-func LookupHttp(coll string) (HttpAccessor, bool) {
+func LookupHttp(coll string) (HttpKey, bool) {
 	httpAccessorsMu.RLock()
 	defer httpAccessorsMu.RUnlock()
 	a, ok := httpAccessors[coll]

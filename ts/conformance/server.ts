@@ -26,6 +26,11 @@ const schema = {
     _id: f.string(),
     label: f.string(),
   }).named("items"),
+  // String family (STR*): value in the "v" field, non-scoped.
+  Strs: collection({
+    _id: f.string(),
+    v: f.string(),
+  }).named("strvals"),
 };
 
 async function main(): Promise<void> {

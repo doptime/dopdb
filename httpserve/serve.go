@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/doptime/dopdb"
 	"github.com/doptime/dopdb/api"
@@ -39,6 +40,7 @@ var dataCommands = map[string]bool{
 	"HLEN": true, "HINCRBY": true, "HINCRBYFLOAT": true, "FIND": true,
 	"HMSET": true, "HMGET": true, "COUNT": true, "FINDONE": true, "WATCH": true,
 	"HSCAN": true, "HSCANNOVALUES": true, "HRANDFIELD": true,
+	"STRGET": true, "STRSET": true, "STRSETALL": true, "STRGETALL": true, "STRDEL": true,
 }
 
 // Guardrails (mirrored on the TypeScript side: server.ts MAX_BODY/DEFAULT_LIMIT/
@@ -121,7 +123,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.dispatch(r.Context(), w, c, acc, scope, scoped)
 }
 
-func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx, acc dopdb.HttpAccessor, scope dopdb.M, scoped bool) {
+func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx, acc dopdb.HttpKey, scope dopdb.M, scoped bool) {
+	ha, _ := acc.(dopdb.HttpAccessor) // nil for non-Hash collections; Hash cases use ha
 	key := c.Field() // ?f= is the document key for per-key commands
 
 	switch c.Cmd {
@@ -135,9 +138,9 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 			err error
 		)
 		if scoped {
-			v, err = acc.HttpGetScoped(ctx, c.DB, key, scope)
+			v, err = ha.HttpGetScoped(ctx, c.DB, key, scope)
 		} else {
-			v, err = acc.HttpGet(ctx, c.DB, key)
+			v, err = ha.HttpGet(ctx, c.DB, key)
 		}
 		writeResult(w, v, err)
 
@@ -149,9 +152,9 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 		c.mergeBody() // fold body value fields into params (@-context already set)
 		var err error
 		if scoped {
-			err = acc.HttpSetScoped(ctx, c.DB, key, c.Params, scope)
+			err = ha.HttpSetScoped(ctx, c.DB, key, c.Params, scope)
 		} else {
-			err = acc.HttpSet(ctx, c.DB, key, c.Params)
+			err = ha.HttpSet(ctx, c.DB, key, c.Params)
 		}
 		writeOK(w, err)
 
@@ -165,9 +168,9 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 		var err error
 		if scoped {
 			// F10: scoped hsetnx checks ownership first — prevents cross-tenant existence leakage
-			inserted, err = acc.HttpSetNXScoped(ctx, c.DB, key, c.Params, scope)
+			inserted, err = ha.HttpSetNXScoped(ctx, c.DB, key, c.Params, scope)
 		} else {
-			inserted, err = acc.HttpSetNX(ctx, c.DB, key, c.Params)
+			inserted, err = ha.HttpSetNX(ctx, c.DB, key, c.Params)
 		}
 		writeResult(w, map[string]any{"inserted": inserted}, err)
 
@@ -180,12 +183,12 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 		if scoped {
 			// delete each key only if owned by caller
 			for _, k := range c.Fields {
-				if err = acc.HttpDelScoped(ctx, c.DB, k, scope); err != nil {
+				if err = ha.HttpDelScoped(ctx, c.DB, k, scope); err != nil {
 					break
 				}
 			}
 		} else {
-			err = acc.HttpDel(ctx, c.DB, c.Fields...)
+			err = ha.HttpDel(ctx, c.DB, c.Fields...)
 		}
 		writeOK(w, err)
 
@@ -199,32 +202,32 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 			err error
 		)
 		if scoped {
-			ex, err = acc.HttpExistsScoped(ctx, c.DB, key, scope)
+			ex, err = ha.HttpExistsScoped(ctx, c.DB, key, scope)
 		} else {
-			ex, err = acc.HttpExists(ctx, c.DB, key)
+			ex, err = ha.HttpExists(ctx, c.DB, key)
 		}
 		writeResult(w, map[string]any{"exists": ex}, err)
 
 	case "HGETALL", "HVALS":
-		v, err := acc.HttpGetAll(ctx, c.DB, scope) // scope nil for unscoped collections
+		v, err := ha.HttpGetAll(ctx, c.DB, scope) // scope nil for unscoped collections
 		writeResult(w, v, err)
 
 	case "HKEYS":
 		if scoped {
-			v, err := acc.HttpKeysScoped(ctx, c.DB, scope)
+			v, err := ha.HttpKeysScoped(ctx, c.DB, scope)
 			writeResult(w, v, err)
 			return
 		}
-		v, err := acc.HttpKeys(ctx, c.DB)
+		v, err := ha.HttpKeys(ctx, c.DB)
 		writeResult(w, v, err)
 
 	case "HLEN":
 		if scoped {
-			n, err := acc.HttpLenScoped(ctx, c.DB, scope)
+			n, err := ha.HttpLenScoped(ctx, c.DB, scope)
 			writeResult(w, map[string]any{"len": n}, err)
 			return
 		}
-		n, err := acc.HttpLen(ctx, c.DB)
+		n, err := ha.HttpLen(ctx, c.DB)
 		writeResult(w, map[string]any{"len": n}, err)
 
 	case "HRANDFIELD":
@@ -232,7 +235,7 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 		if n, e := strconv.Atoi(c.Queries.Get("count")); e == nil {
 			count = n
 		}
-		v, err := acc.HttpRandField(ctx, c.DB, count, scope)
+		v, err := ha.HttpRandField(ctx, c.DB, count, scope)
 		writeResult(w, v, err)
 
 	case "HSCAN", "HSCANNOVALUES":
@@ -246,11 +249,11 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 		}
 		match := c.Queries.Get("match")
 		if c.Cmd == "HSCANNOVALUES" {
-			v, err := acc.HttpScanNoValues(ctx, c.DB, match, cursor, count, scope)
+			v, err := ha.HttpScanNoValues(ctx, c.DB, match, cursor, count, scope)
 			writeResult(w, v, err)
 			return
 		}
-		v, err := acc.HttpScan(ctx, c.DB, match, cursor, count, scope)
+		v, err := ha.HttpScan(ctx, c.DB, match, cursor, count, scope)
 		writeResult(w, v, err)
 
 	case "HINCRBY", "HINCRBYFLOAT":
@@ -270,13 +273,13 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 		}
 		if scoped {
 			// only increment if the document is owned by the caller
-			ok, err := acc.HttpExistsScoped(ctx, c.DB, key, scope)
+			ok, err := ha.HttpExistsScoped(ctx, c.DB, key, scope)
 			if err != nil || !ok {
 				writeErr(w, http.StatusForbidden, "forbidden", dopdb.ErrForbidden)
 				return
 			}
 		}
-		writeOK(w, acc.HttpIncrBy(ctx, c.DB, key, field, delta))
+		writeOK(w, ha.HttpIncrBy(ctx, c.DB, key, field, delta))
 
 	case "FIND":
 		filter, ferr := c.parseFilter()
@@ -320,7 +323,7 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 				return
 			}
 		}
-		v, err := acc.HttpFind(ctx, c.DB, filter, scope, opt)
+		v, err := ha.HttpFind(ctx, c.DB, filter, scope, opt)
 		writeResult(w, v, err)
 
 	case "HMSET":
@@ -329,14 +332,14 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 			writeErr(w, http.StatusBadRequest, "validation", errors.New("HMSET requires a JSON object body {id:{...}}"))
 			return
 		}
-		writeOK(w, acc.HttpMSet(ctx, c.DB, items, scope))
+		writeOK(w, ha.HttpMSet(ctx, c.DB, items, scope))
 
 	case "HMGET":
 		if len(c.Fields) == 0 {
 			writeErr(w, http.StatusBadRequest, "validation", errors.New("HMGET requires ?f="))
 			return
 		}
-		v, err := acc.HttpMGet(ctx, c.DB, scope, c.Fields...)
+		v, err := ha.HttpMGet(ctx, c.DB, scope, c.Fields...)
 		writeResult(w, v, err)
 
 	case "COUNT":
@@ -345,7 +348,7 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 			writeErr(w, http.StatusBadRequest, "validation", ferr)
 			return
 		}
-		n, err := acc.HttpCount(ctx, c.DB, filter, scope)
+		n, err := ha.HttpCount(ctx, c.DB, filter, scope)
 		writeResult(w, map[string]any{"count": n}, err)
 
 	case "FINDONE":
@@ -354,8 +357,76 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 			writeErr(w, http.StatusBadRequest, "validation", ferr)
 			return
 		}
-		v, err := acc.HttpFindOne(ctx, c.DB, filter, scope)
+		v, err := ha.HttpFindOne(ctx, c.DB, filter, scope)
 		writeResult(w, v, err)
+
+	case "STRGET":
+		sa, ok := acc.(dopdb.StringAccessor)
+		if !ok {
+			writeErr(w, http.StatusNotFound, "not_found", errors.New("not a string collection: "+c.Coll))
+			return
+		}
+		if key == "" {
+			writeErr(w, http.StatusBadRequest, "validation", errors.New("STRGET requires ?f="))
+			return
+		}
+		v, err := sa.HttpStrGet(ctx, c.DB, key, scope)
+		writeResult(w, v, err)
+
+	case "STRSET":
+		sa, ok := acc.(dopdb.StringAccessor)
+		if !ok {
+			writeErr(w, http.StatusNotFound, "not_found", errors.New("not a string collection: "+c.Coll))
+			return
+		}
+		if key == "" {
+			writeErr(w, http.StatusBadRequest, "validation", errors.New("STRSET requires ?f="))
+			return
+		}
+		var body map[string]any
+		if err := json.Unmarshal(c.Body, &body); err != nil || body["v"] == nil {
+			writeErr(w, http.StatusBadRequest, "validation", errors.New(`STRSET body needs {"v":<value>}`))
+			return
+		}
+		var exp time.Duration
+		if es, e := strconv.Atoi(c.Queries.Get("expiration")); e == nil && es > 0 {
+			exp = time.Duration(es) * time.Second
+		}
+		writeOK(w, sa.HttpStrSet(ctx, c.DB, key, body["v"], exp, scope))
+
+	case "STRDEL":
+		sa, ok := acc.(dopdb.StringAccessor)
+		if !ok {
+			writeErr(w, http.StatusNotFound, "not_found", errors.New("not a string collection: "+c.Coll))
+			return
+		}
+		if len(c.Fields) == 0 {
+			writeErr(w, http.StatusBadRequest, "validation", errors.New("STRDEL requires ?f="))
+			return
+		}
+		writeOK(w, sa.HttpStrDel(ctx, c.DB, scope, c.Fields...))
+
+	case "STRGETALL":
+		sa, ok := acc.(dopdb.StringAccessor)
+		if !ok {
+			writeErr(w, http.StatusNotFound, "not_found", errors.New("not a string collection: "+c.Coll))
+			return
+		}
+		v, err := sa.HttpStrGetAll(ctx, c.DB, c.Queries.Get("match"), scope)
+		writeResult(w, v, err)
+
+	case "STRSETALL":
+		sa, ok := acc.(dopdb.StringAccessor)
+		if !ok {
+			writeErr(w, http.StatusNotFound, "not_found", errors.New("not a string collection: "+c.Coll))
+			return
+		}
+		var items map[string]any
+		if err := json.Unmarshal(c.Body, &items); err != nil {
+			writeErr(w, http.StatusBadRequest, "validation", errors.New("STRSETALL body needs {key:value,...}"))
+			return
+		}
+		writeOK(w, sa.HttpStrSetAll(ctx, c.DB, items, scope))
 
 	case "WATCH":
 		flusher, ok := w.(http.Flusher)
@@ -376,7 +447,7 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 			flusher.Flush()
 			return nil
 		}
-		_ = acc.HttpWatch(ctx, c.DB, scope, emit)
+		_ = ha.HttpWatch(ctx, c.DB, scope, emit)
 	}
 }
 
