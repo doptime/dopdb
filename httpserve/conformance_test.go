@@ -76,7 +76,7 @@ func setupConformance(t *testing.T) *tsConformance {
 	dopdb.RegisterHttp(dopdb.New[string, confDoc](dopdb.WithCollection("notes")))
 	dopdb.RegisterHttp(dopdb.New[string, confItem](dopdb.WithCollection("items")))
 	dopdb.NewString[string](dopdb.WithCollection("strvals")).HttpOn() // String family (STR*), non-scoped
-dopdb.NewSet[string](dopdb.WithCollection("setvals")).HttpOn()    // Set family (S*), non-scoped
+	dopdb.NewSet[string](dopdb.WithCollection("setvals")).HttpOn()    // Set family (S*), non-scoped
 	dopdb.SetOwnerScope("notes", "owner", "uid")
 	perms := NewPermissions()
 	for _, c := range []string{
