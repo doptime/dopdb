@@ -126,7 +126,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx, acc dopdb.HttpKey, scope dopdb.M, scoped bool) {
 	ha, _ := acc.(dopdb.HttpAccessor) // nil for non-Hash collections; Hash cases use ha
-	key := c.Field() // ?f= is the document key for per-key commands
+	key := c.Field()                  // ?f= is the document key for per-key commands
 
 	switch c.Cmd {
 	case "HGET":
