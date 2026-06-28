@@ -126,6 +126,12 @@ export interface DbApi<C> {
   hmset(entries: Record<string, InferInput<C>>): Promise<void>;
   /** Get many keys at once; result is aligned to the input order (null = miss). */
   hmget(keys: string[]): Promise<(Infer<C> | null)[]>;
+  /** Random field keys (Redis HRANDFIELD). */
+  hrandfield(count?: number): Promise<string[]>;
+  /** Paginate keys+values by cursor (Redis HSCAN). nextCursor 0 = done. */
+  hscan(cursor?: number, match?: string, count?: number): Promise<{ cursor: number; keys: string[]; values: Infer<C>[] }>;
+  /** Paginate keys only (Redis HSCAN NOVALUES). nextCursor 0 = done. */
+  hscannovalues(cursor?: number, match?: string, count?: number): Promise<{ cursor: number; keys: string[] }>;
   /** Count documents matching a filter (owner-scoped on the server). */
   count(filter?: Filter): Promise<number>;
   find(filter?: Filter, opt?: FindOpt): Promise<Infer<C>[]>;
@@ -223,6 +229,23 @@ function makeDbApi<C extends Collection<any>>(key: string, c: C, o: ReturnType<t
       if (keys.length === 0) return [];
       const qs = keys.map((k) => `f=${encodeURIComponent(k)}`).join("&");
       return (await getJSON("hmget", qs)) as (Infer<C> | null)[];
+    },
+    hrandfield: async (count) => {
+      const p: Record<string, string> = {};
+      if (count) p.count = String(count);
+      return (await getJSON("hrandfield", Object.keys(p).length ? q(p) : "")) as string[];
+    },
+    hscan: async (cursor = 0, match, count) => {
+      const p: Record<string, string> = { cursor: String(cursor) };
+      if (match) p.match = match;
+      if (count) p.count = String(count);
+      return (await getJSON("hscan", q(p))) as { cursor: number; keys: string[]; values: Infer<C>[] };
+    },
+    hscannovalues: async (cursor = 0, match, count) => {
+      const p: Record<string, string> = { cursor: String(cursor) };
+      if (match) p.match = match;
+      if (count) p.count = String(count);
+      return (await getJSON("hscannovalues", q(p))) as { cursor: number; keys: string[] };
     },
     count: async (filter = {}) => {
       sanitizeFilter(filter);

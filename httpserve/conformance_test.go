@@ -79,6 +79,7 @@ func setupConformance(t *testing.T) *tsConformance {
 	perms := NewPermissions()
 	for _, c := range []string{
 		"HGET", "HSET", "HSETNX", "HDEL", "HEXISTS", "FIND", "HKEYS", "HLEN",
+		"HSCAN", "HSCANNOVALUES", "HRANDFIELD",
 	} {
 		perms.Grant(c, "notes")
 		perms.Grant(c, "items")
@@ -443,5 +444,127 @@ func TestConformanceUnknownCommand(t *testing.T) {
 	assertSame(t, "unknown cmd", gs, gb, ts, tb)
 	if gs != 400 {
 		t.Errorf("unknown cmd: expected 400, Go=%d TS=%d", gs, ts)
+	}
+}
+
+// scanFields pulls {cursor, keys} from an HSCAN/HSCANNOVALUES body.
+func scanFields(t *testing.T, body any) (float64, []string) {
+	t.Helper()
+	m, ok := body.(map[string]any)
+	if !ok {
+		t.Fatalf("scan body not an object: %v", body)
+	}
+	cur, _ := m["cursor"].(float64)
+	raw, _ := m["keys"].([]any)
+	out := make([]string, len(raw))
+	for i, k := range raw {
+		out[i], _ = k.(string)
+	}
+	return cur, out
+}
+
+// TestConformanceHScan: HSCAN / HSCANNOVALUES are deterministic (sorted by
+// _id), so both engines return identical cursor + keys over the same seed.
+// (values carry an _id-shape difference between Go and TS, identical to HGET,
+// so we compare keys + cursor, not the whole body.)
+func TestConformanceHScan(t *testing.T) {
+	c := setupConformance(t)
+	defer c.close()
+	tok := tokenFor(t, "alice")
+	keys := []string{"scana", "scanb", "scanc"}
+	for _, base := range []string{c.goBase, c.tsBase} {
+		for _, k := range keys {
+			if st, _ := httpCall(t, base, "POST", "/api/hset/notes?f="+k, tok, `{"text":"x"}`); st != 200 {
+				t.Fatalf("seed hset %s %s: status=%d", base, k, st)
+			}
+		}
+	}
+	// HSCAN full page.
+	gs, gb := httpCall(t, c.goBase, "GET", "/api/hscan/notes?count=10", tok, "")
+	ts, tb := httpCall(t, c.tsBase, "GET", "/api/hscan/notes?count=10", tok, "")
+	if gs != ts {
+		t.Errorf("hscan status: Go=%d TS=%d", gs, ts)
+	}
+	gcur, gkeys := scanFields(t, gb)
+	tcur, tkeys := scanFields(t, tb)
+	if gcur != tcur {
+		t.Errorf("hscan cursor: Go=%v TS=%v", gcur, tcur)
+	}
+	assertStringSliceEq(t, "hscan keys", gkeys, tkeys)
+	if len(gkeys) != len(keys) {
+		t.Errorf("hscan keys len: got %d want %d (%v)", len(gkeys), len(keys), gkeys)
+	}
+
+	// HSCAN with glob match — only scana matches.
+	_, gb = httpCall(t, c.goBase, "GET", "/api/hscan/notes?match=scana&count=10", tok, "")
+	_, tb = httpCall(t, c.tsBase, "GET", "/api/hscan/notes?match=scana&count=10", tok, "")
+	_, gkeys = scanFields(t, gb)
+	_, tkeys = scanFields(t, tb)
+	assertStringSliceEq(t, "hscan match keys", gkeys, tkeys)
+	if len(gkeys) != 1 || gkeys[0] != "scana" {
+		t.Errorf("hscan match: got %v want [scana]", gkeys)
+	}
+
+	// HSCANNOVALUES — keys only, same cursor semantics.
+	gs, gb = httpCall(t, c.goBase, "GET", "/api/hscannovalues/notes?count=10", tok, "")
+	ts, tb = httpCall(t, c.tsBase, "GET", "/api/hscannovalues/notes?count=10", tok, "")
+	if gs != ts {
+		t.Errorf("hscannovalues status: Go=%d TS=%d", gs, ts)
+	}
+	gcur, gkeys = scanFields(t, gb)
+	tcur, tkeys = scanFields(t, tb)
+	if gcur != tcur {
+		t.Errorf("hscannovalues cursor: Go=%v TS=%v", gcur, tcur)
+	}
+	assertStringSliceEq(t, "hscannovalues keys", gkeys, tkeys)
+}
+
+// assertStringSliceEq compares two string slices in order.
+func assertStringSliceEq(t *testing.T, label string, a, b []string) {
+	t.Helper()
+	if len(a) != len(b) {
+		t.Errorf("%s: len Go=%d TS=%d (%v vs %v)", label, len(a), len(b), a, b)
+		return
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			t.Errorf("%s[%d]: Go=%q TS=%q", label, i, a[i], b[i])
+		}
+	}
+}
+
+// TestConformanceHRandField: HRANDFIELD is random, so the two engines return
+// different samples. We assert the SHAPE is identical (200 + array of length
+// count, every element a seeded key), not the specific values.
+func TestConformanceHRandField(t *testing.T) {
+	c := setupConformance(t)
+	defer c.close()
+	tok := tokenFor(t, "alice")
+	valid := map[string]bool{"rand1": true, "rand2": true, "rand3": true}
+	for _, base := range []string{c.goBase, c.tsBase} {
+		for k := range valid {
+			if st, _ := httpCall(t, base, "POST", "/api/hset/notes?f="+k, tok, `{"text":"x"}`); st != 200 {
+				t.Fatalf("seed hset %s %s: status=%d", base, k, st)
+			}
+		}
+		st, body := httpCall(t, base, "GET", "/api/hrandfield/notes?count=2", tok, "")
+		if st != 200 {
+			t.Errorf("%s hrandfield: status=%d", base, st)
+			continue
+		}
+		arr, ok := body.([]any)
+		if !ok {
+			t.Errorf("%s hrandfield: body not an array: %v", base, body)
+			continue
+		}
+		if len(arr) != 2 {
+			t.Errorf("%s hrandfield: len=%d want 2", base, len(arr))
+		}
+		for _, e := range arr {
+			s, _ := e.(string)
+			if !valid[s] {
+				t.Errorf("%s hrandfield: %q not a seeded key", base, s)
+			}
+		}
 	}
 }

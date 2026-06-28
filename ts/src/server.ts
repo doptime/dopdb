@@ -134,6 +134,9 @@ interface ExecArgs {
   filter?: Filter;
   field?: string;
   n?: number;
+  cursor?: number;
+  count?: number;
+  match?: string;
   opt?: FindOpt;
 }
 
@@ -216,6 +219,34 @@ async function exec(m: MongoCollection<Doc>, cmd: string, a: ExecArgs, scope: Fi
     case "hlen": {
       return { len: await m.countDocuments(scope) };
     }
+    case "hrandfield": {
+      // Redis HRANDFIELD — random field keys via $sample. scope restricts the
+      // population (owner-scope). Mirrors Go's backend.sample.
+      const size = a.count && a.count > 0 ? a.count : 1;
+      const pipe: Doc[] = [];
+      if (!empty(scope)) pipe.push({ $match: scope });
+      pipe.push({ $sample: { size } }, { $project: { _id: 1 } });
+      const ids: string[] = [];
+      for await (const d of m.aggregate(pipe)) ids.push(String((d as Doc)._id));
+      return ids;
+    }
+    case "hscan":
+    case "hscannovalues": {
+      // Redis HSCAN over Mongo: glob match -> regex on _id, paginated by a
+      // numeric cursor (offset), sorted by _id. nextCursor = cursor+len when
+      // the page is full, else 0 (done). Mirrors Go's backend.scan.
+      const count = a.count && a.count > 0 ? a.count : 10;
+      const cursor = a.cursor ?? 0;
+      const f: Filter = { ...scope };
+      if (a.match && a.match !== "*") (f as Doc)._id = { $regex: globToRegex(a.match) };
+      let q = m.find(f);
+      if (cmd === "hscannovalues") q = q.project({ _id: 1 });
+      const docs = await q.sort({ _id: 1 }).skip(cursor).limit(count).toArray();
+      const keys = docs.map((d) => String((d as Doc)._id));
+      const next = docs.length === count ? cursor + docs.length : 0;
+      if (cmd === "hscannovalues") return { cursor: next, keys };
+      return { cursor: next, keys, values: docs };
+    }
     case "count": {
       const safe = sanitizeFilter(a.filter);
       return { count: await m.countDocuments(mergeScope(scope, safe)) };
@@ -272,6 +303,19 @@ async function exec(m: MongoCollection<Doc>, cmd: string, a: ExecArgs, scope: Fi
   }
 }
 
+// globToRegex converts a Redis glob (used by HSCAN match) to an anchored regex,
+// mirroring Go's globToRegex.
+function globToRegex(glob: string): string {
+  let r = "^";
+  for (const ch of glob) {
+    if (ch === "*") r += ".*";
+    else if (ch === "?") r += ".";
+    else if (".+()|[]{}^$\\".includes(ch)) r += "\\" + ch;
+    else r += ch;
+  }
+  return r + "$";
+}
+
 // ----------------------------------------------------------------------------
 // serverDb — raw, trusted, typed db for handler/server code (no scope, no JWT).
 // ----------------------------------------------------------------------------
@@ -314,6 +358,9 @@ function makeServerApi<C extends Collection<any>>(coll: C, m: MongoCollection<Do
       await exec(m, "hmset", { entries: prepared as Record<string, Doc> }, {});
     },
     hmget: async (keys) => (await exec(m, "hmget", { keys }, {})) as any,
+    hrandfield: async (count) => (await exec(m, "hrandfield", count ? { count } : {}, {})) as string[],
+    hscan: async (cursor = 0, match, count) => (await exec(m, "hscan", { cursor, match, count }, {})) as any,
+    hscannovalues: async (cursor = 0, match, count) => (await exec(m, "hscannovalues", { cursor, match, count }, {})) as any,
     count: async (filter = {}) => ((await exec(m, "count", { filter }, {})) as any).count ?? 0,
     find: async (filter = {}, opt = {}) => (await exec(m, "find", { filter, opt }, {})) as any,
     findone: async (filter = {}) => {
@@ -386,6 +433,7 @@ export async function ensureIndexes(schema: Record<string, Collection<any>>, db:
 const DATA_COMMANDS = new Set([
   "hget", "hset", "hsetnx", "hdel", "del", "hexists", "hgetall",
   "hkeys", "hvals", "hlen", "hincrby", "hincrbyfloat", "hmset", "hmget", "count", "find", "findone",
+  "hrandfield", "hscan", "hscannovalues",
 ]);
 const STREAM_COMMANDS = new Set(["watch"]);
 const ROUTED_COMMANDS = new Set([...DATA_COMMANDS, ...STREAM_COMMANDS]);
@@ -779,6 +827,9 @@ async function buildRuntime(cfg: ServeConfig): Promise<Runtime> {
       filter,
       field: input.url.searchParams.get("field") ?? undefined,
       n: input.url.searchParams.has("n") ? Number(input.url.searchParams.get("n")) : undefined,
+      cursor: input.url.searchParams.has("cursor") ? Number(input.url.searchParams.get("cursor")) : undefined,
+      count: input.url.searchParams.has("count") ? Number(input.url.searchParams.get("count")) : undefined,
+      match: input.url.searchParams.get("match") ?? undefined,
       opt,
     }, scope);
     return { kind: "json", status: 200, body: out ?? null };
