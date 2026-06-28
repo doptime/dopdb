@@ -113,3 +113,26 @@ go test ./httpserve -run IntegrationWatch -v             # M3(watch E2E)
 **小尾巴(非阻塞)**:
 - conformance 的 node 路径此前硬编码 `/opt/homebrew/bin/node`(macOS 专属,Linux/CI 会起不来);Opus 已改为 PATH 解析 + `DOPDB_TS_NODE` 覆盖。
 - I-P4「完整 conformance diff」当前覆盖了**关键**命令;可后续把 hkeys/hvals/hlen/hincrby/count/hmset/hmget 等也纳入双端比对以求完备(非阻塞,核心语义已验)。
+
+## 9 · 当前状态(2026-06-28 · 测试标准化 + HttpOn + 文档拆分后)
+
+本轮(Opus)又做了三件并产生**新的待验证 Go 代码**:
+
+| 事项 | Opus 沙箱可验? | 状态 |
+|---|---|---|
+| 测试标准化(删被取代的 `interop_test.go`、加 httpOn 覆盖、`docs/TESTING.md`) | TS 部分可验 | TS 绿;Go 套件结构已清理,待本机 `go test` 确认 |
+| **HttpOn 权限**(debug 全开默认 + agent 可收紧) | TS 可验 / Go 不可验 | **TS 已验**(tsc + 端到端门测试过);**Go 侧 `perms.go`+`HttpOn`+serve 门从未编译** |
+| 文档拆分(`README.md` 人 / `AGENTS.md` 机器) | 可验 | 完成 |
+
+**重要**:`STATUS §0/§1` 里"go build/vet/test 本机全绿、M5 9/9 PASS"是**上一轮本机跑的,在本轮 HttpOn 的 Go 改动之前**——**现已过时,必须重跑**。本轮新增/改动的 Go 文件(`perms.go`、`dopdb.go::HttpOn`、`httpserve/serve.go` 门)是 Opus 在无 Go 沙箱里**盲写**的,优先级最高的是先 `go build` 确认能编译。
+
+### 唯一剩余 = R8 本机验证回合(见 `rounds/R8/directive.md`)
+本地 GLM-5.2 跑完下列、真实 stdout 落 `rounds/R8/receipt-verify.md`,起草 `SEALED.md` 置 `pending-opus`,回传 Opus 终判联签:
+1. `go build ./... && go vet ./... && gofmt -l .`(M1;**确认本轮盲写 Go 能编译**)
+2. `go test ./httpserve -run Integration -v`(M2,需 Mongo 副本集)
+3. `go test ./httpserve -run Conformance -v`(M5;确认 HttpOn 改门后两端仍一致)
+4. `go test ./httpserve -run IntegrationWatch -v`(M3)
+5. 新增 `httpserve/httpon_test.go`:HttpOn(ReadOnly)→HSET 403 / HGET 非 403;HttpOn() →HSET 200;不配 Grant(证明 HttpOn 独立成门)
+6. `( cd ts && npm test )` 回归(应 74 过 / 1 skip)
+
+**到 R8 真实输出回传、Opus 对 M1/M2/M3/M5 + HttpOn-Go 落终判联签后,项目即可封包结束。** 在此之前不可宣布完成——M1/M2/M3/M5 从未经 Opus 凭真实输出终判。
