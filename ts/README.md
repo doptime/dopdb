@@ -49,9 +49,9 @@ const db = clientDb(schema, {
   getToken: () => localStorage.token,
 });
 
-await db.notes.hSet("@uuid", { text: "buy milk" }); // create — "@uuid" => the server generates the id
-const mine = await db.notes.hGetAll();               // only ever returns my own notes
-await db.notes.hDel(id);
+await db.notes.hset("@uuid", { text: "buy milk" }); // create — "@uuid" => the server generates the id
+const mine = await db.notes.hgetall();               // only ever returns my own notes
+await db.notes.hdel(id);
 ```
 
 `db.notes.*` is fully typed from the schema. There is no controller/service/DAO and no hand-written endpoint — the client safely operates on the database, and the framework enforces auth, isolation, and routing.
@@ -83,7 +83,7 @@ const srv = await serve({ schema, mongo: { uri, db: "appdb" }, jwtSecret, port: 
 
 // trusted, in-process reads/writes (no scope/JWT):
 const db = serverDb(schema, srv.mongo);
-await db.notes.hSet("u1", { text: "hi" });
+await db.notes.hset("u1", { text: "hi" });
 ```
 
 ## What you get

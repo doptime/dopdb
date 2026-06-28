@@ -4,7 +4,7 @@ Terse, full-coverage usage reference. For an AI coding agent or an experienced d
 
 **Core Philosophy**
 1. **One schema, two equivalent engines**: the same schema drives both Go and TypeScript as **complete equivalent implementations** (same URL wire protocol, same command vocabulary, same `@`-binding / isolation / permission model). Mix freely (Go server + TS client, or vice versa).
-2. **The frontend talks to data, no API layer**: the frontend writes no fetch code — it calls "database methods" (`db.coll.hGet(...)`), and the framework does auth / isolation / routing. Reach for functional APIs only for complex logic.
+2. **The frontend talks to data, no API layer**: the frontend writes no fetch code — it calls "database methods" (`db.coll.hget(...)`), and the framework does auth / isolation / routing. Reach for functional APIs only for complex logic.
 3. **String keys only**: keys are always strings. Integer keys are forbidden (JS large-integer precision loss). Convert all IDs to strings.
 4. **Direct to Mongo**: the root package uses `go.mongodb.org/mongo-driver/v2` directly — no Store abstraction. `$inc`, change streams, unique indexes, `2dsphere` all available.
 5. **Closed command vocabulary**: only the commands listed in §3 exist; anything else is a 400.
@@ -171,7 +171,7 @@ func main() {
 
 ## 5. Frontend / Server (TypeScript)
 
-**Package**: `dopdb`. Browser uses `dopdb/client`, Node server uses `dopdb/server`. The TS engine is an equivalent re-implementation: the **server** handles the full command vocabulary of §3 (conformance-verified against Go); the **typed client** today exposes the Hash family (`db.coll.hGet/hSet/hGetAll/hDel/...`). For String/List/Set/ZSet, drive the §3 wire commands (typed client wrappers for them are a follow-up).
+**Package**: `dopdb`. Browser uses `dopdb/client`, Node server uses `dopdb/server`. The TS engine is an equivalent re-implementation: the **server** handles the full command vocabulary of §3 (conformance-verified against Go); the **typed client** today exposes the Hash family (`db.coll.hget/hset/hgetall/hdel/...`). For String/List/Set/ZSet, drive the §3 wire commands (typed client wrappers for them are a follow-up).
 
 ### 5.1 Define the schema (shared by both engines)
 
@@ -201,21 +201,21 @@ import { schema } from "./schema";
 
 const db = clientDb(schema, {
   baseUrl: "https://api.example.com",
-  token: async () => await getJWT(),   // static string or async function
+  getToken: async () => await getJWT(),   // static string or async function
 });
 
-await db.notes.hSet("@uuid", { text: "buy milk" }); // create, server generates id
-const mine = await db.notes.hGetAll();               // Map<id, Note>, only mine
-await db.notes.hSet(id, { text: "edit" });           // update
-await db.notes.hDel(id);                             // delete
+await db.notes.hset("@uuid", { text: "buy milk" }); // create, server generates id
+const mine = await db.notes.hgetall();               // Record<id, Note>, only mine
+await db.notes.hset(id, { text: "edit" });           // update
+await db.notes.hdel(id);                             // delete
 ```
 
 | Op | Method | Key strategy |
 |---|---|---|
-| List | `hGetAll()` | all of my hash (owner-scope filtered) |
-| Create | `hSet("@uuid", v)` | `"@uuid"` triggers server-side id generation |
-| Update | `hSet(id, v)` | existing id |
-| Delete | `hDel(id)` | — |
+| List | `hgetall()` | all of my hash (owner-scope filtered) |
+| Create | `hset("@uuid", v)` | `"@uuid"` triggers server-side id generation |
+| Update | `hset(id, v)` | existing id |
+| Delete | `hdel(id)` | — |
 
 ### 5.3 Node server (the equivalent of Go)
 
@@ -283,7 +283,7 @@ Follow strictly:
 1. **Keys are always strings**; `"@uuid"` triggers server-side id generation; `?f=@uid` means "my row".
 2. **Backend (Hash)**: `dopdb.New[string, *T](dopdb.WithCollection("name"))`; **expose + authorize with `.HttpOn(...)`** (debug `.HttpOn()` first, then tighten) — do not write `RegisterHttp` + per-command `Grant`. Struct tags `json` (== `bson`) + `validate`. Multi-tenant: `dopdb.SetOwnerScope(coll, ownerField, claim)`.
 3. **Backend (String/List/Set/ZSet)**: `dopdb.NewString[K](...)` / `NewList[K,E](...)` / `NewSet[K](...)` / `NewZSet[K](...)`, then `.HttpOn(...)`; reach them via the §3 wire commands; owner-scope and TTL apply as in §4.3/§4.5/§7.
-4. **Frontend**: `collection(shape).named().ownerScope().httpOn(...)`; `clientDb(schema, {baseUrl, token})`; call `db.coll.hSet/hGetAll/hDel` directly — **no fetch, no API layer**.
+4. **Frontend**: `collection(shape).named().ownerScope().httpOn(...)`; `clientDb(schema, {baseUrl, getToken})`; call `db.coll.hset/hgetall/hdel` directly — **no fetch, no API layer**.
 5. **Permissions**: data commands are 403 by default; a collection must `.httpOn(...)` to be reachable; `.httpOn()` with no args = all on (debug only — always tell the user to tighten it).
 6. **`@`-keys**: never have the client send `@uid`/`@owner` etc. — the framework strips and injects them; bind ownership with `.bind("@uid")` (TS) or an owner-scope declaration.
 7. **Commands**: use only the §3 vocabulary; reads GET, writes POST, watch SSE. Blocking list ops are not available.

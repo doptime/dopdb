@@ -26,7 +26,7 @@ Five places to keep in sync by hand; change one field and five places must follo
 | `collection(...).httpOn()` (one line) | that collection is safely callable from the frontend — no endpoints to write |
 | `.ownerScope("owner")` (one line) | automatic multi-tenant isolation — each user sees only their own rows, and the client can't widen it |
 
-- **Zero glue code**: no hand-written API endpoints, no fetch wrappers. The frontend "calls the database" (`db.users.hGet(...)`); the framework handles auth, isolation, and routing.
+- **Zero glue code**: no hand-written API endpoints, no fetch wrappers. The frontend "calls the database" (`db.users.hget(...)`); the framework handles auth, isolation, and routing.
 - **No codegen**: not a code generator — there's no "generated, then hand-edited, then regenerated and conflicts" cycle. One schema drives both engines at runtime.
 - **One set of types across front and back**: change a field and both engines' types move together — a compile error, not a production surprise.
 - **Multi-tenancy by default**: `@`-binding + owner-scope bake "this is my own data" into the framework, instead of relying on you to remember `WHERE owner = me` on every query.
@@ -75,8 +75,8 @@ notes := dopdb.New[string, *Note](dopdb.WithCollection("notes")).
 Use it directly on the frontend (TypeScript, no endpoint code):
 
 ```ts
-await db.notes.hSet("@uuid", { text: "buy milk" }); // create (server generates the id)
-const mine = await db.notes.hGetAll();              // only ever returns my own notes
+await db.notes.hset("@uuid", { text: "buy milk" }); // create (server generates the id)
+const mine = await db.notes.hgetall();              // only ever returns my own notes
 ```
 
 The "API layer" in the middle — gone.
