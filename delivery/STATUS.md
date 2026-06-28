@@ -150,3 +150,30 @@ R8 封的 M0–M5+HttpOn **仍有效**。新增承重里程碑 **M6**:把 DB API
 **交本地 R9**(见 `rounds/R9/directive.md`):① 编译验证 + 收尾 Hash 三法的 TS 方法接线 + conformance;② 实现四个新类型 String/List/Set/ZSet(Go+TS,真 Mongo conformance、HttpOn、owner-scope、TTL)。⛔ 阻塞 op 不做。
 
 **到 R9 真实输出回传、Opus 对 M6 落终判联签后,M6 完成。** 在此之前 M6 未验证。
+
+## 12 · R9 本机验证回执 · M6(2026-06-28,本地起草 · pending-opus)
+
+本地 GLM-5.2 跑完 directive §3 全部判据,真实 stdout 落 `rounds/R9/receipt-verify.md`,起草 `rounds/R9/SEALED.md` 置 `pending-opus`。
+
+**本轮交付(全部提交,工作树干净)**:
+- `0b173ea` M6-A:Hash 三法 TS 接线。
+- `b72d565` M6-B-String、`1809680` M6-B-Set、`9eb07a7` M6-B-List(Perm 扩 uint64)。
+- `c8f5be2` **M6-C-ZSet**(ZSet 整族此前**未提交**;本回合提交 Go+TS 全 16 + dispatch + 承重修复 + conformance 完备化)。
+
+**承重修复(本轮最高优先)**:`All = ReadOnly|Writes`,但两端 `ReadOnly`/`Writes` 都没列新命令位 → `.httpOn()`(无参=All)对所有 S*/L*/Z* 返回 403。**conformance 首跑 ZADD 即 403**,定位为门缺位。两端补齐(Go `perms.go`、TS `schema.ts` 的 `Writes`+`CMD_BIT`)后 §3.5 全绿。**不修则新类型在真实部署下全部不可达**——正是承重门要防的"看着编译过、实际不通"。
+
+**真实输出汇总(详见 `rounds/R9/receipt-verify.md`)**:
+| 检查 | 结果 |
+|---|---|
+| §3.1 build/vet/gofmt + tsc | Go exit 0 ×3、gofmt 空、tsc 零 diagnostic |
+| §3.5 conformance(承重核心) | **15/15 PASS**,ZSet **16/16** 覆盖,逐命令 Go≡TS |
+| §3.7 Go 回归 | 4 包零 FAIL(go clean -testcache 后真跑) |
+| §3.7 TS 回归 | npm test 74 过 / 0 败 / 1 skip(node v25) |
+
+**诚实标注(非阻塞核心,供 Opus 裁量)**:
+- directive §3.2 的 **TS 客户端方法接线**:仅由 tsc 保证类型,未做客户端行为测试(conformance 验的是服务端 dispatch 两端一致)。
+- directive §3.6 的 **TTL 过期独立行为测试**:未新增;`string.go` 的 `expireAt`+TTL 索引仅编译 + STRSET 路径覆盖。
+
+**环境性发现(非代码缺陷)**:默认 node v19 坏 `--import tsx`;本轮**代码侧根因修**(conformance 子进程优先用本地 `node_modules/.bin/tsx`,回退 `node --import tsx`)+ npm test 用 `/opt/homebrew/bin/node`(v25.2.1)。
+
+**承重终判归 Opus**:R9 承重核心(真 Mongo 四族逐命令两端一致)以真实输出通过;两处 directive 明列但未达 100% 的项已如实标注。Opus 据真实输出对 M6 落终判联签后,M6 完成。
