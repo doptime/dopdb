@@ -176,7 +176,7 @@ func main() {
 ### 5.1 Define the schema (shared by both engines)
 
 ```ts
-import { collection, f, HGet, HGetAll, HSet, HDel, ReadOnly, All } from "dopdb";
+import { collection, f, HGet, HGetAll, HSet, HDel, ReadOnly, All } from "@kequnyang/dopdb";
 
 export const schema = {
   Notes: collection({
@@ -191,12 +191,12 @@ export const schema = {
 ```
 
 `f`: `f.string()` `f.number()` `f.boolean()` `f.object(...)` …; chain `.required()`, `.bind("@uid")`, `.default(x)`, etc.
-`.httpOn(...)`: same meaning as Go. The Perm constants (`HGet`…`Watch`, `HScan`/`HScanNoValues`/`HRandField`, `ReadOnly`/`Writes`/`All`/`HashAll`, plus the String/List/Set/ZSet command bits) are exported from `dopdb` as **BigInt** (the bitmask exceeds 32 bits across all types); bit values match Go.
+`.httpOn(...)`: same meaning as Go. The Perm constants (`HGet`…`Watch`, `HScan`/`HScanNoValues`/`HRandField`, `ReadOnly`/`Writes`/`All`/`HashAll`, plus the String/List/Set/ZSet command bits) are exported from `@kequnyang/dopdb` as **BigInt** (the bitmask exceeds 32 bits across all types); bit values match Go.
 
 ### 5.2 Browser client (no fetch code)
 
 ```ts
-import { clientDb } from "dopdb/client";
+import { clientDb } from "@kequnyang/dopdb/client";
 import { schema } from "./schema";
 
 const db = clientDb(schema, {
@@ -220,7 +220,7 @@ await db.notes.hdel(id);                             // delete
 ### 5.3 Node server (the equivalent of Go)
 
 ```ts
-import { serve } from "dopdb/server";
+import { serve } from "@kequnyang/dopdb/server";
 import { schema } from "./schema";
 
 const srv = await serve({
@@ -288,4 +288,4 @@ Follow strictly:
 6. **`@`-keys**: never have the client send `@uid`/`@owner` etc. — the framework strips and injects them; bind ownership with `.bind("@uid")` (TS) or an owner-scope declaration.
 7. **Commands**: use only the §3 vocabulary; reads GET, writes POST, watch SSE. Blocking list ops are not available.
 8. **Consistency**: any change to two-engine behavior must be verified with `conformance_test.go` (drive both engines, diff empty); never substitute a single-engine test.
-9. **Imports**: TS permission constants come from `dopdb` (`HGet`/`ReadOnly`/`All`/… as BigInt); browser `dopdb/client`, Node `dopdb/server`.
+9. **Imports**: TS permission constants come from `@kequnyang/dopdb` (`HGet`/`ReadOnly`/`All`/… as BigInt); browser `dopdb/client`, Node `dopdb/server`.

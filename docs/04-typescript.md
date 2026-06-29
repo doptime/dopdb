@@ -11,7 +11,7 @@ Entry points (`package.json` exports):
 
 ```ts
 // dopdb-schema.ts (imported by client / server / Next.js alike)
-import { collection, f, HGet, HGetAll, HSet, HDel } from "dopdb";
+import { collection, f, HGet, HGetAll, HSet, HDel } from "@kequnyang/dopdb";
 export const schema = {
   users: collection({
     name:  f.string(),
@@ -24,7 +24,7 @@ export const schema = {
 };
 ```
 
-`.named()` sets both the public and storage name; `.inDb("analytics")` binds a data source (the client then adds `?ds=analytics`); `.ownerScope("owner")` declares isolation; `.httpOn(...)` exposes + authorizes (same meaning as Go). The `Perm` constants are exported from `dopdb` as **BigInt** (the bitmask exceeds 32 bits across all types); bit values match Go.
+`.named()` sets both the public and storage name; `.inDb("analytics")` binds a data source (the client then adds `?ds=analytics`); `.ownerScope("owner")` declares isolation; `.httpOn(...)` exposes + authorizes (same meaning as Go). The `Perm` constants are exported from `@kequnyang/dopdb` as **BigInt** (the bitmask exceeds 32 bits across all types); bit values match Go.
 
 > The TS **server** handles the full command vocabulary of `02-http` (Hash + String/List/Set/ZSet), conformance-verified against Go. The typed **client** today exposes the Hash family; for String/List/Set/ZSet, drive the wire commands directly (typed client wrappers are a follow-up).
 
@@ -34,7 +34,7 @@ App Router: drop one catch-all route file to take over `/api/*` under that path:
 
 ```ts
 // app/api/[...slug]/route.ts
-import { createNextHandler } from "dopdb/server";
+import { createNextHandler } from "@kequnyang/dopdb/server";
 import { schema } from "@/dopdb-schema";  // collections declare .httpOn(...) themselves
 
 export const { GET, POST, OPTIONS } = createNextHandler({
@@ -59,7 +59,7 @@ Pages Router: use the standalone Node `listener` (next section): `export default
 ## Standalone Node server
 
 ```ts
-import { serve, serverDb } from "dopdb/server";
+import { serve, serverDb } from "@kequnyang/dopdb/server";
 const srv = await serve({ schema, mongo: { uri, db: "appdb" }, jwtSecret, port: 8080 });
 // multiple sources:
 //   await serve({ schema, jwtSecret, port: 8080,
@@ -79,7 +79,7 @@ HS256 (HMAC secret) and RS256 (PEM/SPKI public key, `createVerify("RSA-SHA256")`
 ## Browser client
 
 ```ts
-import { clientDb } from "dopdb/client";
+import { clientDb } from "@kequnyang/dopdb/client";
 const db = clientDb(schema, {
   baseUrl: "https://api.example.com",   // your Next.js / Node dopdb server
   getToken: () => localStorage.token,
@@ -97,7 +97,7 @@ The client assembles `/<apiBase>/<cmd>/<coll>`; a non-default source adds `?ds=`
 ## Functional API (`/api/<name>`)
 
 ```ts
-import { defineApi } from "dopdb/server";
+import { defineApi } from "@kequnyang/dopdb/server";
 const greet = defineApi(function greet(input: { name: string }, ctx) {
   return { msg: `hi ${input.name}`, caller: ctx.claims["uid"] ?? null };
 });

@@ -5,7 +5,7 @@
 This package is the **TypeScript engine**: a complete, standalone implementation (not a client SDK for a Go backend). It runs the server on Node and provides a typed browser client; it speaks the same URL wire protocol, command vocabulary, `@`-binding, isolation, and permission model as the Go engine, so the two are interchangeable.
 
 ```bash
-npm install dopdb
+npm install @kequnyang/dopdb
 # server only: also install the peer
 npm install mongodb
 ```
@@ -24,7 +24,7 @@ npm install mongodb
 
 ```ts
 // schema.ts — imported by client, server, and Next.js alike
-import { collection, f, HGet, HGetAll, HSet, HDel } from "dopdb";
+import { collection, f, HGet, HGetAll, HSet, HDel } from "@kequnyang/dopdb";
 
 export const schema = {
   notes: collection({
@@ -41,7 +41,7 @@ export const schema = {
 ## Browser client — no fetch code, no API layer
 
 ```ts
-import { clientDb } from "dopdb/client";
+import { clientDb } from "@kequnyang/dopdb/client";
 import { schema } from "./schema";
 
 const db = clientDb(schema, {
@@ -62,7 +62,7 @@ await db.notes.hdel(id);
 
 ```ts
 // app/api/[...slug]/route.ts
-import { createNextHandler } from "dopdb/server";
+import { createNextHandler } from "@kequnyang/dopdb/server";
 import { schema } from "@/schema";
 
 export const { GET, POST, OPTIONS } = createNextHandler({
@@ -78,7 +78,7 @@ This takes over `/api/hget/notes`, `/api/find/...`, `/api/<fn>`, watch (SSE), et
 ### Standalone Node
 
 ```ts
-import { serve, serverDb } from "dopdb/server";
+import { serve, serverDb } from "@kequnyang/dopdb/server";
 const srv = await serve({ schema, mongo: { uri, db: "appdb" }, jwtSecret, port: 8080 });
 
 // trusted, in-process reads/writes (no scope/JWT):

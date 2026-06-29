@@ -48,7 +48,7 @@ log.Fatal(httpserve.Serve(cfg))
 ## Wiring (TS)
 
 ```ts
-import { serveFromConfig } from "dopdb/server";
+import { serveFromConfig } from "@kequnyang/dopdb/server";
 import { schema } from "./schema";  // collections declare .httpOn(...) themselves
 await serveFromConfig("config.toml", { schema });
 // serveFromConfig loads every [[mongo]] as a data source
