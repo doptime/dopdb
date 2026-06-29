@@ -65,4 +65,25 @@ Server 入口(`import { serve } from "dopdb/server"`)是 **Node 侧**:需 `@type
 ## 自分类
 - 🟢 已实证:lockfile/typecheck/build/test/pack/app-冒烟(本机真跑,输出如上)。
 - ⚠️ 修复:文档客户端方法驼峰/`token`/`Map` 三类与实际 API 不符,已修(非框架代码,M0–M6 未触)。
-- ⏳ 待用户:真实 npm publish(凭证依赖)。
+- ✅ §2.3 真实 `npm publish` 完成(经 GitHub Action + environment secret NPM_TOKEN;包名 `@kequnyang/dopdb`,见下"§2.3 发布完成")。
+
+## §2.3 ✅ 发布完成(GitHub Action,真实 npm 输出)
+**三次触发,前两次失败、第三次成功**(诚实记录,根因都定位+修了):
+1. **Run 1 失败 `ENEEDAUTH`**:workflow 未声明 `environment:`,而 NPM_TOKEN 是 **environment secret**(用户建在名为 `NPM_TOKEN` 的 environment 下,非 repo 级)。`${{ secrets.NPM_TOKEN }}` 解析为空。**修**:job 加 `environment: NPM_TOKEN`。
+2. **Run 2 失败 `E403` Package name too similar**:`dopdb` 被 npm 的拼写错误防护判为与 depd/dpdm/gopd/lowdb 过于相似——npm 服务端策略,无法绕过。npm 自己建议用 scoped 名。用户选 `@kequnyang/dopdb`。**修**:package.json `name` 改 `@kequnyang/dopdb`,16 处 import/install 文档同步,workflow 的 `--access public`(scoped 默认私有,必需,已在)。
+3. **Run 3 成功**(`28341933605`,conclusion=success):
+   ```
+   npm notice publish Publishing to https://registry.npmjs.org/ with tag latest and public access
+   npm notice publish Signed provenance statement ... Provenance statement published to transparency log
+   + @kequnyang/dopdb@0.1.202606290834
+   ::notice::Published with dist-tag 'latest' + provenance
+   ```
+
+### 在线实证(registry 真实查询)
+```
+npm view @kequnyang/dopdb version dist-tags
+  → version = '0.1.202606290834'   dist-tags = { latest: '0.1.202606290834' }
+```
+全新 app `npm install @kequnyang/dopdb` → added 1 package,入口 dist/src/index.js + client.js 在位。
+
+**结论:✅ 发布完成**。`@kequnyang/dopdb@0.1.202606290834` 在 npm live(dist-tag latest,带 provenance),app 可 `npm install @kequnyang/dopdb` 安装使用。
