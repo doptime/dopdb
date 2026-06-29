@@ -46,6 +46,7 @@ concurrency:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    environment: NPM_TOKEN # the NPM_TOKEN secret lives in this environment (not at repo scope)
     defaults:
       run:
         working-directory: ts # the package lives in the ts/ subdirectory
