@@ -7,7 +7,7 @@
 #
 # PREREQUISITE (one-time, you do this in GitHub):
 #   repo secret NPM_TOKEN = an npm "Automation" access token with publish rights
-#   for the "dopdb" package:
+#   for the "@kequnyang/dopdb" package:
 #     npm  →  Access Tokens →  Granular access (or classic Automation token)  →
 #     copy the value  →  GitHub repo → Settings → Secrets and variables →
 #     Actions → New repository secret → Name: NPM_TOKEN → paste.

@@ -288,4 +288,4 @@ Follow strictly:
 6. **`@`-keys**: never have the client send `@uid`/`@owner` etc. — the framework strips and injects them; bind ownership with `.bind("@uid")` (TS) or an owner-scope declaration.
 7. **Commands**: use only the §3 vocabulary; reads GET, writes POST, watch SSE. Blocking list ops are not available.
 8. **Consistency**: any change to two-engine behavior must be verified with `conformance_test.go` (drive both engines, diff empty); never substitute a single-engine test.
-9. **Imports**: TS permission constants come from `@kequnyang/dopdb` (`HGet`/`ReadOnly`/`All`/… as BigInt); browser `dopdb/client`, Node `dopdb/server`.
+9. **Imports**: TS permission constants come from `@kequnyang/dopdb` (`HGet`/`ReadOnly`/`All`/… as BigInt); browser `@kequnyang/dopdb/client`, Node `@kequnyang/dopdb/server`.

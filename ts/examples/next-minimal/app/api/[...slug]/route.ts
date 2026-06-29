@@ -1,4 +1,4 @@
-import { createNextHandler, Permissions } from "dopdb/server";
+import { createNextHandler, Permissions } from "@kequnyang/dopdb/server";
 import { schema } from "@/dopdb-schema";
 
 const perms = new Permissions()

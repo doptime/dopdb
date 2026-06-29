@@ -1,9 +1,9 @@
 // dopdb — one framework, one source of truth.
 //
 // Entry points (see package.json "exports"):
-//   import { collection, f, type Infer } from "dopdb";          // shared schema
-//   import { clientDb, apiClient }       from "dopdb/client";    // browser (fetch)
-//   import { serve, serverDb, defineApi } from "dopdb/server";   // node + mongo
+//   import { collection, f, type Infer } from "@kequnyang/dopdb";          // shared schema
+//   import { clientDb, apiClient }       from "@kequnyang/dopdb/client";    // browser (fetch)
+//   import { serve, serverDb, defineApi } from "@kequnyang/dopdb/server";   // node + mongo
 //
 // The root + /client entries import nothing from node or mongodb, so the schema
 // and the client are safe to bundle into a browser app. Only /server pulls the

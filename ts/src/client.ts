@@ -3,14 +3,14 @@
 // the hood is fetch.
 //
 //   import { db as schema } from "./shared/schema";          // the single source
-//   import { clientDb } from "dopdb/client";
+//   import { clientDb } from "@kequnyang/dopdb/client";
 //   const db = clientDb(schema, { baseUrl: "https://api.example.com",
 //                                 getToken: () => localStorage.token });
 //   const u = await db.User.hget("u1");        // u: User | null   (typed)
 //   await db.Order.hset(oid, { total: 12 });   // owner is @-bound server-side
 //
 //   import type { api } from "../server/api";  // type-only: handlers never ship
-//   import { apiClient } from "dopdb/client";
+//   import { apiClient } from "@kequnyang/dopdb/client";
 //   const call = apiClient<typeof api>({ baseUrl });
 //   const out = await call("greet", { name: "Ada" });   // typed in & out
 

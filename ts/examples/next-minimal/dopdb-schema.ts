@@ -1,4 +1,4 @@
-import { collection, f } from "dopdb";
+import { collection, f } from "@kequnyang/dopdb";
 
 export const schema = {
   users: collection({

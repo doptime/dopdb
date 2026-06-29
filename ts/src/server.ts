@@ -24,7 +24,7 @@ import { sanitizeFilter, type Filter } from "./sanitize.js";
 import { loadConfig, portFromAddr } from "./config.js";
 
 // Re-export the config loader from the node entry: `import { serveFromConfig,
-// loadConfig, type Config } from "dopdb/server"`.
+// loadConfig, type Config } from "@kequnyang/dopdb/server".
 export {
   loadConfig,
   defaultSource,
@@ -1291,7 +1291,7 @@ export type NextRouteHandler = (
  * take over that path with no extra config:
  *
  *   // app/api/[...slug]/route.ts
- *   import { createNextHandler, Permissions } from "dopdb/server";
+ *   import { createNextHandler, Permissions } from "@kequnyang/dopdb/server";
  *   import { schema } from "@/dopdb-schema";
  *   const perms = new Permissions().grant("HGET", "users").grant("HSET", "users");
  *   export const { GET, POST, OPTIONS } =
