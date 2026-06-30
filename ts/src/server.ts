@@ -10,7 +10,7 @@
 
 import { createHmac, timingSafeEqual, createVerify, createPublicKey } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from "node:http";
-import { MongoClient, type Db as MongoDb, type Collection as MongoCollection, type ChangeStream, type ChangeStreamOptions } from "mongodb";
+import type { MongoClient, Db as MongoDb, Collection as MongoCollection, ChangeStream, ChangeStreamOptions } from "mongodb";
 
 import {
   type Collection,
@@ -46,6 +46,37 @@ import {
 import type { Db, DbApi, FindOpt, WatchEvent, WatchHandler, Unsubscribe } from "./client.js";
 import { Permissions } from "./permission.js";
 export { Permissions } from "./permission.js";
+
+// ----------------------------------------------------------------------------
+// Bun compatibility for mongodb's bson dependency.
+//
+// bson@7 (shipped with mongodb@7) calls `v8.startupSnapshot.isBuildingSnapshot()`
+// inside a class static initializer that runs when the mongodb module is linked.
+// Bun has not implemented that Node API and throws NotImplementedError, crashing
+// the import before any of our code runs. We replace the throwing stub with a
+// no-op *before* mongodb is imported. Under Node the native call already returns
+// false, so the patch is inert. Run unconditionally; no behavior change on Node.
+//
+// mongodb is loaded lazily (dynamic import) so this shim always evaluates first.
+// ----------------------------------------------------------------------------
+interface V8StartupSnapshot { isBuildingSnapshot?: () => boolean }
+// getBuiltinModule returns `object | undefined`; the v8 module's real shape is not
+// expressible in @types/node, so cast once to a named binding.
+const v8Module = process.getBuiltinModule?.("v8") as { startupSnapshot?: V8StartupSnapshot } | undefined;
+const startupSnapshot = v8Module?.startupSnapshot;
+if (startupSnapshot && typeof startupSnapshot.isBuildingSnapshot === "function") {
+  try {
+    startupSnapshot.isBuildingSnapshot(); // Node: returns false, never throws.
+  } catch {
+    startupSnapshot.isBuildingSnapshot = () => false; // Bun: replace the throwing stub.
+  }
+}
+
+let _mongodb: typeof import("mongodb") | null = null;
+async function mongodb(): Promise<typeof import("mongodb")> {
+  if (!_mongodb) _mongodb = await import("mongodb");
+  return _mongodb;
+}
 
 type Doc = Record<string, unknown>;
 type Claims = Record<string, unknown>;
@@ -937,6 +968,7 @@ async function buildRuntime(cfg: ServeConfig): Promise<Runtime> {
   const ownClients: MongoClient[] = [];
   const open = async (conn: MongoConn): Promise<MongoDb> => {
     if ("uri" in conn) {
+      const { MongoClient } = await mongodb();
       const client = new MongoClient(conn.uri);
       await client.connect();
       ownClients.push(client);

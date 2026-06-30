@@ -1,6 +1,6 @@
 {
   "name": "@kequnyang/dopdb",
-  "version": "0.1.202606290834",
+  "version": "0.1.202606301552",
   "description": "One schema, two equivalent engines (Go + TypeScript), one wire protocol. Declare a collection once and get native types, runtime validation, a typed browser client (fetch), and a Node + MongoDB server — no codegen, no double-write. Redis-compatible data structures (Hash/String/List/Set/ZSet) on MongoDB.",
   "type": "module",
   "license": "MIT",
@@ -70,7 +70,7 @@
     "access": "public"
   },
   "peerDependencies": {
-    "mongodb": "^6.0.0"
+    "mongodb": "^6.0.0 || ^7.0.0"
   },
   "peerDependenciesMeta": {
     "mongodb": {
@@ -79,7 +79,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
-    "mongodb": "^6.5.0",
+    "mongodb": "^7.0.0",
     "tsx": "^4.7.0",
     "typescript": "^5.4.0"
   },
