@@ -2,41 +2,39 @@ package dopdb
 
 import (
 	"context"
-
-	"go.mongodb.org/mongo-driver/v2/bson"
-	"go.mongodb.org/mongo-driver/v2/mongo"
-	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"sort"
 )
 
 // ----------------------------------------------------------------------------
-// SetCollection — Redis Set key type over Mongo.
-// doc form: {_id, members:[M], owner?}. Members are a deduped array ($addToSet).
+// SetCollection — the Redis Set key type, natively.
+//
+// Mongo held {_id, members:[M], owner?} and leaned on $addToSet/$pull to fake
+// set semantics. KVRocks stores a real Redis set at <ns>:<coll>:<key>, so SADD/
+// SREM/SMEMBERS/SISMEMBER/SCARD are the actual commands and deduplication is the
+// server's job. Members are CBOR-encoded in canonical form, which is what makes
+// deduplication correct: two equal values always produce identical bytes.
+//
+// SMEMBERS order is unspecified in Redis, so dopdb sorts the encoded members
+// before decoding. A set has no order to preserve; a stable answer is worth more
+// than the accident of the server's iteration.
 // ----------------------------------------------------------------------------
 
-type setDoc struct {
-	Members []any  `json:"members" bson:"members"`
-	Owner   string `json:"owner,omitempty" bson:"owner,omitempty"`
-}
-
+// SetCollection is the typed handle to a Redis-Set collection.
 type SetCollection[K comparable] struct {
-	c *Collection[K, *setDoc]
+	k keyspace
 }
 
+// NewSet constructs a Set collection. WithCollection names it.
 func NewSet[K comparable](opts ...Option) *SetCollection[K] {
-	return &SetCollection[K]{c: New[K, *setDoc](opts...)}
+	return &SetCollection[K]{k: newKeyspace("NewSet", opts...)}
 }
 
-func (s *SetCollection[K]) Collection() string { return s.c.coll }
+// Collection returns the collection name.
+func (s *SetCollection[K]) Collection() string { return s.k.coll }
 
+// HttpOn exposes this Set collection over HTTP and declares its command set.
 func (s *SetCollection[K]) HttpOn(perms ...Perm) *SetCollection[K] {
-	p := All
-	if len(perms) > 0 {
-		p = 0
-		for _, x := range perms {
-			p |= x
-		}
-	}
-	setHTTPPerm(s.c.coll, p)
+	setHTTPPerm(s.k.coll, permsFrom(perms))
 	RegisterHttp(s)
 	return s
 }
@@ -50,23 +48,20 @@ type SetAccessor interface {
 	HttpSCard(ctx context.Context, ds, key string, scope M) (int64, error)
 }
 
-func setFilter(key string, scope M) bson.M {
-	f := bson.M{"_id": key}
-	for k, v := range scope {
-		f[k] = v
-	}
-	return f
-}
-
-// HttpSAdd adds members (Redis SADD). Upsert creates the doc on first add.
+// HttpSAdd adds members (Redis SADD). The key is created on first add.
 func (s *SetCollection[K]) HttpSAdd(ctx context.Context, ds, key string, members []any, scope M) error {
 	if len(members) == 0 {
 		return nil
 	}
-	_, err := s.c.backend(ds).c(s.c.coll).UpdateOne(ctx, setFilter(key, scope),
-		bson.M{"$addToSet": bson.M{"members": bson.M{"$each": members}}},
-		options.UpdateOne().SetUpsert(true))
-	return err
+	b := s.k.backend(ds)
+	if err := b.claimOwner(ctx, s.k.coll, key, scope); err != nil {
+		return err
+	}
+	args, err := encodeItems(members)
+	if err != nil {
+		return err
+	}
+	return b.rdb.SAdd(ctx, b.memberKey(s.k.coll, key), args...).Err()
 }
 
 // HttpSRem removes members (Redis SREM).
@@ -74,44 +69,56 @@ func (s *SetCollection[K]) HttpSRem(ctx context.Context, ds, key string, members
 	if len(members) == 0 {
 		return nil
 	}
-	_, err := s.c.backend(ds).c(s.c.coll).UpdateOne(ctx, setFilter(key, scope),
-		bson.M{"$pull": bson.M{"members": bson.M{"$in": members}}})
-	return err
+	b := s.k.backend(ds)
+	if err := b.claimOwner(ctx, s.k.coll, key, scope); err != nil {
+		return err
+	}
+	args, err := encodeItems(members)
+	if err != nil {
+		return err
+	}
+	return b.rdb.SRem(ctx, b.memberKey(s.k.coll, key), args...).Err()
 }
 
-// HttpSMembers returns the member array (empty if the key is absent).
+// HttpSMembers returns the members (empty if the key is absent).
 func (s *SetCollection[K]) HttpSMembers(ctx context.Context, ds, key string, scope M) (any, error) {
-	var doc setDoc
-	err := s.c.backend(ds).c(s.c.coll).FindOne(ctx, setFilter(key, scope)).Decode(&doc)
-	if err == mongo.ErrNoDocuments {
+	b := s.k.backend(ds)
+	if err := b.checkOwner(ctx, s.k.coll, key, scope); err != nil {
 		return []any{}, nil
 	}
+	raws, err := b.rdb.SMembers(ctx, b.memberKey(s.k.coll, key)).Result()
 	if err != nil {
 		return nil, err
 	}
-	if doc.Members == nil {
-		return []any{}, nil
+	sort.Strings(raws) // Redis set iteration order is unspecified
+	out, err := decodeItems(raws)
+	if err != nil {
+		return nil, err
 	}
-	return doc.Members, nil
+	if out == nil {
+		out = []any{}
+	}
+	return out, nil
 }
 
 // HttpSIsMember reports membership (Redis SISMEMBER).
 func (s *SetCollection[K]) HttpSIsMember(ctx context.Context, ds, key string, member any, scope M) (bool, error) {
-	f := setFilter(key, scope)
-	f["members"] = member
-	n, err := s.c.backend(ds).c(s.c.coll).CountDocuments(ctx, f, options.Count().SetLimit(1))
-	return n > 0, err
+	b := s.k.backend(ds)
+	if err := b.checkOwner(ctx, s.k.coll, key, scope); err != nil {
+		return false, nil
+	}
+	raw, err := encodeCBOR(member)
+	if err != nil {
+		return false, err
+	}
+	return b.rdb.SIsMember(ctx, b.memberKey(s.k.coll, key), raw).Result()
 }
 
 // HttpSCard returns the member count (Redis SCARD).
 func (s *SetCollection[K]) HttpSCard(ctx context.Context, ds, key string, scope M) (int64, error) {
-	var doc setDoc
-	err := s.c.backend(ds).c(s.c.coll).FindOne(ctx, setFilter(key, scope)).Decode(&doc)
-	if err == mongo.ErrNoDocuments {
+	b := s.k.backend(ds)
+	if err := b.checkOwner(ctx, s.k.coll, key, scope); err != nil {
 		return 0, nil
 	}
-	if err != nil {
-		return 0, err
-	}
-	return int64(len(doc.Members)), nil
+	return b.rdb.SCard(ctx, b.memberKey(s.k.coll, key)).Result()
 }

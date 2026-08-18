@@ -8,19 +8,22 @@ import (
 // ----------------------------------------------------------------------------
 // Filter sanitization.
 //
-// This is the heart of the migration's hardest problem. In Redis/doptime the
-// frontend could only invoke a CLOSED set of verbs, so a per-key on/off
-// whitelist was a sufficient safety model. Mongo's query surface is an open,
-// arbitrary document — exposing it raw is NoSQL injection by construction
-// ({$where:"while(true){}"}, server-side JS, cross-collection reads, etc.).
+// In Redis/doptime the frontend could only invoke a CLOSED set of verbs, so a
+// per-key on/off whitelist was a sufficient safety model. FIND reopened that
+// surface: a filter is an arbitrary document supplied by the caller.
 //
-// dopdb keeps the "closed surface" guarantee by never accepting a raw Mongo
-// filter from an untrusted caller: SanitizeFilter walks the filter and admits
-// only a vetted operator allowlist, rejecting everything that can execute code,
-// reach other collections, or write. Field-level scoping (which fields a given
-// collection exposes, and the mandatory owner==@uid predicate) is layered on top
-// by the HTTP/permission layer; this function enforces the operator-level floor
-// that every query — Go-native or HTTP — passes through.
+// On KVRocks the filter is no longer handed to a database — query.go evaluates
+// it in this process (see the dialect note below). That removes the server-side
+// injection class outright, but NOT the need for this function: an unbounded
+// filter is still a denial-of-service surface (pathological nesting, operators
+// with no bounded cost) and the allowlist is what keeps the accepted dialect
+// identical to the one the TypeScript engine implements. Anything outside the
+// list is rejected here rather than silently ignored downstream.
+//
+// The operator names are unchanged from the Mongo build on purpose: the HTTP
+// wire protocol, the typed clients and the docs all speak this dialect, and the
+// storage swap was not a reason to break them. The evaluator in query.go accepts
+// exactly this set.
 // ----------------------------------------------------------------------------
 
 // allowedQueryOps are filter operators considered safe to accept from callers.
@@ -38,10 +41,11 @@ var allowedQueryOps = map[string]bool{
 	"$regex": true, "$options": true, "$mod": true,
 }
 
-// forbiddenOps are operators that execute code, perform writes, traverse
-// collections, or otherwise escape the read sandbox. Rejected with a clear error
-// even though they would also be caught by the allowlist — naming them makes
-// audits and error messages legible.
+// forbiddenOps are operators that executed code, performed writes, or traversed
+// collections in the Mongo dialect. query.go implements none of them, so they
+// could simply fall through the allowlist — they are named explicitly anyway,
+// because a filter that contains one is a caller expecting behaviour dopdb will
+// not provide, and a clear error beats a silent empty result set.
 var forbiddenOps = map[string]bool{
 	"$where": true, "$function": true, "$accumulator": true,
 	"$expr":   true, // $expr can embed $function/$let; disallow wholesale

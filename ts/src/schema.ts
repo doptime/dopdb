@@ -8,7 +8,7 @@
 //   - index specs          .unique() / .index()
 //   - a server spec        toSpec()                                  (schema-as-data)
 //
-// The same object is imported by the browser (→ fetch) and the server (→ Mongo);
+// The same object is imported by the browser (→ fetch) and the server (→ KVRocks);
 // it is never redefined and never generated.
 
 import { ValidationError, type FieldIssue } from "./errors.js";
@@ -201,9 +201,12 @@ export const ZRangeByScore = 1n << 51n; export const ZRevRangeByScore = 1n << 52
 export const ZRank = 1n << 53n; export const ZRevRank = 1n << 54n;
 export const ZPopMin = 1n << 55n; export const ZPopMax = 1n << 56n;
 export const ZRemRangeByRank = 1n << 57n; export const ZRemRangeByScore = 1n << 58n;
+/** SQL is appended, never inserted: bit values are persisted by the Go
+ * Permissions.SaveJSON, so renumbering would silently re-grant commands. */
+export const SQL = 1n << 59n;
 /** Every non-mutating command. */
 export const ReadOnly =
-  HGet | HExists | HGetAll | HKeys | HVals | HLen | HMGet | Count | Find | FindOne | Watch | HScan | HScanNoValues | HRandField | StrGet | StrGetAll | SMembers | SIsMember | SCard | LRange | LLen | LIndex | ZScore | ZCard | ZCount | ZRange | ZRevRange | ZRangeByScore | ZRevRangeByScore | ZRank | ZRevRank;
+  HGet | HExists | HGetAll | HKeys | HVals | HLen | HMGet | Count | Find | FindOne | Watch | SQL | HScan | HScanNoValues | HRandField | StrGet | StrGetAll | SMembers | SIsMember | SCard | LRange | LLen | LIndex | ZScore | ZCard | ZCount | ZRange | ZRevRange | ZRangeByScore | ZRevRangeByScore | ZRank | ZRevRank;
 /** Every mutating command. */
 export const Writes = StrSet | StrSetAll | StrDel | LPush | RPush | LPop | RPop | LSet | LRem | LTrim | LInsertBefore | LInsertAfter | SAdd | SRem | HSet | HSetNX | HDel | Del | HIncrBy | HIncrByFloat | HMSet | ZAdd | ZRem | ZIncrBy | ZPopMin | ZPopMax | ZRemRangeByRank | ZRemRangeByScore;
 /** Everything — the httpOn() debug default. */
@@ -215,7 +218,7 @@ export const CMD_BIT: Record<string, bigint> = {
   HGET: HGet, HSET: HSet, HSETNX: HSetNX, HDEL: HDel, DEL: Del, HEXISTS: HExists,
   HGETALL: HGetAll, HKEYS: HKeys, HVALS: HVals, HLEN: HLen, HINCRBY: HIncrBy,
   HINCRBYFLOAT: HIncrByFloat, HMSET: HMSet, HMGET: HMGet, COUNT: Count, FIND: Find,
-  FINDONE: FindOne, WATCH: Watch,
+  FINDONE: FindOne, WATCH: Watch, SQL: SQL,
   HSCAN: HScan, HSCANNOVALUES: HScanNoValues, HRANDFIELD: HRandField,
   STRGET: StrGet, STRSET: StrSet, STRSETALL: StrSetAll, STRGETALL: StrGetAll, STRDEL: StrDel,
   SADD: SAdd, SREM: SRem, SMEMBERS: SMembers, SISMEMBER: SIsMember, SCARD: SCard,

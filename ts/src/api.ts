@@ -5,7 +5,7 @@
 // callApi / removeApi — a server API that needs another API just calls its
 // handle like any function (point 4). The route is /api/<name>.
 //
-// This module imports nothing from node or mongodb, so the client can do
+// This module imports nothing from node or ioredis, so the client can do
 //   import type { api } from "../server/api-defs";
 // and pull only the input/output TYPES across — the handler code never ships.
 

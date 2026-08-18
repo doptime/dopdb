@@ -5,39 +5,60 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"testing"
 	"time"
 
 	"github.com/doptime/dopdb"
-
-	"go.mongodb.org/mongo-driver/v2/mongo"
-	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"github.com/redis/go-redis/v9"
 )
 
-// HTTP-layer integration tests against a real MongoDB. They self-skip unless
-// DOPDB_TEST_MONGO_URI is set; each uses a throwaway database dropped on cleanup.
-// They reuse the Mongo-free helpers (do/tokenFor/decodeObj/testSecret).
+// HTTP-layer integration tests against a real KVRocks (or any Redis-protocol
+// server). They self-skip unless DOPDB_TEST_KVROCKS_URI is set; each uses a
+// throwaway key namespace dropped on cleanup. They reuse the database-free
+// helpers (do/tokenFor/decodeObj/testSecret).
 
 type itDoc struct {
-	Owner string `json:"owner" bson:"owner"`
-	Note  string `json:"note" bson:"note"`
+	Owner string `json:"owner"`
+	Note  string `json:"note"`
 }
 
-func mongoOrSkip(t *testing.T) *mongo.Client {
+func kvOrSkip(t *testing.T) *redis.Client {
 	t.Helper()
-	uri := os.Getenv("DOPDB_TEST_MONGO_URI")
+	uri := os.Getenv("DOPDB_TEST_KVROCKS_URI")
 	if uri == "" {
-		t.Skip("set DOPDB_TEST_MONGO_URI to run integration tests")
+		t.Skip("set DOPDB_TEST_KVROCKS_URI (e.g. redis://localhost:6666) to run integration tests")
 	}
-	cl, err := mongo.Connect(options.Client().ApplyURI(uri))
+	opt, err := redis.ParseURL(uri)
 	if err != nil {
-		t.Fatalf("connect: %v", err)
+		t.Fatalf("parse uri: %v", err)
 	}
-	if err := cl.Ping(context.Background(), nil); err != nil {
+	opt.PoolSize = 64
+	cl := redis.NewClient(opt)
+	if err := cl.Ping(context.Background()).Err(); err != nil {
 		t.Fatalf("ping: %v", err)
 	}
 	return cl
+}
+
+// dropNS removes every key dopdb wrote under ns.
+func dropNS(cl *redis.Client, ns string) {
+	ctx := context.Background()
+	var cursor uint64
+	for {
+		keys, next, err := cl.Scan(ctx, cursor, ns+":*", 500).Result()
+		if err != nil {
+			return
+		}
+		if len(keys) > 0 {
+			_ = cl.Del(ctx, keys...).Err()
+		}
+		cursor = next
+		if cursor == 0 {
+			return
+		}
+	}
 }
 
 func decodeArr(t *testing.T, rr *httptest.ResponseRecorder) []map[string]any {
@@ -49,15 +70,15 @@ func decodeArr(t *testing.T, rr *httptest.ResponseRecorder) []map[string]any {
 	return a
 }
 
-// setupMongoHandler wires a single "default" datasource to a throwaway db, runs
-// register (which should dopdb.RegisterHttp the test collections), grants the
-// given (cmd, coll) pairs, and returns a Handler + cleanup.
-func setupMongoHandler(t *testing.T, grants [][2]string, register func()) (*Handler, func()) {
+// setupKVHandler wires a single "default" datasource to a throwaway namespace,
+// runs register (which should dopdb.RegisterHttp the test collections), grants
+// the given (cmd, coll) pairs, and returns a Handler + cleanup.
+func setupKVHandler(t *testing.T, grants [][2]string, register func()) (*Handler, func()) {
 	t.Helper()
-	cl := mongoOrSkip(t)
-	dbName := fmt.Sprintf("dopdb_it_%d", time.Now().UnixNano())
+	cl := kvOrSkip(t)
+	ns := fmt.Sprintf("dopdb_it_%d", time.Now().UnixNano())
 	ds := dopdb.NewDatasources()
-	ds.Add("default", cl.Database(dbName))
+	ds.Add("default", cl, ns)
 	dopdb.SetDatasources(ds)
 	register()
 	p := NewPermissions()
@@ -66,15 +87,15 @@ func setupMongoHandler(t *testing.T, grants [][2]string, register func()) (*Hand
 	}
 	h := NewHandler(NewServer(testSecret), p)
 	return h, func() {
-		_ = cl.Database(dbName).Drop(context.Background())
-		_ = cl.Disconnect(context.Background())
+		dropNS(cl, ns)
+		_ = cl.Close()
 		dopdb.SetDatasources(nil)
 	}
 }
 
 func TestIntegrationHTTPRoundTrip(t *testing.T) {
 	coll := "it_notes"
-	h, done := setupMongoHandler(t,
+	h, done := setupKVHandler(t,
 		[][2]string{{"HSET", coll}, {"HGET", coll}, {"FIND", coll}, {"HDEL", coll}},
 		func() { dopdb.RegisterHttp(dopdb.New[string, *itDoc](dopdb.WithCollection(coll))) },
 	)
@@ -91,7 +112,7 @@ func TestIntegrationHTTPRoundTrip(t *testing.T) {
 		t.Errorf("note=%v want hello", obj["note"])
 	}
 
-	// FIND returns an array.
+	// FIND returns an array — evaluated in-process now, same wire shape.
 	rr = do(h, "POST", "/api/find/"+coll, `{"note":"hello"}`, tokenFor(t, "u1"))
 	if rr.Code != 200 {
 		t.Fatalf("find status=%d", rr.Code)
@@ -108,7 +129,7 @@ func TestIntegrationHTTPRoundTrip(t *testing.T) {
 
 func TestIntegrationOwnerScope(t *testing.T) {
 	coll := "it_owned"
-	h, done := setupMongoHandler(t,
+	h, done := setupKVHandler(t,
 		[][2]string{{"HSET", coll}, {"HGET", coll}},
 		func() {
 			dopdb.RegisterHttp(dopdb.New[string, *itDoc](dopdb.WithCollection(coll)))
@@ -129,20 +150,24 @@ func TestIntegrationOwnerScope(t *testing.T) {
 	if rr := do(h, "GET", "/api/hget/"+coll+"?f=alice", "", tokenFor(t, "bob")); rr.Code != 404 {
 		t.Errorf("bob reading alice's record expected 404, got %d", rr.Code)
 	}
+	// nor overwrite it: the scoped write is a compare-and-set on the owner.
+	if rr := do(h, "POST", "/api/hset/"+coll+"?f=alice", `{"note":"stolen"}`, tokenFor(t, "bob")); rr.Code != 403 {
+		t.Errorf("bob overwriting alice's record expected 403, got %d", rr.Code)
+	}
 }
 
 func TestIntegrationMultiDatasource(t *testing.T) {
-	cl := mongoOrSkip(t)
-	dbA := fmt.Sprintf("dopdb_it_a_%d", time.Now().UnixNano())
-	dbB := fmt.Sprintf("dopdb_it_b_%d", time.Now().UnixNano())
+	cl := kvOrSkip(t)
+	nsA := fmt.Sprintf("dopdb_it_a_%d", time.Now().UnixNano())
+	nsB := fmt.Sprintf("dopdb_it_b_%d", time.Now().UnixNano())
 	ds := dopdb.NewDatasources()
-	ds.Add("default", cl.Database(dbA))
-	ds.Add("other", cl.Database(dbB))
+	ds.Add("default", cl, nsA)
+	ds.Add("other", cl, nsB)
 	dopdb.SetDatasources(ds)
 	defer func() {
-		_ = cl.Database(dbA).Drop(context.Background())
-		_ = cl.Database(dbB).Drop(context.Background())
-		_ = cl.Disconnect(context.Background())
+		dropNS(cl, nsA)
+		dropNS(cl, nsB)
+		_ = cl.Close()
 		dopdb.SetDatasources(nil)
 	}()
 
@@ -169,5 +194,262 @@ func TestIntegrationMultiDatasource(t *testing.T) {
 	rr = do(h, "GET", "/api/hget/"+coll+"?ds=other&f=k1", "", tok)
 	if obj := decodeObj(t, rr); obj["note"] != "in-other" {
 		t.Errorf("other note=%v want in-other", obj["note"])
+	}
+}
+
+// FIND's shaping (sort, skip, limit, projection) moved from the database into
+// the query engine, so the HTTP surface of it needs a test of its own.
+func TestIntegrationFindShaping(t *testing.T) {
+	type rec struct {
+		Name string `json:"name"`
+		Age  int    `json:"age"`
+	}
+	coll := "it_shape"
+	h, done := setupKVHandler(t,
+		[][2]string{{"HSET", coll}, {"FIND", coll}, {"COUNT", coll}},
+		func() { dopdb.RegisterHttp(dopdb.New[string, *rec](dopdb.WithCollection(coll))) },
+	)
+	defer done()
+	tok := tokenFor(t, "u1")
+
+	for i, r := range []rec{{"carol", 30}, {"alice", 40}, {"bob", 30}} {
+		body := fmt.Sprintf(`{"name":%q,"age":%d}`, r.Name, r.Age)
+		if rr := do(h, "POST", fmt.Sprintf("/api/hset/%s?f=k%d", coll, i), body, tok); rr.Code != 200 {
+			t.Fatalf("hset %d = %d", i, rr.Code)
+		}
+	}
+
+	// sort by age asc then name asc, limit 2
+	rr := do(h, "POST", "/api/find/"+coll+`?s={"age":1}&limit=2`, `{}`, tok)
+	if rr.Code != 200 {
+		t.Fatalf("find status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	arr := decodeArr(t, rr)
+	if len(arr) != 2 {
+		t.Fatalf("limit ignored: %d docs", len(arr))
+	}
+	if arr[0]["age"].(float64) != 30 || arr[1]["age"].(float64) != 30 {
+		t.Errorf("sort by age asc failed: %v", arr)
+	}
+
+	// projection: only name
+	rr = do(h, "POST", "/api/find/"+coll+`?p={"name":1}`, `{"age":40}`, tok)
+	arr = decodeArr(t, rr)
+	if len(arr) != 1 {
+		t.Fatalf("projection query returned %d docs", len(arr))
+	}
+	if arr[0]["name"] != "alice" {
+		t.Errorf("projected name=%v", arr[0]["name"])
+	}
+	if age, ok := arr[0]["age"]; ok && age.(float64) != 0 {
+		t.Errorf("projection leaked age: %v", arr[0])
+	}
+
+	// $-operator smuggling in ?s= is still rejected before it reaches the engine
+	if rr := do(h, "POST", "/api/find/"+coll+`?s={"$where":1}`, `{}`, tok); rr.Code != 400 {
+		t.Errorf("sort with $ key expected 400, got %d", rr.Code)
+	}
+
+	// COUNT goes through the same evaluator
+	rr = do(h, "POST", "/api/count/"+coll, `{"age":30}`, tok)
+	if obj := decodeObj(t, rr); obj["count"].(float64) != 2 {
+		t.Errorf("count=%v want 2", obj["count"])
+	}
+}
+
+// A unique-index violation is a 409 now: KVRocks has no server-side unique
+// index, so dopdb raises it and the HTTP layer maps it.
+func TestIntegrationUniqueConflictIs409(t *testing.T) {
+	type uniqRec struct {
+		Email string `json:"email" index:"unique"`
+	}
+	coll := "it_uniq_http"
+	h, done := setupKVHandler(t,
+		[][2]string{{"HSET", coll}},
+		func() { dopdb.RegisterHttp(dopdb.New[string, *uniqRec](dopdb.WithCollection(coll))) },
+	)
+	defer done()
+	tok := tokenFor(t, "u1")
+
+	if rr := do(h, "POST", "/api/hset/"+coll+"?f=a", `{"email":"x@x.io"}`, tok); rr.Code != 200 {
+		t.Fatalf("first hset=%d body=%s", rr.Code, rr.Body.String())
+	}
+	rr := do(h, "POST", "/api/hset/"+coll+"?f=b", `{"email":"x@x.io"}`, tok)
+	if rr.Code != 409 {
+		t.Errorf("duplicate hset=%d want 409 (body=%s)", rr.Code, rr.Body.String())
+	}
+	if obj := decodeObj(t, rr); obj["code"] != "conflict" {
+		t.Errorf("error code=%v want conflict", obj["code"])
+	}
+}
+
+// ---- SQL ---------------------------------------------------------------------
+//
+// SQL is a front end over the same query engine FIND uses, exposed only on Hash
+// collections. These tests cover the three things the HTTP path adds on top of
+// the parser: the FROM check, the owner scope, and the limit clamp.
+
+func TestIntegrationSQL(t *testing.T) {
+	type rec struct {
+		Name string `json:"name"`
+		Age  int    `json:"age"`
+	}
+	coll := "it_sql"
+	h, done := setupKVHandler(t,
+		[][2]string{{"HSET", coll}, {"SQL", coll}},
+		func() { dopdb.RegisterHttp(dopdb.New[string, *rec](dopdb.WithCollection(coll))) },
+	)
+	defer done()
+	tok := tokenFor(t, "u1")
+
+	for i, r := range []rec{{"carol", 30}, {"alice", 40}, {"bob", 30}} {
+		body := fmt.Sprintf(`{"name":%q,"age":%d}`, r.Name, r.Age)
+		if rr := do(h, "POST", fmt.Sprintf("/api/hset/%s?f=k%d", coll, i), body, tok); rr.Code != 200 {
+			t.Fatalf("hset %d = %d", i, rr.Code)
+		}
+	}
+
+	// a raw statement as the body
+	rr := do(h, "POST", "/api/sql/"+coll, "SELECT * FROM "+coll+" WHERE age >= 40", tok)
+	if rr.Code != 200 {
+		t.Fatalf("sql status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if arr := decodeArr(t, rr); len(arr) != 1 || arr[0]["name"] != "alice" {
+		t.Errorf("WHERE age >= 40 => %v", arr)
+	}
+
+	// the {"sql": "..."} wrapper works too
+	rr = do(h, "POST", "/api/sql/"+coll, `{"sql":"SELECT * FROM `+coll+` WHERE age = 30 ORDER BY name ASC"}`, tok)
+	arr := decodeArr(t, rr)
+	if len(arr) != 2 || arr[0]["name"] != "bob" || arr[1]["name"] != "carol" {
+		t.Errorf("ORDER BY name => %v", arr)
+	}
+
+	// projection: only the named column comes back
+	rr = do(h, "POST", "/api/sql/"+coll, "SELECT name FROM "+coll+" WHERE name = 'alice'", tok)
+	arr = decodeArr(t, rr)
+	if len(arr) != 1 || arr[0]["name"] != "alice" {
+		t.Fatalf("projection => %v", arr)
+	}
+	if age, ok := arr[0]["age"]; ok && age.(float64) != 0 {
+		t.Errorf("projection leaked age: %v", arr[0])
+	}
+
+	// COUNT(*) answers a number, like the COUNT command
+	rr = do(h, "GET", "/api/sql/"+coll+"?q="+url.QueryEscape("SELECT COUNT(*) FROM "+coll+" WHERE age = 30"), "", tok)
+	if obj := decodeObj(t, rr); obj["count"].(float64) != 2 {
+		t.Errorf("COUNT(*) => %v", obj["count"])
+	}
+
+	// LIKE
+	rr = do(h, "POST", "/api/sql/"+coll, "SELECT * FROM "+coll+" WHERE name LIKE 'a%'", tok)
+	if arr := decodeArr(t, rr); len(arr) != 1 || arr[0]["name"] != "alice" {
+		t.Errorf("LIKE => %v", arr)
+	}
+
+	// a bad statement is the caller's mistake: 400, not 500
+	if rr := do(h, "POST", "/api/sql/"+coll, "SELECT * FROM", tok); rr.Code != 400 {
+		t.Errorf("bad SQL status=%d want 400 (body=%s)", rr.Code, rr.Body.String())
+	}
+	if rr := do(h, "POST", "/api/sql/"+coll, "DELETE FROM "+coll, tok); rr.Code != 400 {
+		t.Errorf("DELETE status=%d want 400", rr.Code)
+	}
+
+	// FROM naming a DIFFERENT collection must be refused: each collection is
+	// authorized separately, so SQL must not be a way to read another one.
+	if rr := do(h, "POST", "/api/sql/"+coll, "SELECT * FROM other_secret_collection", tok); rr.Code != 400 {
+		t.Errorf("cross-collection FROM status=%d want 400 (body=%s)", rr.Code, rr.Body.String())
+	}
+}
+
+// The owner scope is AND-ed into the compiled filter and cannot be widened by
+// the statement — the same guarantee FIND gives.
+func TestIntegrationSQLOwnerScope(t *testing.T) {
+	coll := "it_sql_scoped"
+	h, done := setupKVHandler(t,
+		[][2]string{{"HSET", coll}, {"SQL", coll}},
+		func() {
+			dopdb.RegisterHttp(dopdb.New[string, *itDoc](dopdb.WithCollection(coll)))
+			dopdb.SetOwnerScope(coll, "owner", "uid")
+		},
+	)
+	defer done()
+
+	if rr := do(h, "POST", "/api/hset/"+coll+"?f=@uid", `{"note":"alice-secret"}`, tokenFor(t, "alice")); rr.Code != 200 {
+		t.Fatalf("alice hset=%d", rr.Code)
+	}
+	if rr := do(h, "POST", "/api/hset/"+coll+"?f=@uid", `{"note":"bob-secret"}`, tokenFor(t, "bob")); rr.Code != 200 {
+		t.Fatalf("bob hset=%d", rr.Code)
+	}
+
+	// alice sees only her own row
+	rr := do(h, "POST", "/api/sql/"+coll, "SELECT * FROM "+coll, tokenFor(t, "alice"))
+	arr := decodeArr(t, rr)
+	if len(arr) != 1 || arr[0]["note"] != "alice-secret" {
+		t.Errorf("scoped SELECT * => %v", arr)
+	}
+
+	// and cannot widen the scope by naming another owner in WHERE
+	rr = do(h, "POST", "/api/sql/"+coll, "SELECT * FROM "+coll+" WHERE owner = 'bob'", tokenFor(t, "alice"))
+	if arr := decodeArr(t, rr); len(arr) != 0 {
+		t.Errorf("alice reading bob's rows via SQL => %v", arr)
+	}
+
+	// nor by an OR that would otherwise match everything
+	rr = do(h, "POST", "/api/sql/"+coll, "SELECT * FROM "+coll+" WHERE owner = 'bob' OR owner = 'alice'", tokenFor(t, "alice"))
+	if arr := decodeArr(t, rr); len(arr) != 1 || arr[0]["note"] != "alice-secret" {
+		t.Errorf("OR-widened scope => %v", arr)
+	}
+
+	// COUNT(*) is scoped too
+	rr = do(h, "GET", "/api/sql/"+coll+"?q="+url.QueryEscape("SELECT COUNT(*) FROM "+coll), "", tokenFor(t, "alice"))
+	if obj := decodeObj(t, rr); obj["count"].(float64) != 1 {
+		t.Errorf("scoped COUNT(*) => %v", obj["count"])
+	}
+}
+
+// SQL is Hash-only: a String/List/Set/ZSet collection is not a table.
+func TestIntegrationSQLIsHashOnly(t *testing.T) {
+	coll := "it_sql_str"
+	h, done := setupKVHandler(t,
+		[][2]string{{"SQL", coll}},
+		func() { dopdb.NewString[string](dopdb.WithCollection(coll)).HttpOn() },
+	)
+	defer done()
+
+	rr := do(h, "POST", "/api/sql/"+coll, "SELECT * FROM "+coll, tokenFor(t, "u1"))
+	if rr.Code != 404 {
+		t.Errorf("SQL on a string collection status=%d want 404 (body=%s)", rr.Code, rr.Body.String())
+	}
+}
+
+// The HTTP path clamps LIMIT exactly as FIND's ?limit= is clamped.
+func TestIntegrationSQLLimitIsClamped(t *testing.T) {
+	type rec struct {
+		N int `json:"n"`
+	}
+	coll := "it_sql_limit"
+	h, done := setupKVHandler(t,
+		[][2]string{{"HSET", coll}, {"SQL", coll}},
+		func() { dopdb.RegisterHttp(dopdb.New[string, *rec](dopdb.WithCollection(coll))) },
+	)
+	defer done()
+	tok := tokenFor(t, "u1")
+	for i := 0; i < 5; i++ {
+		do(h, "POST", fmt.Sprintf("/api/hset/%s?f=k%d", coll, i), fmt.Sprintf(`{"n":%d}`, i), tok)
+	}
+
+	// an absurd LIMIT is clamped, not honoured
+	rr := do(h, "POST", "/api/sql/"+coll, "SELECT * FROM "+coll+" LIMIT 999999", tok)
+	if rr.Code != 200 {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if arr := decodeArr(t, rr); len(arr) != 5 {
+		t.Errorf("got %d rows want 5", len(arr))
+	}
+	// an explicit small LIMIT is honoured
+	rr = do(h, "POST", "/api/sql/"+coll, "SELECT * FROM "+coll+" ORDER BY n ASC LIMIT 2", tok)
+	if arr := decodeArr(t, rr); len(arr) != 2 || arr[0]["n"].(float64) != 0 {
+		t.Errorf("LIMIT 2 => %v", arr)
 	}
 }

@@ -9,8 +9,8 @@ import (
 )
 
 // Serve is the one-line bootstrap. Given a loaded config it connects every
-// [[mongo]] datasource, installs them on dopdb, builds the HTTP handler, applies
-// CORS, and listens. Register your collections (dopdb.RegisterHttp) and grant
+// [[kvrocks]] datasource, installs them on dopdb, builds the HTTP handler,
+// applies CORS, and listens. Register your collections (dopdb.RegisterHttp) and grant
 // permissions before calling, or pass a configured permission set with
 // WithPermissions:
 //
@@ -23,9 +23,14 @@ import (
 func Serve(cfg *config.Config, opts ...ServeOption) error {
 	ctx := context.Background()
 
-	sources := make([]dopdb.DatasourceConfig, 0, len(cfg.Mongo))
-	for _, m := range cfg.Mongo {
-		sources = append(sources, dopdb.DatasourceConfig{Name: m.Name, URI: m.URI, DB: m.DB})
+	sources := make([]dopdb.DatasourceConfig, 0, len(cfg.Kvrocks))
+	for _, k := range cfg.Kvrocks {
+		sources = append(sources, dopdb.DatasourceConfig{
+			Name:      k.Name,
+			URI:       k.URI,
+			Namespace: k.Namespace,
+			Password:  k.Password,
+		})
 	}
 	ds, err := dopdb.ConnectDatasources(ctx, sources)
 	if err != nil {
@@ -65,9 +70,14 @@ type ServeHandle struct {
 func ServeWithHandle(cfg *config.Config, opts ...ServeOption) (*ServeHandle, error) {
 	ctx := context.Background()
 
-	sources := make([]dopdb.DatasourceConfig, 0, len(cfg.Mongo))
-	for _, m := range cfg.Mongo {
-		sources = append(sources, dopdb.DatasourceConfig{Name: m.Name, URI: m.URI, DB: m.DB})
+	sources := make([]dopdb.DatasourceConfig, 0, len(cfg.Kvrocks))
+	for _, k := range cfg.Kvrocks {
+		sources = append(sources, dopdb.DatasourceConfig{
+			Name:      k.Name,
+			URI:       k.URI,
+			Namespace: k.Namespace,
+			Password:  k.Password,
+		})
 	}
 	ds, err := dopdb.ConnectDatasources(ctx, sources)
 	if err != nil {

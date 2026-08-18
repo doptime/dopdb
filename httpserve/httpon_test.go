@@ -1,18 +1,16 @@
 package httpserve
 
 import (
-	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/doptime/dopdb"
-
-	"go.mongodb.org/mongo-driver/v2/mongo"
-	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"github.com/redis/go-redis/v9"
 )
 
 // HttpOn-Go gate behavior (R8 §3 criterion 5). Mirrors the TS e2e gate test
@@ -21,30 +19,19 @@ import (
 // WithPermissions configured. This proves the bitmask stands on its own and
 // the legacy Permissions map is not carrying it.
 //
-// Skips unless DOPDB_TEST_MONGO_URI is set, like the conformance tests.
+// Skips unless DOPDB_TEST_KVROCKS_URI is set, like the conformance tests.
 
 // hpDoc is a minimal non-scoped document for the gate test collections.
 type hpDoc struct {
-	Text string `json:"text" bson:"text"`
+	Text string `json:"text"`
 }
 
-func setupHttpOnGate(t *testing.T) (srv *httptest.Server, cl *mongo.Client, db string) {
+func setupHttpOnGate(t *testing.T) (srv *httptest.Server, cl *redis.Client, ns string) {
 	t.Helper()
-	uri := os.Getenv("DOPDB_TEST_MONGO_URI")
-	if uri == "" {
-		t.Skip("set DOPDB_TEST_MONGO_URI (replica set) to run the HttpOn gate test")
-	}
-	var err error
-	cl, err = mongo.Connect(options.Client().ApplyURI(uri))
-	if err != nil {
-		t.Fatalf("mongo connect: %v", err)
-	}
-	if err := cl.Ping(context.Background(), nil); err != nil {
-		t.Fatalf("mongo ping: %v", err)
-	}
-	db = "dopdb_httpon_" + t.Name()
+	cl = kvOrSkip(t)
+	ns = fmt.Sprintf("dopdb_httpon_%d", time.Now().UnixNano())
 	ds := dopdb.NewDatasources()
-	ds.Add("default", cl.Database(db))
+	ds.Add("default", cl, ns)
 	dopdb.SetDatasources(ds)
 
 	// Collection A: read-only via HttpOn. Collection B: everything on (debug
@@ -55,7 +42,7 @@ func setupHttpOnGate(t *testing.T) (srv *httptest.Server, cl *mongo.Client, db s
 
 	emptyPerms := NewPermissions() // no grants at all
 	srv = httptest.NewServer(NewHandler(NewServer(testSecret), emptyPerms))
-	return srv, cl, db
+	return srv, cl, ns
 }
 
 func hpReq(t *testing.T, base, method, path, body string) int {
@@ -81,11 +68,11 @@ func hpReq(t *testing.T, base, method, path, body string) int {
 }
 
 func TestHttpOnGate(t *testing.T) {
-	srv, cl, db := setupHttpOnGate(t)
+	srv, cl, ns := setupHttpOnGate(t)
 	t.Cleanup(func() {
 		srv.Close()
-		_ = cl.Database(db).Drop(context.Background())
-		_ = cl.Disconnect(context.Background())
+		dropNS(cl, ns)
+		_ = cl.Close()
 		dopdb.SetDatasources(nil)
 	})
 	base := srv.URL

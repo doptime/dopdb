@@ -1,21 +1,22 @@
 # dopdb — common tasks.
 #
-# dopdb binds the MongoDB driver directly (no Store abstraction), so every Go
-# package needs the driver module. Unit tests (api/config/httpserve) run WITHOUT
-# a database; integration tests self-skip unless DOPDB_TEST_MONGO_URI points at a
-# running MongoDB. The watch/change-stream tests additionally require the server
-# to be a replica set.
+# dopdb binds KVRocks directly (no Store abstraction), so every Go package needs
+# the redis client + CBOR modules. Unit tests (api/config/httpserve, plus the
+# query-engine and codec tests) run WITHOUT a database; integration tests
+# self-skip unless DOPDB_TEST_KVROCKS_URI points at a running KVRocks. Any
+# Redis-protocol server works for the test suite — dopdb uses only the common
+# command set — but KVRocks is what the production layout is designed for.
 #
 # The TypeScript implementation (an equivalent of the Go one) lives in ts.
 
 GO ?= go
 export GOFLAGS = -mod=mod
 
-.PHONY: help test test-mongo vet fmt fmt-check build tidy ts ts-test ts-typecheck clean
+.PHONY: help test test-kvrocks vet fmt fmt-check build tidy ts ts-test ts-typecheck clean
 
 help:
-	@echo "make test          - go test ./...  (integration tests skip without DOPDB_TEST_MONGO_URI)"
-	@echo "make test-mongo    - run integration tests against DOPDB_TEST_MONGO_URI (replica set for watch)"
+	@echo "make test          - go test ./...  (integration tests skip without DOPDB_TEST_KVROCKS_URI)"
+	@echo "make test-kvrocks  - run integration tests against DOPDB_TEST_KVROCKS_URI"
 	@echo "make vet           - go vet ./..."
 	@echo "make fmt           - gofmt -w ."
 	@echo "make fmt-check     - fail if anything is unformatted"
@@ -28,8 +29,8 @@ help:
 test:
 	$(GO) test -count=1 ./...
 
-test-mongo:
-	@if [ -z "$(DOPDB_TEST_MONGO_URI)" ]; then echo "set DOPDB_TEST_MONGO_URI=mongodb://...  (replica set required for watch)"; exit 1; fi
+test-kvrocks:
+	@if [ -z "$(DOPDB_TEST_KVROCKS_URI)" ]; then echo "set DOPDB_TEST_KVROCKS_URI=redis://localhost:6666"; exit 1; fi
 	$(GO) test -count=1 -run Integration -v ./...
 
 vet:

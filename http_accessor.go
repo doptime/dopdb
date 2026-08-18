@@ -18,10 +18,11 @@ import (
 // boxing V as any. This mirrors how doptime erased types behind
 // httpapi.ApiInterface / redisdb.IHttpKey.
 //
-// The string key arriving here is already the canonical _id (the @-resolved
-// ?f= value), so it is used directly as the document id. ds is the request
-// datasource selector (?ds=, "default" when absent); every operation runs
-// against c.backend(ds), so the same collection can live in several databases.
+// The string key arriving here is already the canonical id (the @-resolved
+// ?f= value), so it is used directly as the hash field holding the document. ds
+// is the request datasource selector (?ds=, "default" when absent); every
+// operation runs against c.backend(ds), so the same collection can live in
+// several KVRocks namespaces.
 // Request bodies arrive as a merged param map decoded into V via a JSON
 // round-trip honouring the json tags we keep equal to the bson tags.
 // ----------------------------------------------------------------------------
@@ -53,6 +54,11 @@ type HttpAccessor interface {
 	// HttpFind ANDs scope (if any) with the caller filter, then sanitizes.
 	HttpFind(ctx context.Context, ds string, filter M, scope M, opt FindOpt) (any, error)
 
+	// HttpSQL runs a SELECT. The statement is parsed, its FROM clause checked
+	// against this collection, and the result handed to the same evaluator FIND
+	// uses. Only Hash collections implement it.
+	HttpSQL(ctx context.Context, ds, sqlText string, scope M, maxLimit, defLimit int64) (any, error)
+
 	// Scoped per-key operations enforce row-level ownership for collections that
 	// declared an owner scope.
 	HttpGetScoped(ctx context.Context, ds, key string, scope M) (any, error)
@@ -68,7 +74,9 @@ type HttpAccessor interface {
 	HttpFindOne(ctx context.Context, ds string, filter M, scope M) (any, error)
 
 	// HttpWatch streams change events; emit is called per event and returns a
-	// non-nil error to stop the stream (e.g. the client disconnected).
+	// non-nil error to stop the stream (e.g. the client disconnected). Events
+	// come from dopdb's own publication channel, not from a server-side change
+	// feed — see kvrocks.go watch.
 	HttpWatch(ctx context.Context, ds string, scope M, emit func(op, id string, doc any) error) error
 
 	// Hash scan/sample (Redis HSCAN / HSCANNOVALUES / HRANDFIELD). scope, when
@@ -141,11 +149,11 @@ func (c *Collection[K, V]) valueFromParams(params M) (V, error) {
 	return v, err
 }
 
-func (c *Collection[K, V]) decodeMany(docs [][]byte) (any, error) {
+func (c *Collection[K, V]) decodeMany(ids []string, docs [][]byte) (any, error) {
 	out := make([]V, len(docs))
 	var err error
 	for i, b := range docs {
-		if out[i], err = c.decode(b); err != nil {
+		if out[i], err = c.decodeAt(b, ids[i]); err != nil {
 			return nil, err
 		}
 	}
@@ -158,13 +166,13 @@ func (c *Collection[K, V]) findDS(ctx context.Context, ds string, filter M, opt 
 	if err != nil {
 		return nil, err
 	}
-	_, docs, err := c.backend(ds).find(ctx, c.coll, safe, opt)
+	ids, docs, err := c.backend(ds).find(ctx, c.coll, safe, opt)
 	if err != nil {
 		return nil, err
 	}
 	out := make([]V, len(docs))
 	for i, b := range docs {
-		if out[i], err = c.decode(b); err != nil {
+		if out[i], err = c.decodeAt(b, ids[i]); err != nil {
 			return nil, err
 		}
 	}
@@ -187,7 +195,7 @@ func (c *Collection[K, V]) HttpGet(ctx context.Context, ds, key string) (any, er
 	if err != nil {
 		return nil, err
 	}
-	return c.decode(b)
+	return c.decodeAt(b, key)
 }
 
 func (c *Collection[K, V]) HttpSet(ctx context.Context, ds, key string, params M) error {
@@ -227,11 +235,11 @@ func (c *Collection[K, V]) HttpGetAll(ctx context.Context, ds string, scope M) (
 	if len(scope) > 0 {
 		return c.findDS(ctx, ds, scope, FindOpt{})
 	}
-	_, docs, err := c.backend(ds).all(ctx, c.coll)
+	ids, docs, err := c.backend(ds).all(ctx, c.coll)
 	if err != nil {
 		return nil, err
 	}
-	return c.decodeMany(docs)
+	return c.decodeMany(ids, docs)
 }
 
 func (c *Collection[K, V]) HttpKeys(ctx context.Context, ds string) (any, error) {
@@ -287,12 +295,47 @@ func (c *Collection[K, V]) HttpFind(ctx context.Context, ds string, filter M, sc
 	return c.findDS(ctx, ds, mergeScope(filter, scope), opt)
 }
 
+// HttpSQL parses and runs a SELECT. Three things happen here that the native
+// Query does not do, because this is the untrusted path:
+//   - the FROM clause is checked against this collection, so SQL cannot reach a
+//     collection the caller was not granted;
+//   - the owner scope is AND-ed in, so it cannot be widened by the statement;
+//   - LIMIT is defaulted and clamped exactly as FIND's ?limit= is.
+func (c *Collection[K, V]) HttpSQL(ctx context.Context, ds, sqlText string, scope M, maxLimit, defLimit int64) (any, error) {
+	q, err := ParseSQL(sqlText)
+	if err != nil {
+		return nil, err
+	}
+	if err := q.CheckTable(c.coll); err != nil {
+		return nil, err
+	}
+	merged := mergeScope(q.Filter, scope)
+	if q.Count {
+		safe, err := SanitizeFilter(merged)
+		if err != nil {
+			return nil, err
+		}
+		n, err := c.backend(ds).countFilter(ctx, c.coll, safe)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"count": n}, nil
+	}
+	opt := q.Opt
+	if opt.Limit <= 0 {
+		opt.Limit = defLimit
+	} else if opt.Limit > maxLimit {
+		opt.Limit = maxLimit
+	}
+	return c.findDS(ctx, ds, merged, opt)
+}
+
 // ---- scoped per-key operations ----
 //
 // For an owner-scoped collection, a per-key request must not trust the key
 // alone: knowing another user's document id must not grant access. These methods
 // intersect {_id: key} with the owner predicate. Writes use the atomic
-// putScoped (filtered upsert) so there is no check-then-act window.
+// putScoped (a WATCH/MULTI compare-and-set) so there is no check-then-act window.
 
 func (c *Collection[K, V]) HttpGetScoped(ctx context.Context, ds, key string, scope M) (any, error) {
 	vs, err := c.findDS(ctx, ds, mergeScope(M{"_id": key}, scope), FindOpt{Limit: 1})
@@ -446,7 +489,7 @@ func (c *Collection[K, V]) HttpMGet(ctx context.Context, ds string, scope M, key
 		}
 		byID := make(map[string]V, len(ids))
 		for i, id := range ids {
-			if v, derr := c.decode(docs[i]); derr == nil {
+			if v, derr := c.decodeAt(docs[i], id); derr == nil {
 				byID[id] = v
 			}
 		}
@@ -467,7 +510,7 @@ func (c *Collection[K, V]) HttpMGet(ctx context.Context, ds string, scope M, key
 		if raw == nil {
 			continue // missing -> null
 		}
-		if v, derr := c.decode(raw); derr == nil {
+		if v, derr := c.decodeAt(raw, keys[i]); derr == nil {
 			out[i] = v
 		}
 	}
@@ -501,7 +544,7 @@ func (c *Collection[K, V]) HttpWatch(ctx context.Context, ds string, scope M, em
 	return c.backend(ds).watch(ctx, c.coll, scope, func(op, id string, raw []byte) error {
 		var doc any
 		if raw != nil {
-			if d, derr := c.decode(raw); derr == nil {
+			if d, derr := c.decodeAt(raw, id); derr == nil {
 				doc = d
 			}
 		}
@@ -524,11 +567,14 @@ func mergeScope(filter, scope M) M {
 // ----------------------------------------------------------------------------
 // Owner scope policy (row-level isolation).
 //
-// Redis got per-user isolation for free from key naming (userInfo<uid>). Mongo
-// has no key namespace, so isolation must be an explicit predicate. A collection
-// declares which document field carries the owner and which JWT claim supplies
-// the value; the HTTP layer injects {field: claim} into every collection-wide
-// read and forbids the client from widening it.
+// redisdb got per-user isolation for free from key naming (userInfo<uid>), at
+// the cost of the caller remembering to name keys that way. dopdb keeps the
+// isolation explicit instead: a collection declares which document field carries
+// the owner and which JWT claim supplies the value, and the HTTP layer injects
+// {field: claim} into every collection-wide read, with no way for the client to
+// widen it. For the non-Hash collection types — where a native list or set has
+// no document to hold an owner field — the same predicate is enforced against
+// the collection's owner index (kvrocks.go).
 // ----------------------------------------------------------------------------
 
 type scopePolicy struct {
@@ -597,7 +643,7 @@ func (c *Collection[K, V]) HttpScan(ctx context.Context, ds, match string, curso
 	}
 	vals := make([]V, len(docs))
 	for i := range docs {
-		if vals[i], err = c.decode(docs[i]); err != nil {
+		if vals[i], err = c.decodeAt(docs[i], ids[i]); err != nil {
 			return nil, fmt.Errorf("dopdb: decode %s[%s]: %w", c.coll, ids[i], err)
 		}
 	}

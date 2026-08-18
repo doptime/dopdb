@@ -12,8 +12,8 @@ const srcDir = resolve(dirname(new URL(import.meta.url).pathname), "../src");
 /** Regex matching: import ... from "./foo.js" or import ... from '../bar.js' */
 const LOCAL_IMPORT_RE = /from\s+(?<q>["'])(?<path>\.\/[^"']+|(\.\.\/)+[^"']+)\k<q>/g;
 
-/** Regex matching: import ... from "mongodb" or require("mongodb") */
-const MONGODB_IMPORT_RE = /(?:from\s+["']mongodb["']|require\s*\(\s*["']mongodb["'])/;
+/** Regex matching an import of the server-only storage client. */
+const SERVER_CLIENT_IMPORT_RE = /(?:from\s+["']ioredis["']|require\s*\(\s*["']ioredis["'])/;
 
 /** Regex matching: import ... from "node:*" (node:fs, node:crypto, node:http, …) */
 const NODE_BUILTIN_IMPORT_RE = /from\s+["']node:[^"']+["']/;
@@ -81,10 +81,10 @@ function getLocalImports(filePath: string): string[] {
 	return results;
 }
 
-/** Check if a source file imports mongodb or any node:* builtin. */
-function hasServerOnlyImport(filePath: string): { hasMongoDB: boolean; hasNodeBuiltin: boolean; nodeModules: string[] } {
+/** Check if a source file imports the redis client or any node:* builtin. */
+function hasServerOnlyImport(filePath: string): { hasServerClient: boolean; hasNodeBuiltin: boolean; nodeModules: string[] } {
 	const content = stripComments(readFileSync(filePath, "utf-8"));
-	const hasMongoDB = MONGODB_IMPORT_RE.test(content);
+	const hasServerClient = SERVER_CLIENT_IMPORT_RE.test(content);
 	const hasNodeBuiltin = NODE_BUILTIN_IMPORT_RE.test(content);
 	const nodeModules: string[] = [];
 	let m;
@@ -92,7 +92,7 @@ function hasServerOnlyImport(filePath: string): { hasMongoDB: boolean; hasNodeBu
 	while ((m = re.exec(content)) !== null) {
 		nodeModules.push(m[1]);
 	}
-	return { hasMongoDB, hasNodeBuiltin, nodeModules };
+	return { hasServerClient, hasNodeBuiltin, nodeModules };
 }
 
 /**
@@ -127,7 +127,7 @@ function buildImportGraph(entryFile: string): Set<string> {
 // Tests
 // ---------------------------------------------------------------------------
 
-test("index.ts transitive graph does not import mongodb or node:* modules", () => {
+test("index.ts transitive graph does not import ioredis or node:* modules", () => {
 	const entry = resolve(srcDir, "index.ts");
 	const graph = buildImportGraph(entry);
 
@@ -140,13 +140,13 @@ test("index.ts transitive graph does not import mongodb or node:* modules", () =
 
 	// Check each file in the graph
 	for (const file of graph) {
-		const { hasMongoDB, hasNodeBuiltin, nodeModules } = hasServerOnlyImport(file);
-		assert.equal(hasMongoDB, false, `Expected ${file} to NOT import mongodb`);
+		const { hasServerClient, hasNodeBuiltin, nodeModules } = hasServerOnlyImport(file);
+		assert.equal(hasServerClient, false, `Expected ${file} to NOT import ioredis`);
 		assert.equal(hasNodeBuiltin, false, `Expected ${file} to NOT import node:* modules, found: ${nodeModules.join(", ")}`);
 	}
 });
 
-test("client.ts transitive graph does not import mongodb or node:* modules", () => {
+test("client.ts transitive graph does not import ioredis or node:* modules", () => {
 	const entry = resolve(srcDir, "client.ts");
 	const graph = buildImportGraph(entry);
 
@@ -164,18 +164,21 @@ test("client.ts transitive graph does not import mongodb or node:* modules", () 
 
 	// Check each file in the graph
 	for (const file of graph) {
-		const { hasMongoDB, hasNodeBuiltin, nodeModules } = hasServerOnlyImport(file);
-		assert.equal(hasMongoDB, false, `Expected ${file} to NOT import mongodb`);
+		const { hasServerClient, hasNodeBuiltin, nodeModules } = hasServerOnlyImport(file);
+		assert.equal(hasServerClient, false, `Expected ${file} to NOT import ioredis`);
 		assert.equal(hasNodeBuiltin, false, `Expected ${file} to NOT import node:* modules, found: ${nodeModules.join(", ")}`);
 	}
 });
 
-test("server.ts DOES import mongodb (reverse check: proves the guard works)", () => {
-	const serverFile = resolve(srcDir, "server.ts");
-	const { hasMongoDB, hasNodeBuiltin, nodeModules } = hasServerOnlyImport(serverFile);
+// Reverse check: the guard above only proves something if it can actually see a
+// server-only import. kvrocks.ts is where the redis client lives; server.ts is
+// where the node:* builtins live.
+test("the server modules DO carry the server-only imports (proves the guard works)", () => {
+	const kv = hasServerOnlyImport(resolve(srcDir, "kvrocks.ts"));
+	assert.equal(kv.hasServerClient, true, "kvrocks.ts MUST import ioredis — if this fails the guard is not detecting it");
 
-	assert.equal(hasMongoDB, true, "server.ts MUST import mongodb — if this fails the guard is not detecting it");
-	assert.equal(hasNodeBuiltin, true, "server.ts MUST import node:* modules — if this fails the guard is not detecting them");
-	assert.ok(nodeModules.includes("node:crypto"), "server.ts should import node:crypto");
-	assert.ok(nodeModules.includes("node:http"), "server.ts should import node:http");
+	const srv = hasServerOnlyImport(resolve(srcDir, "server.ts"));
+	assert.equal(srv.hasNodeBuiltin, true, "server.ts MUST import node:* modules — if this fails the guard is not detecting them");
+	assert.ok(srv.nodeModules.includes("node:crypto"), "server.ts should import node:crypto");
+	assert.ok(srv.nodeModules.includes("node:http"), "server.ts should import node:http");
 });

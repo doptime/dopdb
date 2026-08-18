@@ -16,7 +16,7 @@ import (
 )
 
 // Handler is the dopdb HTTP entry point. It turns a closed command vocabulary
-// over HTTP into MongoDB operations, with JWT @-binding, per-(command,
+// over HTTP into KVRocks operations, with JWT @-binding, per-(command,
 // collection) permissions, and row-level owner scoping. CRUD endpoints
 // disappear: the frontend speaks HGET/HSET/... directly and safely.
 type Handler struct {
@@ -39,7 +39,7 @@ var dataCommands = map[string]bool{
 	"HGET": true, "HSET": true, "HSETNX": true, "HDEL": true, "DEL": true,
 	"HEXISTS": true, "HGETALL": true, "HKEYS": true, "HVALS": true,
 	"HLEN": true, "HINCRBY": true, "HINCRBYFLOAT": true, "FIND": true,
-	"HMSET": true, "HMGET": true, "COUNT": true, "FINDONE": true, "WATCH": true,
+	"HMSET": true, "HMGET": true, "COUNT": true, "FINDONE": true, "WATCH": true, "SQL": true,
 	"HSCAN": true, "HSCANNOVALUES": true, "HRANDFIELD": true,
 	"STRGET": true, "STRSET": true, "STRSETALL": true, "STRGETALL": true, "STRDEL": true,
 	"SADD": true, "SREM": true, "SMEMBERS": true, "SISMEMBER": true, "SCARD": true,
@@ -310,7 +310,8 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 			opt.Skip = s
 		}
 		// F13: parse sort (?s=<json>) and projection (?p=<json>) — mirrors TS.
-		// F5/F13: validate sort/projection to reject $-operator injection.
+		// F5/F13: validate sort/projection to reject $-operator smuggling. They
+		// are applied in-process by the query engine, not by a database.
 		if sv := c.Queries.Get("s"); sv != "" {
 			if err := json.Unmarshal([]byte(sv), &opt.Sort); err != nil {
 				writeErr(w, http.StatusBadRequest, "validation", fmt.Errorf("invalid ?s= JSON: %w", err))
@@ -332,6 +333,24 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 			}
 		}
 		v, err := ha.HttpFind(ctx, c.DB, filter, scope, opt)
+		writeResult(w, v, err)
+
+	case "SQL":
+		// SQL is a Hash-only surface: a Hash collection is a table, the other
+		// four key types are not (see dopdb/sql.go for the reasoning).
+		if ha == nil {
+			writeErr(w, http.StatusNotFound, "not_found", errors.New("SQL is only available on hash collections: "+c.Coll))
+			return
+		}
+		stmt := c.Queries.Get("q")
+		if stmt == "" {
+			stmt = sqlFromBody(c.Body)
+		}
+		if strings.TrimSpace(stmt) == "" {
+			writeErr(w, http.StatusBadRequest, "validation", errors.New(`SQL requires ?q=<statement> or a body of {"sql":"..."}`))
+			return
+		}
+		v, err := ha.HttpSQL(ctx, c.DB, stmt, scope, maxLimit, defaultLimit)
 		writeResult(w, v, err)
 
 	case "HMSET":
@@ -841,6 +860,22 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 	}
 }
 
+// sqlFromBody accepts either a JSON object {"sql":"..."} or the raw statement as
+// the request body — a SQL statement is not JSON, so demanding a wrapper would
+// be friction for no benefit.
+func sqlFromBody(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	var wrapper struct {
+		SQL string `json:"sql"`
+	}
+	if err := json.Unmarshal(body, &wrapper); err == nil && wrapper.SQL != "" {
+		return wrapper.SQL
+	}
+	return string(body)
+}
+
 // parseFilter reads the FIND filter from ?q=<json> or the request body.
 func (c *ReqCtx) parseFilter() (dopdb.M, error) {
 	raw := c.Queries.Get("q")
@@ -900,6 +935,13 @@ func statusForError(w http.ResponseWriter, err error) {
 		writeErr(w, http.StatusNotFound, "not_found", err)
 	case errors.Is(err, dopdb.ErrForbidden):
 		writeErr(w, http.StatusForbidden, "forbidden", err)
+	case errors.Is(err, dopdb.ErrSQL):
+		// a statement that will not parse, names the wrong table, or asks for
+		// something dopdb does not implement is the caller's mistake
+		writeErr(w, http.StatusBadRequest, "validation", err)
+	case errors.Is(err, dopdb.ErrDuplicate):
+		// a unique-index violation; dopdb enforces these itself on KVRocks
+		writeErr(w, http.StatusConflict, "conflict", err)
 	default:
 		writeErr(w, http.StatusInternalServerError, "error", err)
 	}

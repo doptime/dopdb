@@ -8,7 +8,7 @@ const perms = new Permissions()
 
 export const { GET, POST, OPTIONS } = createNextHandler({
   schema,
-  mongo: { uri: process.env.MONGO_URI!, db: "appdb" },
+  kvrocks: { uri: process.env.KVROCKS_URI!, namespace: "appdb" },
   jwtSecret: process.env.JWT_SECRET!,
   permissions: perms,
 });

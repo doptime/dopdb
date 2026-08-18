@@ -9,16 +9,23 @@
 //	jwt_secret_env = "DOPTIME_JWT_SECRET"   # env var holding the HS256 key / RS256 PEM
 //	cors_origins   = ["https://app.example.com"]
 //
-//	[[mongo]]
-//	name    = "default"                     # a "default" source is required
-//	uri_env = "DOPTIME_MONGO_URI"           # env var holding the connection string (may carry creds)
-//	uri     = "mongodb://localhost:27017"   # literal fallback (dev only); env wins if set
-//	db      = "appdb"
+//	[[kvrocks]]
+//	name         = "default"                    # a "default" source is required
+//	uri_env      = "DOPTIME_KVROCKS_URI"        # env var holding the connection URL
+//	uri          = "redis://localhost:6666"     # literal fallback (dev only); env wins
+//	password_env = "DOPTIME_KVROCKS_PASSWORD"   # env var holding the auth token
+//	namespace    = "appdb"                      # key prefix; the KVRocks stand-in for a database
 //
-//	[[mongo]]
-//	name = "analytics"
-//	uri  = "mongodb://localhost:27017"
-//	db   = "analytics"
+//	[[kvrocks]]
+//	name      = "analytics"
+//	uri       = "redis://localhost:6666"
+//	namespace = "analytics"
+//
+// Why `namespace` and not `db`: KVRocks speaks the Redis protocol and has no
+// per-database collections, so a datasource's logical database is a key prefix
+// applied to every key dopdb writes. On a KVRocks server that also uses native
+// namespace tokens, `password` selects that namespace and `namespace` still
+// partitions keys within it.
 package config
 
 import (
@@ -35,18 +42,20 @@ type HTTPConfig struct {
 	CORSOrigins  []string
 }
 
-// MongoSource is one [[mongo]] datasource.
-type MongoSource struct {
-	Name   string
-	URIEnv string
-	URI    string // resolved: env (URIEnv) wins over the literal
-	DB     string
+// KvrocksSource is one [[kvrocks]] datasource.
+type KvrocksSource struct {
+	Name        string
+	URIEnv      string
+	URI         string // resolved: env (URIEnv) wins over the literal
+	PasswordEnv string
+	Password    string // resolved from PasswordEnv; a literal is accepted for dev
+	Namespace   string
 }
 
 // Config is the whole document.
 type Config struct {
-	HTTP  HTTPConfig
-	Mongo []MongoSource
+	HTTP    HTTPConfig
+	Kvrocks []KvrocksSource
 }
 
 // Load reads and resolves a config file. Secrets and connection strings are
@@ -75,43 +84,48 @@ func (c *Config) resolveEnv() {
 			c.HTTP.JWTSecret = v
 		}
 	}
-	for i := range c.Mongo {
-		if c.Mongo[i].URIEnv != "" {
-			if v := os.Getenv(c.Mongo[i].URIEnv); v != "" {
-				c.Mongo[i].URI = v
+	for i := range c.Kvrocks {
+		if c.Kvrocks[i].URIEnv != "" {
+			if v := os.Getenv(c.Kvrocks[i].URIEnv); v != "" {
+				c.Kvrocks[i].URI = v
+			}
+		}
+		if c.Kvrocks[i].PasswordEnv != "" {
+			if v := os.Getenv(c.Kvrocks[i].PasswordEnv); v != "" {
+				c.Kvrocks[i].Password = v
 			}
 		}
 	}
 }
 
 // Source returns the datasource with the given name.
-func (c *Config) Source(name string) (MongoSource, bool) {
-	for _, m := range c.Mongo {
+func (c *Config) Source(name string) (KvrocksSource, bool) {
+	for _, m := range c.Kvrocks {
 		if m.Name == name {
 			return m, true
 		}
 	}
-	return MongoSource{}, false
+	return KvrocksSource{}, false
 }
 
 // Default returns the "default" datasource (required to exist).
-func (c *Config) Default() MongoSource {
+func (c *Config) Default() KvrocksSource {
 	m, _ := c.Source("default")
 	return m
 }
 
 // Validate enforces the invariants the framework relies on.
 func (c *Config) Validate() error {
-	if len(c.Mongo) == 0 {
-		return fmt.Errorf("config: at least one [[mongo]] datasource is required")
+	if len(c.Kvrocks) == 0 {
+		return fmt.Errorf("config: at least one [[kvrocks]] datasource is required")
 	}
 	if _, ok := c.Source("default"); !ok {
-		return fmt.Errorf("config: a [[mongo]] datasource named \"default\" is required")
+		return fmt.Errorf("config: a [[kvrocks]] datasource named \"default\" is required")
 	}
 	seen := map[string]bool{}
-	for _, m := range c.Mongo {
+	for _, m := range c.Kvrocks {
 		if m.Name == "" {
-			return fmt.Errorf("config: a [[mongo]] datasource is missing name")
+			return fmt.Errorf("config: a [[kvrocks]] datasource is missing name")
 		}
 		if seen[m.Name] {
 			return fmt.Errorf("config: duplicate datasource name %q", m.Name)
@@ -120,8 +134,11 @@ func (c *Config) Validate() error {
 		if m.URI == "" {
 			return fmt.Errorf("config: datasource %q has no uri (set uri or %s)", m.Name, m.URIEnv)
 		}
-		if m.DB == "" {
-			return fmt.Errorf("config: datasource %q has no db", m.Name)
+		if !strings.HasPrefix(m.URI, "redis://") && !strings.HasPrefix(m.URI, "rediss://") {
+			return fmt.Errorf("config: datasource %q uri must start with redis:// or rediss:// (got %q)", m.Name, m.URI)
+		}
+		if m.Namespace == "" {
+			return fmt.Errorf("config: datasource %q has no namespace", m.Name)
 		}
 	}
 	if c.HTTP.JWTSecret == "" {
@@ -134,9 +151,12 @@ func (c *Config) Validate() error {
 // log these at startup.
 func (c *Config) Warnings() []string {
 	var w []string
-	for _, m := range c.Mongo {
+	for _, m := range c.Kvrocks {
 		if m.URIEnv == "" && strings.Contains(m.URI, "@") {
 			w = append(w, fmt.Sprintf("datasource %q has credentials in a literal uri — move it to %s via uri_env", m.Name, "an env var"))
+		}
+		if m.PasswordEnv == "" && m.Password != "" {
+			w = append(w, fmt.Sprintf("datasource %q has a literal password — move it to an env var via password_env", m.Name))
 		}
 	}
 	return w
@@ -150,9 +170,9 @@ func (c *Config) Warnings() []string {
 func parse(text string) (*Config, error) {
 	cfg := &Config{}
 	var (
-		section   string       // current [section]
-		mongoOpen bool         // inside an [[mongo]] element
-		cur       *MongoSource // current [[mongo]] element
+		section string         // current [section]
+		kvOpen  bool           // inside a [[kvrocks]] element
+		cur     *KvrocksSource // current [[kvrocks]] element
 	)
 	lines := strings.Split(text, "\n")
 	for n, raw := range lines {
@@ -163,24 +183,24 @@ func parse(text string) (*Config, error) {
 		switch {
 		case strings.HasPrefix(line, "[[") && strings.HasSuffix(line, "]]"):
 			name := strings.TrimSpace(line[2 : len(line)-2])
-			if name != "mongo" {
+			if name != "kvrocks" {
 				return nil, fmt.Errorf("line %d: unknown array-of-tables [[%s]]", n+1, name)
 			}
-			cfg.Mongo = append(cfg.Mongo, MongoSource{})
-			cur = &cfg.Mongo[len(cfg.Mongo)-1]
-			mongoOpen = true
+			cfg.Kvrocks = append(cfg.Kvrocks, KvrocksSource{})
+			cur = &cfg.Kvrocks[len(cfg.Kvrocks)-1]
+			kvOpen = true
 			section = ""
 		case strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]"):
 			section = strings.TrimSpace(line[1 : len(line)-1])
-			mongoOpen = false
+			kvOpen = false
 			cur = nil
 		default:
 			key, val, err := splitKV(line)
 			if err != nil {
 				return nil, fmt.Errorf("line %d: %w", n+1, err)
 			}
-			if mongoOpen {
-				if err := assignMongo(cur, key, val, n+1); err != nil {
+			if kvOpen {
+				if err := assignKvrocks(cur, key, val, n+1); err != nil {
 					return nil, err
 				}
 			} else if section == "http" {
@@ -211,7 +231,7 @@ func assignHTTP(h *HTTPConfig, key, val string, line int) error {
 	return nil
 }
 
-func assignMongo(m *MongoSource, key, val string, line int) error {
+func assignKvrocks(m *KvrocksSource, key, val string, line int) error {
 	switch key {
 	case "name":
 		m.Name = mustString(val)
@@ -219,10 +239,14 @@ func assignMongo(m *MongoSource, key, val string, line int) error {
 		m.URIEnv = mustString(val)
 	case "uri":
 		m.URI = mustString(val)
-	case "db":
-		m.DB = mustString(val)
+	case "password_env":
+		m.PasswordEnv = mustString(val)
+	case "password":
+		m.Password = mustString(val) // dev only; prefer password_env
+	case "namespace":
+		m.Namespace = mustString(val)
 	default:
-		return fmt.Errorf("line %d: unknown mongo key %q", line, key)
+		return fmt.Errorf("line %d: unknown kvrocks key %q", line, key)
 	}
 	return nil
 }

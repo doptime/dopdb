@@ -1,7 +1,7 @@
 {
   "name": "@kequnyang/dopdb",
   "version": "0.1.202606301552",
-  "description": "One schema, two equivalent engines (Go + TypeScript), one wire protocol. Declare a collection once and get native types, runtime validation, a typed browser client (fetch), and a Node + MongoDB server — no codegen, no double-write. Redis-compatible data structures (Hash/String/List/Set/ZSet) on MongoDB.",
+  "description": "One schema, two equivalent engines (Go + TypeScript), one wire protocol. Declare a collection once and get native types, runtime validation, a typed browser client (fetch), and a Node + KVRocks server \u2014 no codegen, no double-write. Redis-compatible data structures (Hash/String/List/Set/ZSet) stored natively on KVRocks, values encoded as CBOR.",
   "type": "module",
   "license": "MIT",
   "author": "doptime",
@@ -15,14 +15,16 @@
     "url": "https://github.com/doptime/dopdb/issues"
   },
   "keywords": [
-    "mongodb",
+    "kvrocks",
+    "redis",
+    "rocksdb",
     "typescript",
     "schema",
     "orm",
     "odm",
-    "redis",
     "redisdb",
     "doptime",
+    "cbor",
     "typed-client",
     "fullstack",
     "nextjs",
@@ -70,20 +72,23 @@
     "access": "public"
   },
   "peerDependencies": {
-    "mongodb": "^6.0.0 || ^7.0.0"
+    "ioredis": "^5.4.0"
   },
   "peerDependenciesMeta": {
-    "mongodb": {
+    "ioredis": {
       "optional": true
     }
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
-    "mongodb": "^7.0.0",
+    "ioredis": "^5.4.0",
     "tsx": "^4.7.0",
     "typescript": "^5.4.0"
   },
   "engines": {
     "node": ">=20"
+  },
+  "dependencies": {
+    "cbor-x": "^1.5.9"
   }
 }

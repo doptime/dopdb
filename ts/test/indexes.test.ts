@@ -4,16 +4,19 @@ import assert from "node:assert/strict";
 import { f, collection } from "../src/schema.js";
 import { ensureIndexes } from "../src/server.js";
 
-test("ensureIndexes creates unique and TTL indexes from the schema", async () => {
-  const created: { key: Record<string, unknown>; opts: any }[] = [];
-  const fakeDb = {
-    collection() {
-      return {
-        async createIndex(key: Record<string, unknown>, opts: any) {
-          created.push({ key, opts });
-          return "ok";
-        },
-      };
+// ensureIndexes no longer creates anything on the server: KVRocks has no
+// secondary indexes. Only `unique` has runtime meaning — dopdb enforces it
+// itself — so the test asserts what is REGISTERED rather than what was created.
+//
+// A TTL declaration on a Hash field has no equivalent at all: a Hash collection
+// is ONE Redis key, so a per-document expiry cannot be expressed. That is
+// asserted here so the gap cannot be reintroduced silently.
+
+test("ensureIndexes registers unique fields and ignores the rest", async () => {
+  const registered: { coll: string; fields: string[] }[] = [];
+  const fakeBackend = {
+    registerUnique(coll: string, fields: string[]) {
+      registered.push({ coll, fields });
     },
   };
 
@@ -22,18 +25,21 @@ test("ensureIndexes creates unique and TTL indexes from the schema", async () =>
       _id: f.string(),
       email: f.string().unique(),
       createdAt: f.date().ttl(3600),
+      label: f.string(),
     }).named("sessions"),
   };
 
-  await ensureIndexes(schema, fakeDb as any);
+  await ensureIndexes(schema, fakeBackend as never);
 
-  const ttl = created.find((c) => c.opts.expireAfterSeconds != null);
-  assert.ok(ttl, "a TTL index was created");
-  assert.equal(ttl!.opts.expireAfterSeconds, 3600);
-  assert.deepEqual(ttl!.key, { createdAt: 1 });
-  assert.equal(ttl!.opts.unique, undefined, "TTL index is not unique");
+  assert.equal(registered.length, 1);
+  assert.equal(registered[0].coll, "sessions");
+  assert.deepEqual(registered[0].fields, ["email"], "only the unique field is enforceable");
+});
 
-  const uniq = created.find((c) => c.opts.unique === true);
-  assert.ok(uniq, "a unique index was created");
-  assert.deepEqual(uniq!.key, { email: 1 });
+test("a schema with no unique fields registers an empty set", async () => {
+  const registered: string[][] = [];
+  const fakeBackend = { registerUnique: (_c: string, fields: string[]) => void registered.push(fields) };
+  const schema = { Plain: collection({ _id: f.string(), x: f.number() }).named("plain") };
+  await ensureIndexes(schema, fakeBackend as never);
+  assert.deepEqual(registered, [[]]);
 });

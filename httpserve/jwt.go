@@ -1,5 +1,5 @@
 // Package httpserve is the dopdb HTTP layer: it makes CRUD disappear by exposing
-// a closed command vocabulary over MongoDB, with JWT @-context binding,
+// a closed command vocabulary over KVRocks, with JWT @-context binding,
 // per-(command,collection) permissions, and row-level owner scoping.
 package httpserve
 

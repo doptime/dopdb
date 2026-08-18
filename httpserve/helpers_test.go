@@ -9,8 +9,9 @@ import (
 )
 
 // Shared test helpers for the httpserve package. API-dispatch tests do not touch
-// MongoDB (the echo endpoint is pure), so no datasource wiring is needed here.
-// Data-command integration tests live separately and gate on a real MongoDB.
+// the database (the echo endpoint is pure), so no datasource wiring is needed
+// here. Data-command integration tests live separately and gate on a real
+// KVRocks via DOPDB_TEST_KVROCKS_URI.
 
 const testSecret = "test-secret-0123456789"
 

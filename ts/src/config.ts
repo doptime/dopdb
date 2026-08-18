@@ -7,11 +7,16 @@
 //   jwt_secret_env = "DOPTIME_JWT_SECRET"   # env var holding the HS256 key
 //   cors_origins   = ["https://app.example.com"]
 //
-//   [[mongo]]
-//   name    = "default"                     # a "default" source is required
-//   uri_env = "DOPTIME_MONGO_URI"           # env var holding the connection string
-//   uri     = "mongodb://localhost:27017"   # literal fallback (dev only)
-//   db      = "appdb"
+//   [[kvrocks]]
+//   name         = "default"                    # a "default" source is required
+//   uri_env      = "DOPTIME_KVROCKS_URI"        # env var holding the connection URL
+//   uri          = "redis://localhost:6666"     # literal fallback (dev only)
+//   password_env = "DOPTIME_KVROCKS_PASSWORD"   # env var holding the auth token
+//   namespace    = "appdb"                      # key prefix; the KVRocks stand-in for a database
+//
+// Why `namespace` and not `db`: KVRocks speaks the Redis protocol and has no
+// per-database collections, so a datasource's logical database is a key prefix
+// applied to every key dopdb writes.
 //
 // Dependency-free: a tiny reader covering exactly this schema, so it loads with no
 // external packages. Use a `.json` extension to provide the same shape as JSON.
@@ -26,29 +31,33 @@ export interface HttpConfig {
   corsOrigins?: string[];
 }
 
-export interface MongoSource {
+export interface KvrocksSource {
   name: string;
   uriEnv?: string;
   /** Resolved: env (uriEnv) wins over the literal. */
   uri: string;
-  db: string;
+  passwordEnv?: string;
+  /** Resolved from passwordEnv; a literal is accepted for dev. */
+  password?: string;
+  /** Key prefix applied to every key this datasource writes. */
+  namespace: string;
 }
 
 export interface Config {
   http: HttpConfig;
-  mongo: MongoSource[];
+  kvrocks: KvrocksSource[];
 }
 
 /** The "default" datasource (required). */
-export function defaultSource(cfg: Config): MongoSource {
-  const d = cfg.mongo.find((m) => m.name === "default");
-  if (!d) throw new Error('config: a [[mongo]] source named "default" is required');
+export function defaultSource(cfg: Config): KvrocksSource {
+  const d = cfg.kvrocks.find((m) => m.name === "default");
+  if (!d) throw new Error('config: a [[kvrocks]] source named "default" is required');
   return d;
 }
 
 /** Look up a datasource by name. */
-export function source(cfg: Config, name: string): MongoSource | undefined {
-  return cfg.mongo.find((m) => m.name === name);
+export function source(cfg: Config, name: string): KvrocksSource | undefined {
+  return cfg.kvrocks.find((m) => m.name === name);
 }
 
 /** Load and resolve a config file (TOML, or JSON if the path ends in `.json`). */
@@ -69,7 +78,7 @@ interface RawConfig {
     jwt_secret_env?: string;
     cors_origins?: string[];
   };
-  mongo?: { name?: string; uri_env?: string; uri?: string; db?: string }[];
+  kvrocks?: { name?: string; uri_env?: string; uri?: string; password_env?: string; password?: string; namespace?: string }[];
 }
 
 function normalize(raw: RawConfig): Config {
@@ -80,11 +89,13 @@ function normalize(raw: RawConfig): Config {
       jwtSecretEnv: http.jwt_secret_env,
       corsOrigins: http.cors_origins,
     },
-    mongo: (raw.mongo ?? []).map((m) => ({
+    kvrocks: (raw.kvrocks ?? []).map((m) => ({
       name: m.name ?? "",
       uriEnv: m.uri_env,
       uri: m.uri ?? "",
-      db: m.db ?? "",
+      passwordEnv: m.password_env,
+      password: m.password,
+      namespace: m.namespace ?? "",
     })),
   };
 }
@@ -94,22 +105,29 @@ function resolveEnv(cfg: Config): void {
     const v = process.env[cfg.http.jwtSecretEnv];
     if (v) cfg.http.jwtSecret = v;
   }
-  for (const m of cfg.mongo) {
+  for (const m of cfg.kvrocks) {
     if (m.uriEnv) {
       const v = process.env[m.uriEnv];
       if (v) m.uri = v; // env wins over the literal
+    }
+    if (m.passwordEnv) {
+      const v = process.env[m.passwordEnv];
+      if (v) m.password = v;
     }
   }
 }
 
 function validate(cfg: Config): void {
-  if (!cfg.mongo.some((m) => m.name === "default")) {
-    throw new Error('config: at least one [[mongo]] source must be name = "default"');
+  if (!cfg.kvrocks.some((m) => m.name === "default")) {
+    throw new Error('config: at least one [[kvrocks]] source must be name = "default"');
   }
-  for (const m of cfg.mongo) {
-    if (!m.name) throw new Error("config: every [[mongo]] needs a name");
-    if (!m.uri) throw new Error(`config: mongo source "${m.name}" has no uri (set uri or its uri_env)`);
-    if (!m.db) throw new Error(`config: mongo source "${m.name}" has no db`);
+  for (const m of cfg.kvrocks) {
+    if (!m.name) throw new Error("config: every [[kvrocks]] needs a name");
+    if (!m.uri) throw new Error(`config: kvrocks source "${m.name}" has no uri (set uri or its uri_env)`);
+    if (!/^rediss?:\/\//.test(m.uri)) {
+      throw new Error(`config: kvrocks source "${m.name}" uri must start with redis:// or rediss:// (got "${m.uri}")`);
+    }
+    if (!m.namespace) throw new Error(`config: kvrocks source "${m.name}" has no namespace`);
   }
 }
 
@@ -118,7 +136,7 @@ function validate(cfg: Config): void {
 function parseToml(text: string): RawConfig {
   const out: RawConfig = {};
   let cursor: Record<string, unknown> | null = null; // current [table]
-  let mongoArr: Record<string, unknown>[] | undefined;
+  let kvArr: Record<string, unknown>[] | undefined;
 
   for (let line of text.split("\n")) {
     line = stripComment(line).trim();
@@ -129,11 +147,11 @@ function parseToml(text: string): RawConfig {
       cursor = out.http as Record<string, unknown>;
       continue;
     }
-    if (line === "[[mongo]]") {
-      mongoArr = (out.mongo as Record<string, unknown>[] | undefined) ?? [];
-      out.mongo = mongoArr as RawConfig["mongo"];
+    if (line === "[[kvrocks]]") {
+      kvArr = (out.kvrocks as Record<string, unknown>[] | undefined) ?? [];
+      out.kvrocks = kvArr as RawConfig["kvrocks"];
       const entry: Record<string, unknown> = {};
-      mongoArr.push(entry);
+      kvArr.push(entry);
       cursor = entry;
       continue;
     }

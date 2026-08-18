@@ -3,9 +3,9 @@
 // Entry points (see package.json "exports"):
 //   import { collection, f, type Infer } from "@kequnyang/dopdb";          // shared schema
 //   import { clientDb, apiClient }       from "@kequnyang/dopdb/client";    // browser (fetch)
-//   import { serve, serverDb, defineApi } from "@kequnyang/dopdb/server";   // node + mongo
+//   import { serve, serverDb, defineApi } from "@kequnyang/dopdb/server";   // node + KVRocks
 //
-// The root + /client entries import nothing from node or mongodb, so the schema
+// The root + /client entries import nothing from node or ioredis, so the schema
 // and the client are safe to bundle into a browser app. Only /server pulls the
 // driver in.
 

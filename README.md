@@ -2,7 +2,7 @@
 
 **Write one schema; get the types, validation, typed client, and HTTP server for both Go and TypeScript — no codegen, no writing it twice.**
 
-dopdb is a merge-rewrite of `doptime` + `redisdb` + `doptime-client`, with the data backend swapped to **MongoDB**. Its single goal: **eliminate the glue code you write five times just to store and fetch a piece of data.**
+dopdb is a merge-rewrite of `doptime` + `redisdb` + `doptime-client`, with the data backend on **KVRocks** (Apache Kvrocks — a RocksDB-backed store speaking the Redis protocol). Its single goal: **eliminate the glue code you write five times just to store and fetch a piece of data.**
 
 ---
 
@@ -30,21 +30,36 @@ Five places to keep in sync by hand; change one field and five places must follo
 - **No codegen**: not a code generator — there's no "generated, then hand-edited, then regenerated and conflicts" cycle. One schema drives both engines at runtime.
 - **One set of types across front and back**: change a field and both engines' types move together — a compile error, not a production surprise.
 - **Multi-tenancy by default**: `@`-binding + owner-scope bake "this is my own data" into the framework, instead of relying on you to remember `WHERE owner = me` on every query.
-- **Mongo used as Mongo**: bound directly to the official driver — atomic `$inc`, change streams, unique indexes, geo indexes all work, with no abstraction layer in the way.
+- **Redis data structures used as Redis data structures**: bound directly to the protocol — a Hash collection is one Redis hash, and List/Set/ZSet are the real types, so `LPUSH`/`ZINCRBY`/`ZPOPMIN`/`HSCAN` are single atomic commands rather than array surgery. Values are stored as CBOR.
 
 ## A Redis-compatible data layer
 
-dopdb covers the **redisdb-compatible data structures**, each mapped onto MongoDB:
+dopdb covers the **redisdb-compatible data structures**, and on KVRocks each one is backed by the native Redis type:
 
-| Type | Commands | Backing doc |
+| Type | Commands | Backing key |
 |---|---|---|
-| **Hash** (the core type) | HGet/HSet/HSetNX/HDel/HExists/HGetAll/HKeys/HVals/HLen/HIncrBy/HIncrByFloat/HMSet/HMGet/HScan/HScanNoValues/HRandField | a Mongo collection of documents |
-| **String** | STRGET/STRSET/STRSETALL/STRGETALL/STRDEL (+ TTL) | `{_id, v, expireAt?}` |
-| **List** | LPUSH/RPUSH/LPOP/RPOP/LRANGE/LLEN/LINDEX/LSET/LREM/LTRIM/LINSERTBEFORE/LINSERTAFTER | `{_id, items[]}` |
-| **Set** | SADD/SREM/SMEMBERS/SISMEMBER/SCARD | `{_id, members[]}` |
-| **ZSet** | ZADD/ZREM/ZSCORE/ZCARD/ZCOUNT/ZINCRBY/ZRANGE/ZREVRANGE/ZRANGEBYSCORE/ZREVRANGEBYSCORE/ZRANK/ZREVRANK/ZPOPMIN/ZPOPMAX/ZREMRANGEBYRANK/ZREMRANGEBYSCORE | `{_id, members:[{m,score}]}` |
+| **Hash** (the core type) | HGet/HSet/HSetNX/HDel/HExists/HGetAll/HKeys/HVals/HLen/HIncrBy/HIncrByFloat/HMSet/HMGet/HScan/HScanNoValues/HRandField | one Redis HASH: `<ns>:<coll>`, field = document id, value = the CBOR document |
+| **String** | STRGET/STRSET/STRSETALL/STRGETALL/STRDEL (+ native TTL) | a Redis STRING per key |
+| **List** | LPUSH/RPUSH/LPOP/RPOP/LRANGE/LLEN/LINDEX/LSET/LREM/LTRIM/LINSERTBEFORE/LINSERTAFTER | a Redis LIST per key |
+| **Set** | SADD/SREM/SMEMBERS/SISMEMBER/SCARD | a Redis SET per key |
+| **ZSet** | ZADD/ZREM/ZSCORE/ZCARD/ZCOUNT/ZINCRBY/ZRANGE/ZREVRANGE/ZRANGEBYSCORE/ZREVRANGEBYSCORE/ZRANK/ZREVRANK/ZPOPMIN/ZPOPMAX/ZREMRANGEBYRANK/ZREMRANGEBYSCORE | a Redis ZSET per key |
 
-Every command is verified to behave identically across the Go and TypeScript engines (a cross-implementation conformance harness runs both and diffs them). Blocking ops (`BLPop`/`BRPop`/`BRPopLPush`) are intentionally not implemented — MongoDB has no native blocking, and the subscription need is covered by `watch` (change streams).
+Every command is verified to behave identically across the Go and TypeScript engines (a cross-implementation conformance harness runs both and diffs them). Blocking ops (`BLPop`/`BRPop`/`BRPopLPush`) are intentionally not implemented; the subscription need is covered by `watch`.
+
+## What KVRocks does not give you
+
+Worth knowing before you design a collection, because these are real and not papered over:
+
+- **`FIND` scans.** There is no server-side query language. `FIND`/`COUNT`/`FINDONE` walk the collection hash and evaluate the filter in-process. The filter dialect is unchanged (`$gt`, `$in`, `$regex`, `$elemMatch`, …) — only the cost model is: **O(collection), not O(result)**. Because the query is dopdb's own now, it is also reachable as SQL:
+
+  ```sql
+  SELECT name, age FROM users WHERE age >= 18 ORDER BY age DESC LIMIT 20
+  ```
+
+  Read-only, Hash collections only, no `JOIN` — a front end over the same engine, costing exactly what `FIND` costs. See [`docs/05-sql.md`](./docs/05-sql.md).
+- **Indexes are gone except `unique`.** `unique` is enforced by dopdb itself (a side hash claiming each value; violation → HTTP 409). Ascending/descending/text/geo declarations are accepted and inert.
+- **No per-document TTL.** A Hash collection is one Redis key, so a single document inside it cannot expire on its own. Per-*key* TTL is native for the String family.
+- **`watch` cannot replay.** Change events are dopdb's own pub/sub publication, so no replica set and no server configuration are needed — but a reconnect starts fresh, and only writes made through dopdb are seen.
 
 ## Mental model (one sentence)
 
@@ -55,7 +70,7 @@ Every command is verified to behave identically across the Go and TypeScript eng
           /            \
         Go              TypeScript
    (server, direct      (same server, or a
-    to Mongo)            typed browser client)
+    to KVRocks)          typed browser client)
           \            /
        the same URL wire protocol
        (mix freely: Go server + TS client, or vice versa)
@@ -68,6 +83,10 @@ TypeScript is not a "client SDK" — it's an **equivalent re-implementation** of
 Declare once on the backend (Go):
 
 ```go
+type Note struct {
+    Text string `json:"text"`
+}
+
 notes := dopdb.New[string, *Note](dopdb.WithCollection("notes")).
     HttpOn() // debug: everything on; tighten with an agent once it works
 ```
@@ -83,9 +102,9 @@ The "API layer" in the middle — gone.
 
 ## Good fit / not a fit
 
-**Good fit**: data-driven apps (SaaS, tools, dashboards, CRUD with per-user isolation) that want unified front/back types, no API layer, and MongoDB.
+**Good fit**: data-driven apps (SaaS, tools, dashboards, CRUD with per-user isolation) that want unified front/back types, no API layer, and key-addressed access to a KVRocks/Redis-protocol store.
 
-**Not a fit**: systems centered on complex multi-document transactions / joins; cases that can't accept the "push access to the edge" security model; non-MongoDB backends.
+**Not a fit**: workloads whose read pattern is ad-hoc queries over large collections (every `FIND` is a scan); systems centered on multi-document transactions or joins; cases that can't accept the "push access to the edge" security model; non-Redis-protocol backends.
 
 ## Next
 

@@ -5,8 +5,8 @@
 //
 //   node --import tsx conformance/server.ts
 //
-// Env: PORT, MONGO_URI, MONGO_DB, JWT_SECRET. Prints "DOPDB_TS_READY <port>"
-// once listening, then blocks until killed.
+// Env: PORT, KVROCKS_URI, KVROCKS_NAMESPACE, JWT_SECRET. Prints
+// "DOPDB_TS_READY <port>" once listening, then blocks until killed.
 
 import { serve } from "../src/server.js";
 import { collection, f } from "../src/schema.js";
@@ -26,22 +26,22 @@ const schema = {
     _id: f.string(),
     label: f.string(),
   }).named("items"),
-  // String family (STR*): value in the "v" field, non-scoped.
+  // String family (STR*): a native Redis string per key, non-scoped.
   Strs: collection({
     _id: f.string(),
     v: f.string(),
   }).named("strvals"),
-  // Set family (S*): members array, non-scoped.
+  // Set family (S*): a native Redis set per key, non-scoped.
   Setvals: collection({
     _id: f.string(),
     members: f.string(), // array via wire; not schema-validated for S*
   }).named("setvals"),
-  // List family (L*/R*): items array, non-scoped.
+  // List family (L*/R*): a native Redis list per key, non-scoped.
   Listvals: collection({
     _id: f.string(),
     items: f.string(), // array via wire
   }).named("listvals"),
-  // ZSet family (Z*): members [{m,score}], non-scoped.
+  // ZSet family (Z*): a native Redis sorted set per key, non-scoped.
   Zsetvals: collection({
     _id: f.string(),
     members: f.string(), // array via wire
@@ -50,16 +50,16 @@ const schema = {
 
 async function main(): Promise<void> {
   const port = Number(process.env.PORT);
-  const uri = process.env.MONGO_URI;
-  const db = process.env.MONGO_DB;
+  const uri = process.env.KVROCKS_URI;
+  const namespace = process.env.KVROCKS_NAMESPACE;
   const jwtSecret = process.env.JWT_SECRET;
-  if (!port || !uri || !db || !jwtSecret) {
-    process.stderr.write("conformance/server.ts: PORT, MONGO_URI, MONGO_DB, JWT_SECRET all required\n");
+  if (!port || !uri || !namespace || !jwtSecret) {
+    process.stderr.write("conformance/server.ts: PORT, KVROCKS_URI, KVROCKS_NAMESPACE, JWT_SECRET all required\n");
     process.exit(2);
   }
   const srv = await serve({
     schema,
-    mongo: { uri, db },
+    kvrocks: { uri, namespace },
     jwtSecret,
     port,
     permit: () => true, // behavioral conformance, not the permission gate

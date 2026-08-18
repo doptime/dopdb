@@ -7,14 +7,20 @@ jwt_secret_env = "DOPTIME_JWT_SECRET"    # 持有 HS256 密钥 / RS256 PEM 公�
 cors_origins   = ["https://app.example.com"]
 
 # 至少要有一个 name = "default" 的数据源(框架默认数据源)。
-[[mongo]]
-name    = "default"
-uri_env = "DOPTIME_MONGO_URI"            # 持有连接串的环境变量名(可含账号密码);env 优先
-uri     = "mongodb://localhost:27017"    # 字面回退,仅开发期用;env 未设时才采用
-db      = "appdb"
+#
+# namespace 是 KVRocks 上「数据库」的替代品:KVRocks 走 Redis 协议,没有
+# database-里装-collection 的概念,所以一个数据源的逻辑库就是加在所有键前面的
+# 前缀。若服务端启用了 KVRocks 原生 namespace token,则由 password 选择该
+# namespace,namespace 前缀仍在其内部再做一层切分。
+[[kvrocks]]
+name         = "default"
+uri_env      = "DOPTIME_KVROCKS_URI"        # 持有连接串的环境变量名;env 优先
+uri          = "redis://localhost:6666"     # 字面回退,仅开发期用;env 未设时才采用
+password_env = "DOPTIME_KVROCKS_PASSWORD"   # 持有认证 token 的环境变量名
+namespace    = "appdb"
 
 # 可选:迁移期的第二数据源(WithDB("analytics") 选用)。
-[[mongo]]
-name = "analytics"
-uri  = "mongodb://localhost:27017"
-db   = "analytics"
+[[kvrocks]]
+name      = "analytics"
+uri       = "redis://localhost:6666"
+namespace = "analytics"

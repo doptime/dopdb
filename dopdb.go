@@ -8,15 +8,20 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-
-	"go.mongodb.org/mongo-driver/v2/bson"
 )
 
 // ----------------------------------------------------------------------------
-// Storage is MongoDB, bound directly (no Store/Codec abstraction). Datasources
+// Storage is KVRocks, bound directly (no Store/Codec abstraction). Datasources
 // are registered once at startup via dopdb.SetDatasources(...) / dopdb.Serve(...)
-// — see mongo.go. BSON is the on-disk format; field names come from `bson:"..."`
-// tags (kept equal to the json tags so the HTTP JSON round-trip lines up).
+// — see kvrocks.go. CBOR is the on-disk format; field names come from the
+// `json:"..."` tags, so what is stored and what crosses HTTP carry identical
+// names (the former bson tags had no meaning once Mongo was gone).
+//
+// A Hash collection is ONE Redis hash: field = document id, value = the CBOR
+// document. That is the redisdb layout dopdb grew out of, so HGET/HSET/HDEL/
+// HEXISTS/HLEN/HKEYS/HVALS/HSCAN/HRANDFIELD are the real commands again. The
+// capability that does not survive is server-side querying: Find/Count/FindOne
+// scan the hash and filter in-process (query.go).
 // ----------------------------------------------------------------------------
 
 // ----------------------------------------------------------------------------
@@ -32,7 +37,7 @@ type config struct {
 type Option func(*config)
 
 // WithDB binds this collection to a named datasource from the registry (a config
-// [[mongo]] name). Defaults to the "default" source. Over HTTP, ?ds=<name> can
+// [[kvrocks]] name). Defaults to the "default" source. Over HTTP, ?ds=<name> can
 // select another datasource per request.
 func WithDB(name string) Option { return func(c *config) { c.db = name } }
 
@@ -48,8 +53,8 @@ func WithKey(name string) Option { return WithCollection(name) }
 // ----------------------------------------------------------------------------
 
 // Collection is the typed handle to one document collection: documents of type V
-// keyed by K. It is the dopdb analogue of redisdb's HashKey — a hash of structs
-// IS a keyed document collection, which is exactly what Mongo stores natively.
+// keyed by K. It is the dopdb analogue of redisdb's HashKey — and on KVRocks it
+// is literally that: one Redis hash whose fields are the document ids.
 //
 // V may be a struct or *struct. K may be any comparable type; it is serialized
 // to a single canonical string _id (see serializeKey).
@@ -61,6 +66,7 @@ type Collection[K comparable, V any] struct {
 	vIsPtr     bool
 	vElemType  reflect.Type // underlying struct type when V is struct/*struct
 	pkFieldIdx int          // index of the field whose type is assignable to K, or -1
+	idFieldIdx int          // index of the string field tagged `json:"_id"`, or -1
 
 	idxSpecs []IndexSpec
 	idxMu    sync.Mutex
@@ -101,6 +107,7 @@ func New[K comparable, V any](opts ...Option) *Collection[K, V] {
 	if t.Kind() == reflect.Struct {
 		c.vElemType = t
 		c.pkFieldIdx = primaryKeyFieldIndex(t, reflect.TypeOf((*K)(nil)).Elem())
+		c.idFieldIdx = idFieldIndex(t)
 		c.idxSpecs = indexSpecsFromTags(t) // ensured lazily, once per datasource, on first use
 	}
 	return c
@@ -109,7 +116,7 @@ func New[K comparable, V any](opts ...Option) *Collection[K, V] {
 // backend resolves this collection's datasource backend (ds==""→the collection's
 // bound datasource, itself ""→the registry default) and ensures the declared
 // indexes once per datasource.
-func (c *Collection[K, V]) backend(ds string) *mongoBackend {
+func (c *Collection[K, V]) backend(ds string) *kvBackend {
 	if ds == "" {
 		ds = c.ds
 	}
@@ -118,7 +125,7 @@ func (c *Collection[K, V]) backend(ds string) *mongoBackend {
 	return b
 }
 
-func (c *Collection[K, V]) ensureIndexes(b *mongoBackend, ds string) {
+func (c *Collection[K, V]) ensureIndexes(b *kvBackend, ds string) {
 	if len(c.idxSpecs) == 0 {
 		return
 	}
@@ -168,8 +175,8 @@ func (c *Collection[K, V]) HttpOn(perms ...Perm) *Collection[K, V] {
 // integer kinds use base-10; everything else is JSON-encoded. Using a single
 // codec for both write and read eliminates the redisdb bug where struct keys
 // were written via msgpack but read back via JSON (and the singular/plural
-// decoders disagreed). String/integer ids also avoid the float64 _id hazard the
-// doptime docs warn about.
+// decoders disagreed). The result is the Redis hash FIELD name, so it must be a
+// plain string — which is also why numeric keys are base-10 rather than floats.
 func (c *Collection[K, V]) serializeKey(k K) (string, error) {
 	rv := reflect.ValueOf(k)
 	switch rv.Kind() {
@@ -222,7 +229,7 @@ func (c *Collection[K, V]) encode(v V) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return bson.Marshal(out)
+	return encodeCBOR(out)
 }
 
 func (c *Collection[K, V]) decode(b []byte) (V, error) {
@@ -230,13 +237,39 @@ func (c *Collection[K, V]) decode(b []byte) (V, error) {
 	if c.vIsPtr {
 		// allocate a fresh element so each decoded value is independent
 		pv := reflect.New(c.vElemType)
-		if err := bson.Unmarshal(b, pv.Interface()); err != nil {
+		if err := decodeCBOR(b, pv.Interface()); err != nil {
 			return v, err
 		}
 		return pv.Interface().(V), nil
 	}
-	err := bson.Unmarshal(b, &v)
+	err := decodeCBOR(b, &v)
 	return v, err
+}
+
+// decodeAt decodes a stored document and, when V declares a string field tagged
+// `json:"_id"`, fills it with the document's key.
+//
+// The document id lives in the Redis hash FIELD, not inside the stored value, so
+// nothing would otherwise populate that field. The Mongo build forced `_id` into
+// every document on write; keeping the behaviour on read costs no storage and
+// keeps `_id`-carrying structs round-tripping as they always did.
+func (c *Collection[K, V]) decodeAt(b []byte, id string) (V, error) {
+	v, err := c.decode(b)
+	if err != nil || c.idFieldIdx < 0 {
+		return v, err
+	}
+	rv := reflect.ValueOf(v)
+	for rv.Kind() == reflect.Ptr {
+		if rv.IsNil() {
+			return v, nil
+		}
+		rv = rv.Elem()
+	}
+	f := rv.Field(c.idFieldIdx)
+	if f.CanSet() && f.Kind() == reflect.String {
+		f.SetString(id)
+	}
+	return v, nil
 }
 
 // ---- core methods (redisdb-compatible names) ----
@@ -311,7 +344,7 @@ func (c *Collection[K, V]) HGet(key K) (V, error) {
 	if err != nil {
 		return zero, err // ErrNoDoc propagates
 	}
-	return c.decode(b)
+	return c.decodeAt(b, id)
 }
 
 // HMGet returns values aligned with keys. A missing key yields a zero value.
@@ -334,7 +367,7 @@ func (c *Collection[K, V]) HMGet(keys ...K) ([]V, error) {
 		if b == nil {
 			continue // missing -> zero value
 		}
-		if out[i], err = c.decode(b); err != nil {
+		if out[i], err = c.decodeAt(b, ids[i]); err != nil {
 			return nil, fmt.Errorf("dopdb: decode %s[%s]: %w", c.coll, ids[i], err)
 		}
 	}
@@ -372,7 +405,7 @@ func (c *Collection[K, V]) HGetAll() (map[K]V, error) {
 		if err != nil {
 			return nil, fmt.Errorf("dopdb: bad key %q in %s: %w", id, c.coll, err)
 		}
-		v, err := c.decode(docs[i])
+		v, err := c.decodeAt(docs[i], id)
 		if err != nil {
 			return nil, fmt.Errorf("dopdb: decode %s[%s]: %w", c.coll, id, err)
 		}
@@ -424,13 +457,13 @@ func (c *Collection[K, V]) HKeys() ([]K, error) {
 
 // HVals returns all values.
 func (c *Collection[K, V]) HVals() ([]V, error) {
-	_, docs, err := c.backend("").all(context.Background(), c.coll)
+	ids, docs, err := c.backend("").all(context.Background(), c.coll)
 	if err != nil {
 		return nil, err
 	}
 	out := make([]V, len(docs))
 	for i, b := range docs {
-		if out[i], err = c.decode(b); err != nil {
+		if out[i], err = c.decodeAt(b, ids[i]); err != nil {
 			return nil, err
 		}
 	}
@@ -443,8 +476,9 @@ func (c *Collection[K, V]) HLen() (int64, error) {
 }
 
 // HIncrBy atomically increments a numeric field (dot-path) on key's document,
-// upserting if absent. This is a true atomic $inc — the redisdb `counter`
-// modifier could only do a racy read-modify-write in Go.
+// upserting if absent. A Redis hash field holds a whole document here, so this
+// is a WATCH-guarded read-modify-write rather than one command — still atomic,
+// and still not the racy in-process increment the redisdb `counter` modifier did.
 func (c *Collection[K, V]) HIncrBy(key K, fieldPath string, delta int64) error {
 	id, err := c.serializeKey(key)
 	if err != nil {
@@ -465,21 +499,21 @@ func (c *Collection[K, V]) HIncrByFloat(key K, fieldPath string, delta float64) 
 // ---- the capability the KV model never had ----
 
 // Find runs a field-content query and returns matching values. The filter is
-// passed through SanitizeFilter first; when this path is reached from the HTTP
-// layer the same sanitizer guarantees the frontend cannot smuggle $where /
-// $function / cross-collection $lookup, etc.
+// passed through SanitizeFilter first, then evaluated in-process against every
+// document of the collection (KVRocks cannot query by content). Cost is
+// therefore O(collection); see query.go for what that means in practice.
 func (c *Collection[K, V]) Find(filter M, opt FindOpt) ([]V, error) {
 	safe, err := SanitizeFilter(filter)
 	if err != nil {
 		return nil, err
 	}
-	_, docs, err := c.backend("").find(context.Background(), c.coll, safe, opt)
+	ids, docs, err := c.backend("").find(context.Background(), c.coll, safe, opt)
 	if err != nil {
 		return nil, err
 	}
 	out := make([]V, len(docs))
 	for i, b := range docs {
-		if out[i], err = c.decode(b); err != nil {
+		if out[i], err = c.decodeAt(b, ids[i]); err != nil {
 			return nil, err
 		}
 	}
@@ -524,6 +558,20 @@ func collectionNameByType(t reflect.Type) string {
 	return name
 }
 
+// idFieldIndex finds the string field tagged `json:"_id"`, or -1.
+func idFieldIndex(structT reflect.Type) int {
+	for i := 0; i < structT.NumField(); i++ {
+		f := structT.Field(i)
+		if f.Type.Kind() != reflect.String {
+			continue
+		}
+		if name := strings.Split(f.Tag.Get("json"), ",")[0]; name == "_id" {
+			return i
+		}
+	}
+	return -1
+}
+
 func primaryKeyFieldIndex(structT, keyT reflect.Type) int {
 	if keyT.Kind() == reflect.Ptr {
 		keyT = keyT.Elem()
@@ -538,11 +586,12 @@ func primaryKeyFieldIndex(structT, keyT reflect.Type) int {
 
 // indexSpecsFromTags reads `index:"..."` struct tags into IndexSpecs.
 // Supported values: "1"/"-1" (asc/desc), "text", "2dsphere", "unique"
-// (single-field unique), or combinations like "1,unique".
+// (single-field unique), or combinations like "1,unique". On KVRocks only
+// "unique" has runtime effect — see IndexSpec.
 func indexSpecsFromTags(t reflect.Type) []IndexSpec {
 	var specs []IndexSpec
-	bsonName := func(f reflect.StructField) string {
-		if tag := f.Tag.Get("bson"); tag != "" {
+	fieldName := func(f reflect.StructField) string {
+		if tag := f.Tag.Get("json"); tag != "" {
 			if name := strings.Split(tag, ",")[0]; name != "" && name != "-" {
 				return name
 			}
@@ -555,7 +604,7 @@ func indexSpecsFromTags(t reflect.Type) []IndexSpec {
 		if tag == "" {
 			continue
 		}
-		name := bsonName(f)
+		name := fieldName(f)
 		spec := IndexSpec{Name: name + "_idx"}
 		for _, part := range strings.Split(tag, ",") {
 			switch strings.TrimSpace(part) {
@@ -595,6 +644,7 @@ func (c *Collection[K, V]) keysFromIDs(ids []string) ([]K, error) {
 
 // HRandField returns up to count random field keys (Redis HRANDFIELD). count<=0
 // yields one. Negative-count duplicate semantics are not emulated.
+// This is the native command again — no aggregation $sample stage in between.
 func (c *Collection[K, V]) HRandField(count int) ([]K, error) {
 	ids, err := c.backend("").sample(context.Background(), c.coll, count, nil)
 	if err != nil {
@@ -604,7 +654,9 @@ func (c *Collection[K, V]) HRandField(count int) ([]K, error) {
 }
 
 // HScan paginates field keys with their values (Redis HSCAN). cursor 0 starts
-// iteration; the returned cursor is 0 when complete. match is a Redis glob.
+// iteration; the returned cursor is 0 when complete. match is a Redis glob,
+// applied by the server. As with real HSCAN a page may be short or empty while
+// the cursor is still non-zero — only cursor 0 means "done".
 func (c *Collection[K, V]) HScan(cursor uint64, match string, count int64) ([]K, []V, uint64, error) {
 	ids, docs, next, err := c.backend("").scan(context.Background(), c.coll, match, cursor, count, nil)
 	if err != nil {
@@ -616,7 +668,7 @@ func (c *Collection[K, V]) HScan(cursor uint64, match string, count int64) ([]K,
 	}
 	vals := make([]V, len(docs))
 	for i := range docs {
-		if vals[i], err = c.decode(docs[i]); err != nil {
+		if vals[i], err = c.decodeAt(docs[i], ids[i]); err != nil {
 			return nil, nil, 0, fmt.Errorf("dopdb: decode %s[%s]: %w", c.coll, ids[i], err)
 		}
 	}

@@ -5,7 +5,7 @@
 //
 //   const perms = new Permissions();
 //   perms.grant("HGET", "User").grant("HSET", "User");
-//   serve({ schema, mongo, jwtSecret, permissions: perms });
+//   serve({ schema, kvrocks, jwtSecret });
 
 import { readFile, writeFile } from "node:fs/promises";
 

@@ -8,190 +8,35 @@ import { defineApi, _clearApiRegistry } from "../src/api.js";
 import { serve, type DopdbServer } from "../src/server.js";
 import { clientDb } from "../src/client.js";
 
-// ---- a minimal in-memory Mongo Db (only what exec() touches) -----------------
+// ---- harness -----------------------------------------------------------------
+//
+// The Mongo build could fake its database with ~180 lines of in-memory objects,
+// because every command was a document operation. On KVRocks the commands ARE
+// Redis commands — LPUSH, ZADD, HSCAN, WATCH/MULTI, pub/sub — and a hand-rolled
+// fake of those would be testing the fake, not the engine. So this suite runs
+// against a real server and skips when there is none, exactly like the Go
+// integration tests.
+//
+// The dialect and codec are covered without a server in query.test.ts and
+// codec.test.ts, so `npm test` still has real coverage on a bare checkout.
 
-function matchField(val: unknown, cond: unknown): boolean {
-  if (cond !== null && typeof cond === "object" && !Array.isArray(cond) && !(cond instanceof Date)) {
-    for (const [op, arg] of Object.entries(cond as Record<string, unknown>)) {
-      switch (op) {
-        case "$eq": if (val !== arg) return false; break;
-        case "$ne": if (val === arg) return false; break;
-        case "$gt": if (!((val as number) > (arg as number))) return false; break;
-        case "$gte": if (!((val as number) >= (arg as number))) return false; break;
-        case "$lt": if (!((val as number) < (arg as number))) return false; break;
-        case "$lte": if (!((val as number) <= (arg as number))) return false; break;
-        case "$in": if (!(arg as unknown[]).includes(val)) return false; break;
-        case "$nin": if ((arg as unknown[]).includes(val)) return false; break;
-        default: return false;
-      }
-    }
-    return true;
-  }
-  return val === cond;
-}
+const KV = process.env.DOPDB_TEST_KVROCKS_URI;
+const skip = KV ? false : "set DOPDB_TEST_KVROCKS_URI (e.g. redis://localhost:6666) to run";
 
-function matchDoc(doc: Record<string, unknown>, filter: Record<string, unknown>): boolean {
-  for (const [k, cond] of Object.entries(filter)) {
-    if (k === "$and") {
-      if (!(cond as Record<string, unknown>[]).every((c) => matchDoc(doc, c))) return false;
-    } else if (k === "$or") {
-      if (!(cond as Record<string, unknown>[]).some((c) => matchDoc(doc, c))) return false;
-    } else if (!matchField(doc[k], cond)) {
-      return false;
-    }
-  }
-  return true;
-}
+/** A namespace nobody else is using, dropped after the suite. */
+const NS = `dopdb_ts_test_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
 
-class DupKeyError extends Error {
-  code = 11000;
-}
-
-type ChangeEvent = { operationType: string; documentKey: { _id: string }; fullDocument: Record<string, unknown> | null; _id: { seq: number } };
-
-function fakeCollection() {
-  const store = new Map<string, Record<string, unknown>>();
-  const watchers = new Set<(ev: ChangeEvent) => void>();
-  let seq = 0;
-  const log: ChangeEvent[] = [];
-  const all = () => [...store.values()];
-  const sel = (filter: Record<string, unknown>) => all().filter((d) => matchDoc(d, filter));
-  const emit = (operationType: string, id: string, fullDocument: Record<string, unknown> | null) => {
-    const ev: ChangeEvent = { operationType, documentKey: { _id: id }, fullDocument, _id: { seq: ++seq } };
-    log.push(ev);
-    for (const w of watchers) w(ev);
-  };
-  const cursor = (rows: Record<string, unknown>[]) => {
-    let data = rows.slice();
-    let proj: Record<string, 0 | 1> | null = null;
-    const applyProj = (d: Record<string, unknown>) => {
-      if (!proj) return d;
-      const inc = Object.values(proj).some((v) => v === 1);
-      const out: Record<string, unknown> = {};
-      if (inc) {
-        for (const k of Object.keys(d)) if (proj[k] === 1) out[k] = d[k];
-        if (proj._id !== 0 && "_id" in d) out._id = d._id;
-      } else {
-        for (const k of Object.keys(d)) if (proj[k] !== 0) out[k] = d[k];
-      }
-      return out;
-    };
-    const c: any = {
-      project: (p: Record<string, 0 | 1>) => { proj = p; return c; },
-      sort: () => c,
-      skip: (n: number) => { data = data.slice(n); return c; },
-      limit: (n: number) => { data = data.slice(0, n); return c; },
-      toArray: async () => data.map(applyProj),
-      async *[Symbol.asyncIterator]() { for (const d of data) yield applyProj(d); },
-    };
-    return c;
-  };
-  const put = (filter: Record<string, unknown>, doc: Record<string, unknown>, upsert?: boolean) => {
-    const hit = sel(filter)[0];
-    if (hit) { store.set(String(hit._id), { ...doc }); emit("replace", String(doc._id), { ...doc }); return { matchedCount: 1, upsertedCount: 0 }; }
-    if (upsert) {
-      const id = String(doc._id);
-      if (store.has(id)) throw new DupKeyError(); // filter failed on a non-_id field (e.g. owner)
-      store.set(id, { ...doc });
-      emit("insert", id, { ...doc });
-      return { matchedCount: 0, upsertedCount: 1 };
-    }
-    return { matchedCount: 0, upsertedCount: 0 };
-  };
-  return {
-    async findOne(filter: Record<string, unknown>) { return sel(filter)[0] ?? null; },
-    async insertOne(doc: Record<string, unknown>) {
-      const id = String(doc._id);
-      if (store.has(id)) throw new DupKeyError();
-      store.set(id, { ...doc });
-      emit("insert", id, { ...doc });
-      return { insertedId: id };
-    },
-    async replaceOne(filter: Record<string, unknown>, doc: Record<string, unknown>, opts?: { upsert?: boolean }) {
-      return put(filter, doc, opts?.upsert);
-    },
-    async bulkWrite(ops: { replaceOne: { filter: Record<string, unknown>; replacement: Record<string, unknown>; upsert?: boolean } }[]) {
-      for (const op of ops) put(op.replaceOne.filter, op.replaceOne.replacement, op.replaceOne.upsert);
-      return { ok: 1 };
-    },
-    async updateOne(filter: Record<string, unknown>, update: Record<string, unknown>, opts?: { upsert?: boolean }) {
-      const hit = sel(filter)[0];
-      const inc = (update.$inc ?? {}) as Record<string, number>;
-      if (hit) {
-        for (const [k, n] of Object.entries(inc)) hit[k] = ((hit[k] as number) ?? 0) + n;
-        emit("update", String(hit._id), { ...hit });
-        return { matchedCount: 1, upsertedCount: 0 };
-      }
-      if (opts?.upsert) {
-        const doc: Record<string, unknown> = { _id: filter._id };
-        for (const [k, n] of Object.entries(inc)) doc[k] = n;
-        store.set(String(doc._id), doc);
-        emit("insert", String(doc._id), { ...doc });
-        return { matchedCount: 0, upsertedCount: 1 };
-      }
-      return { matchedCount: 0, upsertedCount: 0 };
-    },
-    async deleteMany(filter: Record<string, unknown>) {
-      const hits = sel(filter);
-      for (const d of hits) { store.delete(String(d._id)); emit("delete", String(d._id), null); }
-      return { deletedCount: hits.length };
-    },
-    async countDocuments(filter: Record<string, unknown>) { return sel(filter).length; },
-    find(filter: Record<string, unknown>) { return cursor(sel(filter)); },
-    async createIndex() { return "ok"; },
-    watch(pipeline: Record<string, any>[], opts?: { resumeAfter?: { seq?: number } }) {
-      // parse an optional { $match: { "fullDocument.<field>": value } } stage
-      let mf: string | undefined;
-      let mv: unknown;
-      for (const stage of pipeline ?? []) {
-        const match = stage?.$match as Record<string, unknown> | undefined;
-        if (match) for (const [k, v] of Object.entries(match)) if (k.startsWith("fullDocument.")) { mf = k.slice("fullDocument.".length); mv = v; }
-      }
-      const queue: ChangeEvent[] = [];
-      let resolveNext: ((r: IteratorResult<ChangeEvent>) => void) | null = null;
-      let closed = false;
-      const push = (ev: ChangeEvent) => {
-        if (mf !== undefined && ev.fullDocument?.[mf] !== mv) return; // owner scope
-        if (resolveNext) { resolveNext({ value: ev, done: false }); resolveNext = null; }
-        else queue.push(ev);
-      };
-      watchers.add(push);
-      // resume: replay log entries after the given token (respecting scope)
-      const resumeSeq = typeof opts?.resumeAfter?.seq === "number" ? opts.resumeAfter.seq : null;
-      if (resumeSeq != null) {
-        for (const ev of log) {
-          if (ev._id.seq <= resumeSeq) continue;
-          if (mf !== undefined && ev.fullDocument?.[mf] !== mv) continue;
-          queue.push(ev);
-        }
-      }
-      const stream: any = {
-        [Symbol.asyncIterator]() { return this; },
-        next(): Promise<IteratorResult<ChangeEvent>> {
-          if (closed) return Promise.resolve({ value: undefined as any, done: true });
-          if (queue.length) return Promise.resolve({ value: queue.shift()!, done: false });
-          return new Promise((r) => { resolveNext = r; });
-        },
-        async close() {
-          closed = true;
-          watchers.delete(push);
-          if (resolveNext) { resolveNext({ value: undefined as any, done: true }); resolveNext = null; }
-        },
-        return() { return this.close().then(() => ({ value: undefined as any, done: true })); },
-      };
-      return stream;
-    },
-  };
-}
-
-function fakeMongo() {
-  const colls = new Map<string, ReturnType<typeof fakeCollection>>();
-  return {
-    collection(name: string) {
-      if (!colls.has(name)) colls.set(name, fakeCollection());
-      return colls.get(name)!;
-    },
-  };
+async function dropNamespace(): Promise<void> {
+  if (!KV) return;
+  const { Redis } = await import("ioredis");
+  const r = new Redis(KV);
+  let cursor = "0";
+  do {
+    const [next, keys] = await r.scan(cursor, "MATCH", `${NS}:*`, "COUNT", 500);
+    cursor = next;
+    if (keys.length > 0) await r.del(...keys);
+  } while (cursor !== "0");
+  await r.quit();
 }
 
 function makeJWT(claims: Record<string, unknown>, secret: string): string {
@@ -214,6 +59,11 @@ const schema = {
   })
     .named("notes")
     .ownerScope("owner"),
+  Uniq: collection({
+    _id: f.string(),
+    email: f.string().unique(),
+    n: f.number(),
+  }).named("uniqs"),
   Profile: collection({
     _id: f.string(),
     name: f.string().title(),
@@ -237,9 +87,10 @@ const tokA = makeJWT({ uid: "alice" }, SECRET);
 const tokB = makeJWT({ uid: "bob" }, SECRET);
 
 before(async () => {
+  if (!KV) return;
   srv = await serve({
     schema,
-    mongo: fakeMongo() as any,
+    kvrocks: { uri: KV, namespace: NS },
     jwtSecret: SECRET,
     permit: () => true, // behavioral suite: exercise data/@-binding/scope, not the gate
     port: 0, // ephemeral
@@ -249,7 +100,8 @@ before(async () => {
 });
 
 after(async () => {
-  await srv.close();
+  if (srv) await srv.close();
+  await dropNamespace();
   greet.remove();
   _clearApiRegistry();
 });
@@ -267,7 +119,7 @@ async function call(method: string, path: string, token?: string, body?: unknown
   return { status: res.status, body: text ? JSON.parse(text) : null };
 }
 
-test("hset fills @-bound owner from the JWT, not the client body", async () => {
+test("hset fills @-bound owner from the JWT, not the client body", { skip }, async () => {
   const r = await call("POST", "/api/hset/notes?f=n1", tokA, { text: "hello", owner: "spoofed" });
   assert.equal(r.status, 200);
   const got = await call("GET", "/api/hget/notes?f=n1", tokA);
@@ -276,31 +128,31 @@ test("hset fills @-bound owner from the JWT, not the client body", async () => {
   assert.equal(got.body.text, "hello");
 });
 
-test("owner-scope: bob cannot read alice's note (404 under his scope)", async () => {
+test("owner-scope: bob cannot read alice's note (404 under his scope)", { skip }, async () => {
   const got = await call("GET", "/api/hget/notes?f=n1", tokB);
   assert.equal(got.status, 404);
 });
 
-test("owner-scope: bob cannot overwrite alice's note (403 via dup key)", async () => {
+test("owner-scope: bob cannot overwrite alice's note (403 via dup key)", { skip }, async () => {
   const r = await call("POST", "/api/hset/notes?f=n1", tokB, { text: "hijack" });
   assert.equal(r.status, 403);
   const still = await call("GET", "/api/hget/notes?f=n1", tokA);
   assert.equal(still.body.text, "hello", "alice's data is intact");
 });
 
-test("hsetnx returns inserted=false on an existing key", async () => {
+test("hsetnx returns inserted=false on an existing key", { skip }, async () => {
   const r = await call("POST", "/api/hsetnx/notes?f=n1", tokA, { text: "again" });
   assert.equal(r.status, 200);
   assert.equal(r.body.inserted, false);
 });
 
-test("validation: empty required text is rejected with 400", async () => {
+test("validation: empty required text is rejected with 400", { skip }, async () => {
   const r = await call("POST", "/api/hset/notes?f=n2", tokA, { text: "" });
   assert.equal(r.status, 400);
   assert.equal(r.body.code, "validation");
 });
 
-test("find is owner-scoped: alice sees her note, bob sees none", async () => {
+test("find is owner-scoped: alice sees her note, bob sees none", { skip }, async () => {
   await call("POST", "/api/hset/notes?f=n3", tokA, { text: "second" });
   const a = await call("POST", "/api/find/notes", tokA, {});
   assert.ok(Array.isArray(a.body) && a.body.length >= 2);
@@ -308,18 +160,18 @@ test("find is owner-scoped: alice sees her note, bob sees none", async () => {
   assert.deepEqual(b.body, []);
 });
 
-test("unauthenticated access to an owner-scoped collection is 401", async () => {
+test("unauthenticated access to an owner-scoped collection is 401", { skip }, async () => {
   const r = await call("GET", "/api/hget/notes?f=n1");
   assert.equal(r.status, 401);
 });
 
-test("/api/<name> runs the endpoint with claims in ctx", async () => {
+test("/api/<name> runs the endpoint with claims in ctx", { skip }, async () => {
   const r = await call("POST", "/api/greet", tokA, { name: "Ada" });
   assert.equal(r.status, 200);
   assert.deepEqual(r.body, { msg: "hi Ada", caller: "alice" });
 });
 
-test("unknown collection is 404", async () => {
+test("unknown collection is 404", { skip }, async () => {
   const r = await call("GET", "/api/hget/ghosts?f=x", tokA);
   assert.equal(r.status, 404);
 });
@@ -335,7 +187,7 @@ async function waitFor(pred: () => boolean, ms = 1500): Promise<void> {
   }
 }
 
-test("hmset writes many keys, owner-filled; hmget reads them aligned to input", async () => {
+test("hmset writes many keys, owner-filled; hmget reads them aligned to input", { skip }, async () => {
   const r = await call("POST", "/api/hmset/notes", tokA, {
     m1: { text: "one" },
     m2: { text: "two" },
@@ -350,12 +202,12 @@ test("hmset writes many keys, owner-filled; hmget reads them aligned to input", 
   assert.equal(got.body[2].text, "two");
 });
 
-test("hmget is owner-scoped: bob cannot read alice's keys", async () => {
+test("hmget is owner-scoped: bob cannot read alice's keys", { skip }, async () => {
   const got = await call("GET", "/api/hmget/notes?f=m1&f=m2", tokB);
   assert.deepEqual(got.body, [null, null]);
 });
 
-test("find projection limits returned fields", async () => {
+test("find projection limits returned fields", { skip }, async () => {
   const p = encodeURIComponent(JSON.stringify({ text: 1, _id: 0 }));
   const r = await call("POST", `/api/find/notes?p=${p}`, tokA, { text: "one" });
   assert.equal(r.status, 200);
@@ -367,7 +219,7 @@ test("find projection limits returned fields", async () => {
   }
 });
 
-test("watch streams live, owner-scoped changes to the client (SSE)", async () => {
+test("watch streams live, owner-scoped changes to the client (SSE)", { skip }, async () => {
   const aliceEvents: any[] = [];
   const db = clientDb(schema, { baseUrl: base, getToken: () => tokA });
   const unsub = await db.Note.watch((e) => aliceEvents.push(e));
@@ -395,7 +247,7 @@ test("watch streams live, owner-scoped changes to the client (SSE)", async () =>
   assert.equal(aliceEvents.length, afterUnsub, "no events after unsubscribe");
 });
 
-test("count is owner-scoped and filterable", async () => {
+test("count is owner-scoped and filterable", { skip }, async () => {
   await call("POST", "/api/hset/notes?f=cnt1", tokA, { text: "countme" });
   const a = await call("POST", "/api/count/notes", tokA, { text: "countme" });
   assert.equal(a.status, 200);
@@ -443,29 +295,35 @@ async function openSSE(path: string, token: string, lastEventId?: string) {
   return { events, get lastId() { return lastId; }, close: () => ctrl.abort() };
 }
 
-test("watch resumes from Last-Event-ID, replaying changes missed while disconnected", async () => {
+// Change events come from Redis pub/sub, which does not replay: a reconnect
+// starts fresh and anything published during the gap is gone. That is strictly
+// weaker than a change-stream resume token, so it is asserted rather than
+// quietly assumed — the server emits no SSE `id:` line at all.
+test("watch does not claim to resume: reconnecting starts fresh", { skip }, async () => {
   const c1 = await openSSE("/api/watch/notes", tokA);
   await sleep(60);
   await call("POST", "/api/hset/notes?f=r1", tokA, { text: "r1" });
   await waitFor(() => c1.events.some((e) => e.data.key === "r1"));
-  const token = c1.lastId!;
-  assert.ok(token, "server emitted a resume token (SSE id)");
+  assert.equal(c1.lastId, undefined, "no resume token is advertised (pub/sub cannot replay)");
   c1.close();
   await sleep(40);
 
-  // change happens while the client is disconnected
+  // change happens while the client is disconnected — it is missed, by design
   await call("POST", "/api/hset/notes?f=r2", tokA, { text: "r2" });
 
-  const c2 = await openSSE("/api/watch/notes", tokA, token);
-  await waitFor(() => c2.events.some((e) => e.data.key === "r2"));
-  assert.ok(c2.events.some((e) => e.data.key === "r2"), "resume replayed the missed change");
-  assert.equal(c2.events.some((e) => e.data.key === "r1"), false, "did not replay before the token");
+  const c2 = await openSSE("/api/watch/notes", tokA);
+  await sleep(120);
+  assert.equal(c2.events.some((e) => e.data.key === "r2"), false, "no replay of the gap");
+
+  // but a change made after reconnecting IS delivered
+  await call("POST", "/api/hset/notes?f=r3", tokA, { text: "r3" });
+  await waitFor(() => c2.events.some((e) => e.data.key === "r3"));
   c2.close();
 });
 
 // ---- @-binding (key tokens, @field, anti-forgery) + new commands ------------
 
-test("@uuid key: server generates the record key; @field + counter + title fire", async () => {
+test("@uuid key: server generates the record key; @field + counter + title fire", { skip }, async () => {
   const r = await call("POST", "/api/hset/profiles?f=@uuid", tokA, { name: "secret agent" });
   assert.equal(r.status, 200);
   const all = await call("GET", "/api/hgetall/profiles", tokA);
@@ -480,7 +338,7 @@ test("@uuid key: server generates the record key; @field + counter + title fire"
   assert.ok(doc.createdAt && doc.updatedAt, "timestamps filled on write");
 });
 
-test("@uid key: read/write your own record by the JWT claim", async () => {
+test("@uid key: read/write your own record by the JWT claim", { skip }, async () => {
   await call("POST", "/api/hset/profiles?f=@uid", tokA, { name: "alice prime" });
   const self = await call("GET", "/api/hget/profiles?f=@uid", tokA);
   assert.equal(self.status, 200);
@@ -490,7 +348,7 @@ test("@uid key: read/write your own record by the JWT claim", async () => {
   assert.equal(bob.status, 404, "@uid resolves to bob → no such record");
 });
 
-test("anti-forgery: client @-keys and bound fields cannot override server context", async () => {
+test("anti-forgery: client @-keys and bound fields cannot override server context", { skip }, async () => {
   await call("POST", "/api/hset/profiles?f=af1", tokA, { name: "x", owner: "root", "@uid": "root" });
   const got = await call("GET", "/api/hget/profiles?f=af1", tokA);
   assert.equal(got.body.owner, "alice", "bound field overwritten by the JWT");
@@ -498,7 +356,7 @@ test("anti-forgery: client @-keys and bound fields cannot override server contex
   assert.equal(got.body.slug, "af1", "@field default since slug was absent");
 });
 
-test("del removes a record", async () => {
+test("del removes a record", { skip }, async () => {
   await call("POST", "/api/hset/profiles?f=del1", tokA, { name: "bye" });
   assert.equal((await call("GET", "/api/hget/profiles?f=del1", tokA)).status, 200);
   const d = await call("POST", "/api/del/profiles?f=del1", tokA, {});
@@ -506,7 +364,7 @@ test("del removes a record", async () => {
   assert.equal((await call("GET", "/api/hget/profiles?f=del1", tokA)).status, 404);
 });
 
-test("hincrbyfloat adds a float to a numeric field", async () => {
+test("hincrbyfloat adds a float to a numeric field", { skip }, async () => {
   await call("POST", "/api/hset/profiles?f=hf1", tokA, { name: "n" }); // hits=1 (counter)
   const r = await call("POST", "/api/hincrbyfloat/profiles?f=hf1&field=hits&n=1.5", tokA, {});
   assert.equal(r.status, 200);
@@ -514,7 +372,7 @@ test("hincrbyfloat adds a float to a numeric field", async () => {
   assert.equal(got.body.hits, 2.5);
 });
 
-test("client.save derives the key from _id", async () => {
+test("client.save derives the key from _id", { skip }, async () => {
   const db = clientDb(schema, { baseUrl: base, getToken: () => tokA });
   await db.Profile.save({ _id: "save1", name: "saved" });
   const got = await call("GET", "/api/hget/profiles?f=save1", tokA);
@@ -525,11 +383,11 @@ test("client.save derives the key from _id", async () => {
 
 // ---- listener property on DopdbServer ----------------------------------------
 
-test("serve returns a DopdbServer with a callable listener", async () => {
+test("serve returns a DopdbServer with a callable listener", { skip }, async () => {
   assert.equal(typeof srv.listener, "function", "listener must be a function");
 });
 
-test("srv.listener can handle a fake HTTP request", async () => {
+test("srv.listener can handle a fake HTTP request", { skip }, async () => {
   const req = {
     method: "GET",
     url: "/api/hget/notes?f=n1",
@@ -549,14 +407,53 @@ test("srv.listener can handle a fake HTTP request", async () => {
   assert.ok(res._body.length > 0, "listener should produce a response body");
 });
 
+// ---- regressions found by the post-migration audit ---------------------------
+//
+// Both of these were engine divergences: Go behaved correctly, TS did not. They
+// are pinned here because neither had a test, which is exactly why they survived
+// the migration unnoticed.
+
+// KVRocks has no unique index, so dopdb raises the violation itself. It must
+// surface as 409/"conflict" like Go's ErrDuplicate — a plain Error would fall
+// through the HTTP error mapper as an opaque 500.
+test("a unique-index violation is 409 conflict, not 500", { skip }, async () => {
+  const first = await call("POST", "/api/hset/uniqs?f=a", tokA, { email: "dup@x.io", n: 0 });
+  assert.equal(first.status, 200);
+
+  const dup = await call("POST", "/api/hset/uniqs?f=b", tokA, { email: "dup@x.io", n: 0 });
+  assert.equal(dup.status, 409, "duplicate must be a conflict");
+  assert.equal(dup.body.code, "conflict");
+
+  // rewriting the SAME document with the same value is not a conflict
+  const same = await call("POST", "/api/hset/uniqs?f=a", tokA, { email: "dup@x.io", n: 1 });
+  assert.equal(same.status, 200);
+});
+
+// hincrby is a WATCH/MULTI read-modify-write. ioredis multiplexes the whole
+// process over one socket, and WATCH is per-CONNECTION state — so without a
+// dedicated, serialised transaction connection the first EXEC clears the watch
+// set and later transactions commit unprotected, silently losing increments.
+// This test failed at 11-15 of 20 before the fix, with zero error responses.
+test("concurrent hincrby loses no increments", { skip }, async () => {
+  await call("POST", "/api/hset/uniqs?f=ctr", tokA, { email: "ctr@x.io", n: 0 });
+  const N = 20;
+  const rs = await Promise.all(
+    Array.from({ length: N }, () => call("POST", "/api/hincrby/uniqs?f=ctr&field=n&n=1", tokA)),
+  );
+  assert.equal(rs.filter((r) => r.status !== 200).length, 0, "no request may fail");
+
+  const got = await call("GET", "/api/hget/uniqs?f=ctr", tokA);
+  assert.equal(got.body.n, N, `expected ${N} increments to land, got ${got.body.n}`);
+});
+
 // ---- httpOn permission gate (Task 2) ----------------------------------------
 // A collection's .httpOn(...) bitmask is the grant; no permit function needed.
-test("httpOn gates data commands without a permit function", async () => {
+test("httpOn gates data commands without a permit function", { skip }, async () => {
   const ronly = collection({ _id: f.string(), text: f.string() }).named("ronly").httpOn(ReadOnly);
   const full = collection({ _id: f.string(), text: f.string() }).named("full").httpOn(); // debug: all on
   const s = await serve({
     schema: { Ronly: ronly, Full: full },
-    mongo: fakeMongo() as any,
+    kvrocks: { uri: KV!, namespace: `${NS}_gate` },
     jwtSecret: SECRET,
     // NO permit / permissions — the httpOn bitmask is the only grant.
     port: 0,

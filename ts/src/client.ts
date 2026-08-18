@@ -136,7 +136,13 @@ export interface DbApi<C> {
   count(filter?: Filter): Promise<number>;
   find(filter?: Filter, opt?: FindOpt): Promise<Infer<C>[]>;
   findone(filter?: Filter): Promise<Infer<C> | null>;
-  /** Subscribe to live changes (point 5: Mongo change streams). Owner-scoped on
+  /** Run a SELECT against this collection. The FROM clause must name it.
+   * Read-only, Hash-only, and compiled to the same engine `find` uses — see
+   * docs/05-sql.md for the supported grammar. */
+  sql(statement: string): Promise<Infer<C>[]>;
+  /** Run a SELECT COUNT(*) and return the number of matching rows. */
+  sqlCount(statement: string): Promise<number>;
+  /** Subscribe to live changes (server-side pub/sub channel). Owner-scoped on
    * the server. Returns an unsubscribe function. */
   watch(onEvent: WatchHandler<Infer<C>>, opts?: WatchOptions): Promise<Unsubscribe>;
   /** alias of hget */
@@ -261,6 +267,9 @@ function makeDbApi<C extends Collection<any>>(key: string, c: C, o: ReturnType<t
       if (opt.projection) params.p = JSON.stringify(opt.projection);
       return (await postJSON("find", q(params), filter)) as Infer<C>[];
     },
+    sql: async (statement: string) => (await postJSON("sql", "", { sql: statement })) as Infer<C>[],
+    sqlCount: async (statement: string) =>
+      ((await postJSON("sql", "", { sql: statement })) as { count?: number }).count ?? 0,
     findone: async (filter = {}) => {
       sanitizeFilter(filter);
       try {

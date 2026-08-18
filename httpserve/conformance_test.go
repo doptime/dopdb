@@ -2,7 +2,6 @@ package httpserve
 
 import (
 	"bufio"
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -18,9 +17,7 @@ import (
 	"time"
 
 	"github.com/doptime/dopdb"
-
-	"go.mongodb.org/mongo-driver/v2/mongo"
-	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"github.com/redis/go-redis/v9"
 )
 
 // M5 Go↔TS conformance: send identical HTTP requests to a Go server and a TS
@@ -28,17 +25,18 @@ import (
 // shape. This is the REAL cross-engine verification — not a Go-only or
 // TS-only test dressed up as conformance (the R2/R5/R7 facade).
 //
-// Skips unless DOPDB_TEST_MONGO_URI is set (needs a real Mongo; the data paths
-// exercise hsetnx dup-key and owner-scope, which are meaningless without it).
+// Skips unless DOPDB_TEST_KVROCKS_URI is set (needs a real server; the data
+// paths exercise scoped writes and owner-scope, which are meaningless without
+// one).
 
 // confDoc mirrors ts/conformance/server.ts Notes: owner is @-bound.
 type confDoc struct {
-	Text  string `json:"text" bson:"text"`
-	Owner string `json:"owner" bson:"owner"`
+	Text  string `json:"text"`
+	Owner string `json:"owner"`
 }
 
 type confItem struct {
-	Label string `json:"label" bson:"label"`
+	Label string `json:"label"`
 }
 
 // tsConformance holds the two server URLs + cleanup.
@@ -47,31 +45,25 @@ type tsConformance struct {
 	tsBase string // TS subprocess server URL
 	tsCmd  *exec.Cmd
 	goSrv  *httptest.Server
-	cl     *mongo.Client
-	goDB   string
-	tsDB   string
+	cl     *redis.Client
+	goNS   string
+	tsNS   string
 }
 
 func setupConformance(t *testing.T) *tsConformance {
 	t.Helper()
-	uri := os.Getenv("DOPDB_TEST_MONGO_URI")
+	uri := os.Getenv("DOPDB_TEST_KVROCKS_URI")
 	if uri == "" {
-		t.Skip("set DOPDB_TEST_MONGO_URI (replica set) to run Go↔TS conformance")
+		t.Skip("set DOPDB_TEST_KVROCKS_URI (e.g. redis://localhost:6666) to run Go↔TS conformance")
 	}
-	cl, err := mongo.Connect(options.Client().ApplyURI(uri))
-	if err != nil {
-		t.Fatalf("mongo connect: %v", err)
-	}
-	if err := cl.Ping(context.Background(), nil); err != nil {
-		t.Fatalf("mongo ping: %v", err)
-	}
+	cl := kvOrSkip(t)
 	stamp := time.Now().UnixNano()
-	goDB := fmt.Sprintf("dopdb_conf_go_%d", stamp)
-	tsDB := fmt.Sprintf("dopdb_conf_ts_%d", stamp)
+	goNS := fmt.Sprintf("dopdb_conf_go_%d", stamp)
+	tsNS := fmt.Sprintf("dopdb_conf_ts_%d", stamp)
 
 	// --- Go server (in-process) ---
 	ds := dopdb.NewDatasources()
-	ds.Add("default", cl.Database(goDB))
+	ds.Add("default", cl, goNS)
 	dopdb.SetDatasources(ds)
 	// Mirror the TS schema: notes (scoped) + items (plain).
 	dopdb.RegisterHttp(dopdb.New[string, confDoc](dopdb.WithCollection("notes")))
@@ -84,7 +76,7 @@ func setupConformance(t *testing.T) *tsConformance {
 	perms := NewPermissions()
 	for _, c := range []string{
 		"HGET", "HSET", "HSETNX", "HDEL", "HEXISTS", "FIND", "HKEYS", "HLEN",
-		"HSCAN", "HSCANNOVALUES", "HRANDFIELD",
+		"HSCAN", "HSCANNOVALUES", "HRANDFIELD", "SQL",
 	} {
 		perms.Grant(c, "notes")
 		perms.Grant(c, "items")
@@ -112,8 +104,8 @@ func setupConformance(t *testing.T) *tsConformance {
 	cmd.Dir = tsDir
 	cmd.Env = append(os.Environ(),
 		"PORT="+fmt.Sprint(tsPort),
-		"MONGO_URI="+uri,
-		"MONGO_DB="+tsDB,
+		"KVROCKS_URI="+uri,
+		"KVROCKS_NAMESPACE="+tsNS,
 		"JWT_SECRET="+testSecret,
 	)
 	stdout, err := cmd.StdoutPipe()
@@ -153,8 +145,8 @@ func setupConformance(t *testing.T) *tsConformance {
 		tsCmd:  cmd,
 		goSrv:  goSrv,
 		cl:     cl,
-		goDB:   goDB,
-		tsDB:   tsDB,
+		goNS:   goNS,
+		tsNS:   tsNS,
 	}
 }
 
@@ -167,9 +159,9 @@ func (c *tsConformance) close() {
 		c.goSrv.Close()
 	}
 	if c.cl != nil {
-		_ = c.cl.Database(c.goDB).Drop(context.Background())
-		_ = c.cl.Database(c.tsDB).Drop(context.Background())
-		_ = c.cl.Disconnect(context.Background())
+		dropNS(c.cl, c.goNS)
+		dropNS(c.cl, c.tsNS)
+		_ = c.cl.Close()
 	}
 	dopdb.SetDatasources(nil)
 }
@@ -1069,4 +1061,79 @@ func samePop(a, b any) bool {
 		}
 	}
 	return true
+}
+
+// TestConformanceSQL: the SQL front end must compile to the same answer on both
+// engines — including the parts that are easy to get subtly different (ORDER BY
+// direction, LIKE escaping, COUNT(*), owner scope, and the rejection of the
+// statements dopdb does not implement).
+func TestConformanceSQL(t *testing.T) {
+	c := setupConformance(t)
+	defer c.close()
+	tok := tokenFor(t, "alice")
+
+	// seed identical rows into both engines
+	for i, label := range []string{"alpha", "beta", "gamma"} {
+		body := fmt.Sprintf(`{"label":%q}`, label)
+		for _, base := range []string{c.goBase, c.tsBase} {
+			if st, _ := httpCall(t, base, "POST", fmt.Sprintf("/api/hset/items?f=s%d", i), tok, body); st != 200 {
+				t.Fatalf("seed %s: %d", base, st)
+			}
+		}
+	}
+
+	same := func(label, method, path, body string) {
+		t.Helper()
+		gs, gb := httpCall(t, c.goBase, method, path, tok, body)
+		ts, tb := httpCall(t, c.tsBase, method, path, tok, body)
+		assertSame(t, label, gs, gb, ts, tb)
+	}
+
+	// ordered result sets must match element for element
+	ordered := func(label, sql string, want []string) {
+		t.Helper()
+		_, gb := httpCall(t, c.goBase, "POST", "/api/sql/items", tok, sql)
+		_, tb := httpCall(t, c.tsBase, "POST", "/api/sql/items", tok, sql)
+		g, ts := labelsOf(gb), labelsOf(tb)
+		if !sliceEq(g, ts) {
+			t.Errorf("%s: Go=%v TS=%v", label, g, ts)
+		}
+		if !sliceEq(g, want) {
+			t.Errorf("%s: got %v want %v", label, g, want)
+		}
+	}
+
+	ordered("order asc", "SELECT * FROM items ORDER BY label ASC", []string{"alpha", "beta", "gamma"})
+	ordered("order desc", "SELECT * FROM items ORDER BY label DESC", []string{"gamma", "beta", "alpha"})
+	ordered("where like", "SELECT * FROM items WHERE label LIKE 'a%'", []string{"alpha"})
+	ordered("where in", "SELECT * FROM items WHERE label IN ('beta','gamma') ORDER BY label ASC", []string{"beta", "gamma"})
+	ordered("limit+offset", "SELECT * FROM items ORDER BY label ASC LIMIT 1 OFFSET 1", []string{"beta"})
+	ordered("not", "SELECT * FROM items WHERE NOT label = 'beta' ORDER BY label ASC", []string{"alpha", "gamma"})
+
+	// COUNT(*) shape
+	same("count", "POST", "/api/sql/items", "SELECT COUNT(*) FROM items")
+	same("count where", "POST", "/api/sql/items", "SELECT COUNT(*) FROM items WHERE label LIKE 'g%'")
+
+	// rejections must agree on status AND error code, not just on failing
+	same("reject delete", "POST", "/api/sql/items", "DELETE FROM items")
+	same("reject join", "POST", "/api/sql/items", "SELECT * FROM items JOIN notes ON 1 = 1")
+	same("reject group by", "POST", "/api/sql/items", "SELECT * FROM items GROUP BY label")
+	same("reject alias", "POST", "/api/sql/items", "SELECT label AS l FROM items")
+	same("reject foreign table", "POST", "/api/sql/items", "SELECT * FROM notes")
+	same("reject syntax", "POST", "/api/sql/items", "SELECT * FROM")
+	same("reject = NULL", "POST", "/api/sql/items", "SELECT * FROM items WHERE label = NULL")
+	same("reject empty", "POST", "/api/sql/items", "")
+}
+
+// labelsOf pulls the `label` column out of a SQL result set.
+func labelsOf(body any) []string {
+	arr, _ := body.([]any)
+	out := make([]string, 0, len(arr))
+	for _, e := range arr {
+		if m, ok := e.(map[string]any); ok {
+			s, _ := m["label"].(string)
+			out = append(out, s)
+		}
+	}
+	return out
 }

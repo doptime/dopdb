@@ -1,11 +1,11 @@
 # 04 · TypeScript equivalent (Next.js takeover · browser client · standalone Node · functional API)
 
-`ts/` is a **peer, complete implementation** of Go (not a client, not a WASM bridge). Same wire protocol, same command vocabulary, same `@`-binding / row-level isolation / permission model. **Using TS is entirely independent of Go**: it forwards to no Go backend; everything Go does on Mongo, TS does itself.
+`ts/` is a **peer, complete implementation** of Go (not a client, not a WASM bridge). Same wire protocol, same command vocabulary, same `@`-binding / row-level isolation / permission model. **Using TS is entirely independent of Go**: it forwards to no Go backend; everything Go does on KVRocks, TS does itself. `src/kvrocks.ts`, `src/codec.ts` and `src/query.ts` are deliberate twins of the identically named Go files — same key layout, same CBOR value format, same filter dialect.
 
 Entry points (`package.json` exports):
-- `dopdb` — the shared schema (`collection`, `f`, `Infer`, the `Perm` constants); pulls in no node/mongodb, browser-safe.
+- `dopdb` — the shared schema (`collection`, `f`, `Infer`, the `Perm` constants); pulls in no node builtins and no redis client, browser-safe.
 - `dopdb/client` — the browser `fetch` client (`clientDb`, `apiClient`).
-- `dopdb/server` — the Node + MongoDB server (`createNextHandler`, `serve`, `serveFromConfig`, `serverDb`, `defineApi`).
+- `dopdb/server` — the Node + KVRocks server (`createNextHandler`, `serve`, `serveFromConfig`, `serverDb`, `defineApi`).
 
 ## One schema across all surfaces
 
@@ -39,19 +39,19 @@ import { schema } from "@/dopdb-schema";  // collections declare .httpOn(...) th
 
 export const { GET, POST, OPTIONS } = createNextHandler({
   schema,
-  mongo: { uri: process.env.MONGO_URI!, db: "appdb" },   // or datasources: [...]
+  kvrocks: { uri: process.env.KVROCKS_URI!, namespace: "appdb" },   // or datasources: [...]
   jwtSecret: process.env.JWT_SECRET!,                     // HS256 secret or RS256 PEM public key
 });
 
-export const runtime = "nodejs"; // the MongoDB driver is not Edge-compatible
+export const runtime = "nodejs"; // the redis client is not Edge-compatible
 ```
 
 Key points:
 - **Takeover is immediate**: `GET/POST/OPTIONS` handle `/api/hget/users`, `/api/find/orders`, `/api/<fn-name>`, etc.
 - **Prefix is configurable**: the handler reads Next.js's catch-all segment (the part after the mount point), so the prefix is whatever folder you place it in — rename `app/api/[...slug]` to `app/db/[...slug]` for `/db/*`, **no code change**; set the client's `apiBase: "/db"` to match.
-- **Lazy connect**: Mongo connects on the first request and is reused; the CORS preflight (OPTIONS) does not touch the DB.
+- **Lazy connect**: KVRocks connects on the first request and is reused; the CORS preflight (OPTIONS) does not touch the DB.
 - **watch (SSE)**: `GET /api/watch/<coll>` returns `text/event-stream`, pushed via `ReadableStream` (needs a replica set).
-- Multiple sources: replace `mongo` with `datasources: [{ name, mongo }, ...]`; select per request with `?ds=`.
+- Multiple sources: replace `kvrocks` with `datasources: [{ name, kvrocks }, ...]`; select per request with `?ds=`.
 - From a config file: `nextHandlerFromConfig("config.toml", { schema })`.
 
 Pages Router: use the standalone Node `listener` (next section): `export default (req, res) => srv.listener(req, res)`.
@@ -60,13 +60,13 @@ Pages Router: use the standalone Node `listener` (next section): `export default
 
 ```ts
 import { serve, serverDb } from "@kequnyang/dopdb/server";
-const srv = await serve({ schema, mongo: { uri, db: "appdb" }, jwtSecret, port: 8080 });
+const srv = await serve({ schema, kvrocks: { uri, namespace: "appdb" }, jwtSecret, port: 8080 });
 // multiple sources:
 //   await serve({ schema, jwtSecret, port: 8080,
-//     datasources: [{ name:"default", mongo:{uri,db:"appdb"} }, { name:"analytics", mongo:{uri,db:"analytics"} }] });
+//     datasources: [{ name:"default", kvrocks:{uri,namespace:"appdb"} }, { name:"analytics", kvrocks:{uri,namespace:"analytics"} }] });
 ```
 
-For trusted internal reads/writes (no scope/JWT): `const db = serverDb(schema, mongoDb); await db.users.hget("u1")`. `srv.listener` also plugs into a Pages Router API route.
+For trusted internal reads/writes (no scope/JWT): `const db = serverDb(schema, backend); await db.users.hget("u1")`. `srv.listener` also plugs into a Pages Router API route.
 
 ### Permissions
 

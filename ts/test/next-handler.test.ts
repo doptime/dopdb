@@ -7,16 +7,16 @@ import { collection, f } from "../src/schema.js";
 const schema = { users: collection({ name: f.string() }).named("users") };
 
 test("createNextHandler exposes GET/POST/OPTIONS", () => {
-  const h = createNextHandler({ schema, mongo: { uri: "mongodb://127.0.0.1:1/x", db: "x" }, jwtSecret: "s" });
+  const h = createNextHandler({ schema, kvrocks: { uri: "redis://127.0.0.1:1", namespace: "x" }, jwtSecret: "s" });
   assert.equal(typeof h.GET, "function");
   assert.equal(typeof h.POST, "function");
   assert.equal(typeof h.OPTIONS, "function");
 });
 
-test("OPTIONS preflight returns 204 without dialing Mongo", async () => {
+test("OPTIONS preflight returns 204 without dialing KVRocks", async () => {
   const h = createNextHandler({
     schema,
-    mongo: { uri: "mongodb://127.0.0.1:1/x", db: "x" }, // unreachable; must NOT be connected
+    kvrocks: { uri: "redis://127.0.0.1:1", namespace: "x" }, // unreachable; must NOT be connected
     jwtSecret: "s",
     cors: ["*"],
   });

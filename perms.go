@@ -72,12 +72,15 @@ const (
 	ZPopMax
 	ZRemRangeByRank
 	ZRemRangeByScore
+	// SQL is appended, never inserted: the bit values are persisted by
+	// Permissions.SaveJSON, so renumbering would silently re-grant commands.
+	SQL
 )
 
 // Convenience groups.
 const (
 	// ReadOnly = every non-mutating command.
-	ReadOnly Perm = HGet | HExists | HGetAll | HKeys | HVals | HLen | HMGet | Count | Find | FindOne | Watch | HScan | HScanNoValues | HRandField | StrGet | StrGetAll | SMembers | SIsMember | SCard | LRange | LLen | LIndex | ZScore | ZCard | ZCount | ZRange | ZRevRange | ZRangeByScore | ZRevRangeByScore | ZRank | ZRevRank
+	ReadOnly Perm = HGet | HExists | HGetAll | HKeys | HVals | HLen | HMGet | Count | Find | FindOne | Watch | SQL | HScan | HScanNoValues | HRandField | StrGet | StrGetAll | SMembers | SIsMember | SCard | LRange | LLen | LIndex | ZScore | ZCard | ZCount | ZRange | ZRevRange | ZRangeByScore | ZRevRangeByScore | ZRank | ZRevRank
 	// Writes = every mutating command.
 	Writes Perm = HSet | HSetNX | HDel | Del | HIncrBy | HIncrByFloat | HMSet | StrSet | StrSetAll | StrDel | SAdd | SRem | LPush | RPush | LPop | RPop | LSet | LRem | LTrim | LInsertBefore | LInsertAfter | ZAdd | ZRem | ZIncrBy | ZPopMin | ZPopMax | ZRemRangeByRank | ZRemRangeByScore
 	// All = everything. This is the HttpOn() debug default.
@@ -92,7 +95,7 @@ var cmdPerm = map[string]Perm{
 	"HEXISTS": HExists, "HGETALL": HGetAll, "HKEYS": HKeys, "HVALS": HVals,
 	"HLEN": HLen, "HINCRBY": HIncrBy, "HINCRBYFLOAT": HIncrByFloat,
 	"HMSET": HMSet, "HMGET": HMGet, "COUNT": Count, "FIND": Find,
-	"FINDONE": FindOne, "WATCH": Watch,
+	"FINDONE": FindOne, "WATCH": Watch, "SQL": SQL,
 	"HSCAN": HScan, "HSCANNOVALUES": HScanNoValues, "HRANDFIELD": HRandField,
 	"STRGET": StrGet, "STRSET": StrSet, "STRSETALL": StrSetAll, "STRGETALL": StrGetAll, "STRDEL": StrDel,
 	"SADD": SAdd, "SREM": SRem, "SMEMBERS": SMembers, "SISMEMBER": SIsMember, "SCARD": SCard,
@@ -165,7 +168,7 @@ func HttpPermNames(p Perm) []string {
 		{HExists, "hexists"}, {HGetAll, "hgetall"}, {HKeys, "hkeys"}, {HVals, "hvals"},
 		{HLen, "hlen"}, {HIncrBy, "hincrby"}, {HIncrByFloat, "hincrbyfloat"},
 		{HMSet, "hmset"}, {HMGet, "hmget"}, {Count, "count"}, {Find, "find"},
-		{FindOne, "findone"}, {Watch, "watch"},
+		{FindOne, "findone"}, {Watch, "watch"}, {SQL, "sql"},
 		{HScan, "hscan"}, {HScanNoValues, "hscannovalues"}, {HRandField, "hrandfield"},
 		{StrGet, "strget"}, {StrSet, "strset"}, {StrSetAll, "strsetall"}, {StrGetAll, "strgetall"}, {StrDel, "strdel"}, {SAdd, "sadd"}, {SRem, "srem"}, {SMembers, "smembers"}, {SIsMember, "sismember"}, {SCard, "scard"}, {LPush, "lpush"}, {RPush, "rpush"}, {LPop, "lpop"}, {RPop, "rpop"}, {LRange, "lrange"}, {LLen, "llen"}, {LIndex, "lindex"}, {LSet, "lset"}, {LRem, "lrem"}, {LTrim, "ltrim"}, {LInsertBefore, "linsertbefore"}, {LInsertAfter, "linsertafter"}, {ZAdd, "zadd"}, {ZRem, "zrem"}, {ZScore, "zscore"}, {ZCard, "zcard"}, {ZCount, "zcount"}, {ZIncrBy, "zincrby"}, {ZRange, "zrange"}, {ZRevRange, "zrevrange"}, {ZRangeByScore, "zrangebyscore"}, {ZRevRangeByScore, "zrevrangebyscore"}, {ZRank, "zrank"}, {ZRevRank, "zrevrank"}, {ZPopMin, "zpopmin"}, {ZPopMax, "zpopmax"}, {ZRemRangeByRank, "zremrangebyrank"}, {ZRemRangeByScore, "zremrangebyscore"},
 	}

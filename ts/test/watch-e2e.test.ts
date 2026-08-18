@@ -4,7 +4,8 @@ import { createHmac } from "node:crypto";
 import { f, collection } from "../src/schema.js";
 import { serve } from "../src/server.js";
 import type { DopdbServer } from "../src/server.js";
-// M3 TS watch E2E against real MongoDB replica set.
+// TS watch E2E against a real KVRocks. Events come from dopdb's own pub/sub
+// channel, not a change stream.
 // Verifies: insert/update push, scoped delete no-delivery (I-WA2).
 
 const schema = {
@@ -32,12 +33,13 @@ function portOf(srv: DopdbServer): number {
 	throw new Error("server not listening");
 }
 
-const MONGO = process.env.DOPDB_TEST_MONGO_URI;
+const KV = process.env.DOPDB_TEST_KVROCKS_URI;
+const NS = `dopdb_watch_ts_${Date.now()}`;
 
-test("TS watch: insert and update events are pushed", { skip: MONGO ? false : "set DOPDB_TEST_MONGO_URI (replica set) to run" }, async () => {
+test("TS watch: insert and update events are pushed", { skip: KV ? false : "set DOPDB_TEST_KVROCKS_URI to run" }, async () => {
 	const srv = await serve({
 		schema,
-		mongo: { uri: MONGO!, db: "dopdb_watch_ts" },
+		kvrocks: { uri: KV!, namespace: NS },
 		jwtSecret: SECRET,
 		permit: () => true,
 		port: 0,

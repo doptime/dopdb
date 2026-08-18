@@ -6,7 +6,9 @@ Terse, full-coverage usage reference. For an AI coding agent or an experienced d
 1. **One schema, two equivalent engines**: the same schema drives both Go and TypeScript as **complete equivalent implementations** (same URL wire protocol, same command vocabulary, same `@`-binding / isolation / permission model). Mix freely (Go server + TS client, or vice versa).
 2. **The frontend talks to data, no API layer**: the frontend writes no fetch code — it calls "database methods" (`db.coll.hget(...)`), and the framework does auth / isolation / routing. Reach for functional APIs only for complex logic.
 3. **String keys only**: keys are always strings. Integer keys are forbidden (JS large-integer precision loss). Convert all IDs to strings.
-4. **Direct to Mongo**: the root package uses `go.mongodb.org/mongo-driver/v2` directly — no Store abstraction. `$inc`, change streams, unique indexes, `2dsphere` all available.
+4. **Direct to KVRocks**: the root package speaks the Redis protocol directly (`github.com/redis/go-redis/v9`) — no Store abstraction. A Hash collection is one Redis hash; String/List/Set/ZSet are the native types, so their commands are single atomic commands. Values are CBOR (`github.com/fxamacker/cbor/v2`), field names from the `json` tags.
+7. **SQL is available, read-only and Hash-only**: `SELECT ... FROM <coll> WHERE ... ORDER BY ... LIMIT ...` over a Hash collection, as a front end to the same query engine (`docs/05-sql.md`). No JOIN, no GROUP BY, no writes. It costs what FIND costs.
+8. **Know what the store cannot do**: `FIND`/`COUNT`/`FINDONE` scan the collection and filter in-process — O(collection), not O(result). The only enforceable index is `unique`. There is no per-document TTL. `watch` cannot replay. Design against these, do not discover them in production.
 5. **Closed command vocabulary**: only the commands listed in §3 exist; anything else is a 400.
 6. **`@`-binding**: the server injects `@`-prefixed context (user, request info, target metadata); any `@`-key sent by the client is stripped (anti-forgery).
 
@@ -14,17 +16,31 @@ Terse, full-coverage usage reference. For an AI coding agent or an experienced d
 
 ## 1. Infrastructure & Config
 
-**DB**: MongoDB (watch needs a replica set). **Config**: `config.toml` (local) or `CONFIG_URL` (prod). **Multiple data sources**: define several `[[mongo]]`; pick per-request with `?ds=<name>`, default `default`. The data source is **not** in the path.
+**DB**: KVRocks (any Redis-protocol server works; no replica set, no `notify-keyspace-events`). **Config**: `config.toml` (local) or `CONFIG_URL` (prod). **Multiple data sources**: define several `[[kvrocks]]`; pick per-request with `?ds=<name>`, default `default`. The data source is **not** in the path.
+
+`namespace` is the KVRocks stand-in for a database name: it is a **key prefix** applied to every key the datasource writes, because Redis has no databases-containing-collections.
 
 ```toml
-[[mongo]]
-  Name = "default"
-  URI  = "mongodb://127.0.0.1:27017/?replicaSet=rs0"
-  DB   = "app"
+[[kvrocks]]
+  name         = "default"
+  uri_env      = "DOPTIME_KVROCKS_URI"        # env wins over the literal below
+  uri          = "redis://127.0.0.1:6666"
+  password_env = "DOPTIME_KVROCKS_PASSWORD"   # KVRocks namespace token, if used
+  namespace    = "app"
 [http]
-  Port        = 8080
-  JWTSecret   = "..."          # HS256 secret; RS256 uses a PEM/SPKI public key
-  CORSOrigins = ["https://app.example.com"]
+  addr           = ":8080"
+  jwt_secret_env = "DOPTIME_JWT_SECRET"       # HS256 secret; RS256 uses a PEM/SPKI public key
+  cors_origins   = ["https://app.example.com"]
+```
+
+**Key layout** (worth knowing when you inspect the store by hand):
+
+```
+<ns>:<coll>                  HASH   Hash collection: field = document id, value = CBOR document
+<ns>:<coll>:<key>            native STRING / LIST / SET / ZSET
+<ns>:<coll>:__owner          HASH   row isolation for the non-Hash types
+<ns>:<coll>:__uniq:<field>   HASH   unique-index claims
+<ns>:<coll>:__events         channel for watch
 ```
 
 ---
@@ -64,7 +80,7 @@ Terse, full-coverage usage reference. For an AI coding agent or an experienced d
 ### ZSet (`{_id, members:[{m,score}]}`)
 `zadd` `zrem` `zscore` `zcard` `zcount` `zincrby` `zrange` `zrevrange` `zrangebyscore` `zrevrangebyscore` `zrank` `zrevrank` `zpopmin` `zpopmax` `zremrangebyrank` `zremrangebyscore`. Range/score params via query: `?start=&stop=`, `?min=&max=`, `?count=`, `?withscores=1`.
 
-> Every command above is covered by the Go↔TS conformance harness (both engines, same Mongo, per-command diff). Naming avoids collisions: String uses the `STR*` prefix so it never clashes with Set's `S*`.
+> Every command above is covered by the Go↔TS conformance harness (both engines, one server, separate namespaces, per-command diff). Naming avoids collisions: String uses the `STR*` prefix so it never clashes with Set's `S*`.
 
 ---
 
@@ -78,13 +94,14 @@ Terse, full-coverage usage reference. For an AI coding agent or an experienced d
 import "github.com/doptime/dopdb"
 
 type Note struct {
-    ID    string `json:"id"   bson:"_id"`            // _id is the key (string)
-    Owner string `json:"owner" bson:"owner"`          // owner field (for owner-scope)
-    Text  string `json:"text"  bson:"text" validate:"required"`
+    ID    string `json:"id"`                          // the key (string)
+    Owner string `json:"owner"`                       // owner field (for owner-scope)
+    Text  string `json:"text" validate:"required"`
 }
 
 // Factory: New[K, V](opts...). K = key type (string), V = value type (pointer or value).
-// json tags == bson tags (the HTTP body is JSON-round-tripped into V).
+// json tags name the stored CBOR fields too — one set of names end to end.
+// (bson tags are gone: they meant nothing once the store stopped being Mongo.)
 var Notes = dopdb.New[string, *Note](
     dopdb.WithCollection("notes"),   // collection name (else derived from V's type name)
     dopdb.WithDB("default"),          // specify only for a non-default data source
@@ -108,7 +125,7 @@ Notes.HttpOn(dopdb.HashAll)                        // = All, doptime-compatible 
 
 ### 4.3 The redisdb-compatible data structures (String / List / Set / ZSet)
 
-Each is a first-class Go type backed by its own Mongo collection, registered + authorized via `HttpOn`, and reached over the **wire commands** in §3:
+Each is a first-class Go type backed by the **native Redis type**, registered + authorized via `HttpOn`, and reached over the **wire commands** in §3:
 
 ```go
 cfg  := dopdb.NewString[string](dopdb.WithCollection("cfg")).HttpOn()   // STR* commands
@@ -117,10 +134,11 @@ tags := dopdb.NewSet[string](dopdb.WithCollection("tags")).HttpOn()      // S* c
 board := dopdb.NewZSet[string](dopdb.WithCollection("board")).HttpOn()    // Z* commands
 ```
 
-- Doc shapes: String `{_id,v,expireAt?}`, List `{_id,items[]}`, Set `{_id,members[]}`, ZSet `{_id,members:[{m,score}]}`.
-- **Owner-scope** applies identically: the owner lives at the document top level and the gate ANDs `{_id, owner}` (see §4.5).
-- These types currently expose the **HTTP command layer** (handlers `HttpStrGet`, `HttpSAdd`, `HttpLPush`, `HttpZAdd`, …) and are reached via the §3 wire commands; the Hash family additionally has native non-HTTP Go methods.
-- **TTL**: `NewString(...).EnsureTTL(ctx, ds)` builds the TTL index; `strset` with an expiration sets `expireAt` (§7).
+- Storage: one native Redis key per entry at `<ns>:<coll>:<key>`. Values/elements/members are CBOR; ZSet members are plain strings.
+- **Owner-scope** applies identically in effect, but a native list has no document to hold an owner field — so for these four it is enforced against the collection's `__owner` index: first writer claims the key, a foreign key then reads as absent and writes as 403 (see §4.5).
+- These types expose the **HTTP command layer** (handlers `HttpStrGet`, `HttpSAdd`, `HttpLPush`, `HttpZAdd`, …) and are reached via the §3 wire commands; the Hash family additionally has native non-HTTP Go methods.
+- **TTL**: `strset` with an expiration issues `SET ... EX` — a real per-key TTL. `EnsureTTL(...)` is kept for source compatibility and does nothing (§7).
+- **`LPUSH` with several items** lands them head-first *in the order given* (`[a,b]` onto `[c]` → `[a,b,c]`), preserving the previous behaviour; raw Redis would give `[b,a,c]`.
 
 ### 4.4 `@`-binding
 
@@ -128,7 +146,7 @@ Server-injected, client `@`-keys stripped:
 - **Identity** (JWT): `@uid`, `@email`, `@role`, …
 - **Request info**: `@remoteAddr`, `@host`, `@method`, `@path`, `@rawQuery`.
 - **Target metadata**: `@key` (collection key), `@field` (field).
-`?f=@uid` = "my own row". Go structs receive the corresponding bson field (injected per owner-scope / binding).
+`?f=@uid` = "my own row". Go structs receive the corresponding json-tagged field (injected per owner-scope / binding).
 
 ### 4.5 owner-scope (row-level isolation)
 
@@ -225,14 +243,14 @@ import { schema } from "./schema";
 
 const srv = await serve({
   schema,
-  mongo: { uri: process.env.MONGO_URI!, db: "app" },
+  kvrocks: { uri: process.env.KVROCKS_URI!, namespace: "app" },
   jwtSecret: process.env.JWT_SECRET!,
   // No permit/permissions: each collection's .httpOn() bitmask authorizes (same as Go).
   port: 8080,
 });
 ```
 
-`serverDb(schema, db)` gives typed server-side collections in Node; `defineApi(fn)` defines a functional API.
+`serverDb(schema, backend)` gives typed server-side collections in Node; `defineApi(fn)` defines a functional API.
 
 ---
 
@@ -250,8 +268,10 @@ const srv = await serve({
 
 ## 7. watch + TTL
 
-- **watch** = Mongo change stream → SSE (`text/event-stream`). **Needs a replica set.** Under owner-scope it filters by `{owner: me}`; reconnect resumes via resume token; under owner-scope a delete event isn't delivered (no fullDocument). The client subscribes via `GET /api/watch/<coll>`.
-- **TTL**: String collections support expiration. A doc carries `expireAt: Date` and the collection has a TTL index `{expireAt:1}, expireAfterSeconds:0`; an expiration `> 0` sets `expireAt = now + d`. Background expiry is MongoDB's job (~60s granularity).
+- **watch** = dopdb's own pub/sub channel → SSE (`text/event-stream`). No replica set and no server configuration needed. Under owner-scope it filters by `{owner: me}`, and a delete event isn't delivered under scope (no document to scope on). The client subscribes via `GET /api/watch/<coll>`.
+  - **No replay.** Redis pub/sub is fire-and-forget: there is no resume token, the server sends no SSE `id:` line, `Last-Event-ID` is ignored, and a reconnect starts fresh. Only writes made **through dopdb** are visible — a process writing the same keys with `redis-cli` is invisible.
+- **TTL**: per-**key** only, and native — `strset` with an expiration issues `SET ... EX` and KVRocks expires the key itself. A per-**document** TTL inside a Hash collection **cannot be expressed** (the collection is one Redis key); a `.ttl(...)` schema declaration is recorded and inert.
+- **Indexes**: only `index:"unique"` is enforced (dopdb maintains a claim hash; a violation is **409**, `ErrDuplicate`). It is sparse: a missing value claims nothing. `1`/`-1`/`text`/`2dsphere` are accepted and inert.
 
 ---
 
@@ -272,7 +292,7 @@ Both engines match field-for-field (a conformance test guards `status` + `code`)
 
 ## 9. Testing (standard suite)
 
-See `docs/TESTING.md`. Go unit tests live beside the code (`*_test.go`); tests needing a real Mongo are gated by `DOPDB_TEST_MONGO_URI` (skipped if unset); cross-implementation consistency is guarded by `httpserve/conformance_test.go` (it starts a TS subprocess, drives both engines, and diffs every command — including all String/List/Set/ZSet commands). **Never substitute a single-engine test for a consistency claim.**
+See `docs/TESTING.md`. Go unit tests live beside the code (`*_test.go`) — `query_test.go` and `codec_test.go` pin the filter dialect and the storage format and need no server; tests needing a real KVRocks are gated by `DOPDB_TEST_KVROCKS_URI` (skipped if unset); cross-implementation consistency is guarded by `httpserve/conformance_test.go` (it starts a TS subprocess, drives both engines, and diffs every command — including all String/List/Set/ZSet commands). **Never substitute a single-engine test for a consistency claim.**
 
 ---
 
@@ -281,7 +301,7 @@ See `docs/TESTING.md`. Go unit tests live beside the code (`*_test.go`); tests n
 Follow strictly:
 
 1. **Keys are always strings**; `"@uuid"` triggers server-side id generation; `?f=@uid` means "my row".
-2. **Backend (Hash)**: `dopdb.New[string, *T](dopdb.WithCollection("name"))`; **expose + authorize with `.HttpOn(...)`** (debug `.HttpOn()` first, then tighten) — do not write `RegisterHttp` + per-command `Grant`. Struct tags `json` (== `bson`) + `validate`. Multi-tenant: `dopdb.SetOwnerScope(coll, ownerField, claim)`.
+2. **Backend (Hash)**: `dopdb.New[string, *T](dopdb.WithCollection("name"))`; **expose + authorize with `.HttpOn(...)`** (debug `.HttpOn()` first, then tighten) — do not write `RegisterHttp` + per-command `Grant`. Struct tags `json` + `validate` (no `bson`). Multi-tenant: `dopdb.SetOwnerScope(coll, ownerField, claim)`.
 3. **Backend (String/List/Set/ZSet)**: `dopdb.NewString[K](...)` / `NewList[K,E](...)` / `NewSet[K](...)` / `NewZSet[K](...)`, then `.HttpOn(...)`; reach them via the §3 wire commands; owner-scope and TTL apply as in §4.3/§4.5/§7.
 4. **Frontend**: `collection(shape).named().ownerScope().httpOn(...)`; `clientDb(schema, {baseUrl, getToken})`; call `db.coll.hset/hgetall/hdel` directly — **no fetch, no API layer**.
 5. **Permissions**: data commands are 403 by default; a collection must `.httpOn(...)` to be reachable; `.httpOn()` with no args = all on (debug only — always tell the user to tighten it).

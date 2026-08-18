@@ -13,16 +13,17 @@ addr           = ":9000"
 jwt_secret_env = "TEST_JWT_SECRET"
 cors_origins   = ["https://a.example.com", "https://b.example.com"]
 
-[[mongo]]
-name    = "default"
-uri_env = "TEST_MONGO_URI"
-uri     = "mongodb://localhost:27017"   # dev fallback
-db      = "appdb"
+[[kvrocks]]
+name         = "default"
+uri_env      = "TEST_KVROCKS_URI"
+uri          = "redis://localhost:6666"   # dev fallback
+password_env = "TEST_KVROCKS_PASSWORD"
+namespace    = "appdb"
 
-[[mongo]]
-name = "analytics"
-uri  = "mongodb://localhost:27017"
-db   = "analytics"
+[[kvrocks]]
+name      = "analytics"
+uri       = "redis://localhost:6666"
+namespace = "analytics"
 `
 
 func writeTmp(t *testing.T, body string) string {
@@ -36,7 +37,8 @@ func writeTmp(t *testing.T, body string) string {
 
 func TestLoadAndEnvOverride(t *testing.T) {
 	t.Setenv("TEST_JWT_SECRET", "s3cr3t")
-	t.Setenv("TEST_MONGO_URI", "mongodb://user:pw@prod:27017/?authSource=admin")
+	t.Setenv("TEST_KVROCKS_URI", "redis://prod:6666")
+	t.Setenv("TEST_KVROCKS_PASSWORD", "ns-token")
 
 	cfg, err := Load(writeTmp(t, sample))
 	if err != nil {
@@ -52,11 +54,14 @@ func TestLoadAndEnvOverride(t *testing.T) {
 		t.Errorf("cors=%v", cfg.HTTP.CORSOrigins)
 	}
 	def := cfg.Default()
-	if def.URI != "mongodb://user:pw@prod:27017/?authSource=admin" {
+	if def.URI != "redis://prod:6666" {
 		t.Errorf("default uri not overridden by env: %q", def.URI)
 	}
-	if def.DB != "appdb" {
-		t.Errorf("default db=%q", def.DB)
+	if def.Password != "ns-token" {
+		t.Errorf("password not resolved from env: %q", def.Password)
+	}
+	if def.Namespace != "appdb" {
+		t.Errorf("default namespace=%q", def.Namespace)
 	}
 	if _, ok := cfg.Source("analytics"); !ok {
 		t.Error("analytics source missing")
@@ -70,7 +75,7 @@ func TestEnvFallbackToLiteral(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.Default().URI != "mongodb://localhost:27017" {
+	if cfg.Default().URI != "redis://localhost:6666" {
 		t.Errorf("expected literal uri fallback, got %q", cfg.Default().URI)
 	}
 }
@@ -80,10 +85,10 @@ func TestValidateRequiresDefault(t *testing.T) {
 	body := `
 [http]
 jwt_secret_env = "TEST_JWT_SECRET"
-[[mongo]]
-name = "analytics"
-uri  = "mongodb://localhost:27017"
-db   = "analytics"
+[[kvrocks]]
+name      = "analytics"
+uri       = "redis://localhost:6666"
+namespace = "analytics"
 `
 	if _, err := Load(writeTmp(t, body)); err == nil {
 		t.Fatal("expected error: missing default datasource")
@@ -94,26 +99,69 @@ func TestValidateRequiresSecret(t *testing.T) {
 	body := `
 [http]
 jwt_secret_env = "DEFINITELY_UNSET_VAR_XYZ"
-[[mongo]]
-name = "default"
-uri  = "mongodb://localhost:27017"
-db   = "appdb"
+[[kvrocks]]
+name      = "default"
+uri       = "redis://localhost:6666"
+namespace = "appdb"
 `
 	if _, err := Load(writeTmp(t, body)); err == nil {
 		t.Fatal("expected error: empty jwt secret")
 	}
 }
 
+// A mongodb:// URI is now a configuration error rather than a silent
+// misconfiguration that only fails at dial time.
+func TestValidateRejectsNonRedisURI(t *testing.T) {
+	t.Setenv("TEST_JWT_SECRET", "x")
+	body := `
+[http]
+jwt_secret_env = "TEST_JWT_SECRET"
+[[kvrocks]]
+name      = "default"
+uri       = "mongodb://localhost:27017"
+namespace = "appdb"
+`
+	if _, err := Load(writeTmp(t, body)); err == nil {
+		t.Fatal("expected error: uri must be redis:// or rediss://")
+	}
+}
+
+func TestValidateRequiresNamespace(t *testing.T) {
+	t.Setenv("TEST_JWT_SECRET", "x")
+	body := `
+[http]
+jwt_secret_env = "TEST_JWT_SECRET"
+[[kvrocks]]
+name = "default"
+uri  = "redis://localhost:6666"
+`
+	if _, err := Load(writeTmp(t, body)); err == nil {
+		t.Fatal("expected error: missing namespace")
+	}
+}
+
 func TestWarnings(t *testing.T) {
 	cfg := &Config{
 		HTTP: HTTPConfig{JWTSecret: "x"},
-		Mongo: []MongoSource{
-			{Name: "default", URI: "mongodb://user:pw@h:27017", DB: "d"}, // creds in literal
+		Kvrocks: []KvrocksSource{
+			{Name: "default", URI: "redis://user:pw@h:6666", Namespace: "d"}, // creds in literal
 		},
 	}
 	w := cfg.Warnings()
 	if len(w) != 1 {
 		t.Fatalf("expected 1 warning, got %d: %v", len(w), w)
+	}
+}
+
+func TestWarnsOnLiteralPassword(t *testing.T) {
+	cfg := &Config{
+		HTTP: HTTPConfig{JWTSecret: "x"},
+		Kvrocks: []KvrocksSource{
+			{Name: "default", URI: "redis://h:6666", Password: "hunter2", Namespace: "d"},
+		},
+	}
+	if w := cfg.Warnings(); len(w) != 1 {
+		t.Fatalf("expected 1 warning for a literal password, got %d: %v", len(w), w)
 	}
 }
 
@@ -123,10 +171,10 @@ func TestStripCommentRespectsQuotes(t *testing.T) {
 [http]
 jwt_secret_env = "TEST_JWT_SECRET"
 addr = "host#notacomment:80"   # real comment
-[[mongo]]
-name = "default"
-uri  = "mongodb://localhost:27017"
-db   = "appdb"
+[[kvrocks]]
+name      = "default"
+uri       = "redis://localhost:6666"
+namespace = "appdb"
 `
 	t.Setenv("TEST_JWT_SECRET", "x")
 	cfg, err := Load(writeTmp(t, body))

@@ -1,16 +1,24 @@
-// server.ts — the α server runtime. Binds the MongoDB driver directly (no Store
-// abstraction; point 14) and uses Mongo features as Mongo features.
+// server.ts — the α server runtime. Binds KVRocks directly (no Store
+// abstraction; point 14) and uses Redis data structures as Redis data structures.
 //
 // Two surfaces, mirroring Go's Collection (trusted) + httpserve (scoped):
-//   - serverDb(schema, db)  raw, trusted, typed db for handler/server code.
-//   - serve(cfg)            HTTP server enforcing JWT @-binding, owner-scope,
-//                           permissions; dispatches data commands + /api/<name>.
+//   - serverDb(schema, backend)  raw, trusted, typed db for handler/server code.
+//   - serve(cfg)                 HTTP server enforcing JWT @-binding, owner-scope,
+//                                permissions; dispatches data commands + /api/<name>.
 //
 // One schema, imported here and on the client. Nothing is generated.
+//
+// The storage layout, the CBOR value format and the query dialect are shared
+// with the Go engine command-for-command — see kvrocks.ts, codec.ts and query.ts,
+// each the twin of the identically named Go file.
 
 import { createHmac, timingSafeEqual, createVerify, createPublicKey } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from "node:http";
-import type { MongoClient, Db as MongoDb, Collection as MongoCollection, ChangeStream, ChangeStreamOptions } from "mongodb";
+
+import { KvBackend, type KvConn } from "./kvrocks.js";
+import { decodeValue, encodeValue } from "./codec.js";
+import { applyProjection, matchFilter, sortDocs, sortKeysFromMap, type SortKey } from "./query.js";
+import { parseSql, checkTable, SqlError } from "./sql.js";
 
 import {
   type Collection,
@@ -32,7 +40,7 @@ export {
   portFromAddr,
   type Config,
   type HttpConfig,
-  type MongoSource,
+  type KvrocksSource,
 } from "./config.js";
 import { runEndpoint, type ApiMap, type ApiContext } from "./api.js";
 import {
@@ -46,37 +54,6 @@ import {
 import type { Db, DbApi, FindOpt, WatchEvent, WatchHandler, Unsubscribe } from "./client.js";
 import { Permissions } from "./permission.js";
 export { Permissions } from "./permission.js";
-
-// ----------------------------------------------------------------------------
-// Bun compatibility for mongodb's bson dependency.
-//
-// bson@7 (shipped with mongodb@7) calls `v8.startupSnapshot.isBuildingSnapshot()`
-// inside a class static initializer that runs when the mongodb module is linked.
-// Bun has not implemented that Node API and throws NotImplementedError, crashing
-// the import before any of our code runs. We replace the throwing stub with a
-// no-op *before* mongodb is imported. Under Node the native call already returns
-// false, so the patch is inert. Run unconditionally; no behavior change on Node.
-//
-// mongodb is loaded lazily (dynamic import) so this shim always evaluates first.
-// ----------------------------------------------------------------------------
-interface V8StartupSnapshot { isBuildingSnapshot?: () => boolean }
-// getBuiltinModule returns `object | undefined`; the v8 module's real shape is not
-// expressible in @types/node, so cast once to a named binding.
-const v8Module = process.getBuiltinModule?.("v8") as { startupSnapshot?: V8StartupSnapshot } | undefined;
-const startupSnapshot = v8Module?.startupSnapshot;
-if (startupSnapshot && typeof startupSnapshot.isBuildingSnapshot === "function") {
-  try {
-    startupSnapshot.isBuildingSnapshot(); // Node: returns false, never throws.
-  } catch {
-    startupSnapshot.isBuildingSnapshot = () => false; // Bun: replace the throwing stub.
-  }
-}
-
-let _mongodb: typeof import("mongodb") | null = null;
-async function mongodb(): Promise<typeof import("mongodb")> {
-  if (!_mongodb) _mongodb = await import("mongodb");
-  return _mongodb;
-}
 
 type Doc = Record<string, unknown>;
 type Claims = Record<string, unknown>;
@@ -122,13 +99,12 @@ function verifyJWT(token: string, secret: string): Claims {
 }
 
 // ----------------------------------------------------------------------------
-// Low-level command execution against a Mongo collection (shared by serverDb and
-// the HTTP dispatcher). Values are already prepared; `scope` is the owner
-// predicate ({} = unscoped). _id holds the collection key.
+// Low-level command execution against a KVRocks namespace (shared by serverDb
+// and the HTTP dispatcher). Values are already prepared; `scope` is the owner
+// predicate ({} = unscoped).
 // ----------------------------------------------------------------------------
 
 const empty = (m: Filter) => Object.keys(m).length === 0;
-const isDupKey = (e: unknown) => !!e && typeof e === "object" && (e as { code?: number }).code === 11000;
 
 // Guardrails (mirrored on the Go side).
 const DEFAULT_LIMIT = 100; // find with no explicit limit is capped here
@@ -147,7 +123,7 @@ function mergeScope(scope: Filter, filter: Filter): Filter {
 
 // Sort/projection come straight off the query string; admit only plain
 // field -> number/boolean maps. This blocks operator smuggling ($-keys) and
-// illegal field paths from reaching the driver.
+// illegal field paths from reaching the query engine.
 function checkSortProj(o: unknown, what: string): void {
   if (o == null) return;
   if (typeof o !== "object" || Array.isArray(o)) throw new ValidationError([], `dopdb: invalid ${what}`);
@@ -180,551 +156,596 @@ interface ExecArgs {
   min?: number;
   max?: number;
   withscores?: boolean;
+  sql?: string;
   opt?: FindOpt;
 }
 
-// A Mongo change event → our wire-friendly WatchEvent. Returns null for op types
-// we don't surface (drop, rename, invalidate, ...).
-function toWatchEvent(ev: Record<string, unknown>): WatchEvent<Doc> | null {
-  const op = ev.operationType as string;
-  if (op !== "insert" && op !== "update" && op !== "replace" && op !== "delete") return null;
-  const dk = (ev.documentKey ?? {}) as Record<string, unknown>;
-  return {
-    type: op,
-    key: String(dk._id ?? ""),
-    doc: (ev.fullDocument as Doc | undefined) ?? null,
-  };
-}
+// ---- helpers over the stored shape ------------------------------------------
+//
+// The document id lives in the Redis hash FIELD, not inside the document, so it
+// is stripped on write and injected on read. Callers see the same `_id`-carrying
+// object the Mongo build returned.
 
-// Owner-scoped change-stream pipeline. Scoped streams match on fullDocument.<owner>,
-// so deletes (no fullDocument) are not delivered to scoped watchers.
-function ownerPipeline(scope: Filter): Doc[] {
+const withId = (id: string, doc: Doc): Doc => ({ ...doc, _id: id });
+const stripId = (doc: Doc): Doc => {
+  const out = { ...doc };
+  delete out._id;
+  return out;
+};
+
+/** The (field, value) pair of an owner scope, or null when unscoped. */
+function scopePair(scope: Filter): [string, unknown] | null {
   const keys = Object.keys(scope);
-  if (keys.length === 0) return [];
-  const match: Doc = {};
-  for (const k of keys) match[`fullDocument.${k}`] = scope[k];
-  return [{ $match: match }];
+  if (keys.length === 0) return null;
+  return [keys[0], (scope as Doc)[keys[0]]];
 }
 
-async function exec(m: MongoCollection<Doc>, cmd: string, a: ExecArgs, scope: Filter): Promise<unknown> {
+function listIdx(n: number, i: number): number { return i < 0 ? n + i : i; }
+
+/** Render a score bound the way Redis range commands expect, including the
+ * infinities the HTTP layer uses as "unbounded". */
+function scoreArg(f: number): string {
+  if (f === -Infinity) return "-inf";
+  if (f === Infinity) return "+inf";
+  return String(f);
+}
+
+type ZM = { m: string; score: number };
+
+/** Redis returns [member, score, member, score, ...] for WITHSCORES. */
+function zPairs(flat: string[]): ZM[] {
+  const out: ZM[] = [];
+  for (let i = 0; i + 1 < flat.length; i += 2) out.push({ m: flat[i], score: Number(flat[i + 1]) });
+  return out;
+}
+
+function zRender(ms: ZM[], withScores: boolean): unknown {
+  return withScores ? ms.map((x) => ({ m: x.m, score: x.score })) : ms.map((x) => x.m);
+}
+
+/** Shape a matched result set: sort, skip, limit, project. The in-process
+ * stand-in for the cursor options the driver used to send. */
+function shape(rows: Doc[], opt: FindOpt | undefined, sortKeys?: SortKey[]): Doc[] {
+  let out = rows;
+  if (sortKeys && sortKeys.length > 0) sortDocs(out, sortKeys);
+  else if (opt?.sort) sortDocs(out, sortKeysFromMap(opt.sort as Record<string, unknown>));
+  if (opt?.skip != null && opt.skip > 0) out = out.slice(opt.skip);
+  const lim = opt?.limit;
+  const cap = lim != null ? Math.min(Math.max(lim, 0), MAX_LIMIT) || DEFAULT_LIMIT : DEFAULT_LIMIT;
+  if (out.length > cap) out = out.slice(0, cap);
+  if (opt?.projection) out = out.map((d) => applyProjection(d, opt.projection as Record<string, unknown>));
+  return out;
+}
+
+// ---- command execution -------------------------------------------------------
+
+async function exec(b: KvBackend, coll: string, cmd: string, a: ExecArgs, scope: Filter): Promise<unknown> {
+  const scoped = !empty(scope);
+  const key = a.key as string;
+
+  // Non-Hash collection types keep their row isolation in the collection's owner
+  // index, because a native list/set/zset has no document to hold an owner field.
+  const guardRead = async (): Promise<boolean> => (scoped ? await b.checkOwner(coll, key, scope) : true);
+  const guardWrite = async (): Promise<void> => {
+    if (scoped && !(await b.claimOwner(coll, key, scope))) throw new ForbiddenError();
+  };
+
   switch (cmd) {
+    // ---- Hash family ----
     case "hget": {
-      const doc = await m.findOne({ _id: a.key, ...scope } as Filter);
+      const doc = await b.get(coll, key);
       if (!doc) throw new NotFoundError();
-      return doc;
+      const full = withId(key, doc);
+      if (scoped && !matchFilter(full, scope)) throw new NotFoundError();
+      return full;
     }
     case "hset": {
-      const doc = { ...(a.value as Doc), _id: a.key };
-      try {
-        await m.replaceOne({ _id: a.key, ...scope } as Filter, doc as Doc, { upsert: true });
-      } catch (e) {
-        if (isDupKey(e) && !empty(scope)) throw new ForbiddenError();
-        throw e;
+      const doc = stripId(a.value as Doc);
+      if (!scoped) {
+        await b.put(coll, key, doc);
+        return { ok: true };
       }
+      const [field, val] = scopePair(scope)!;
+      if (!(await b.putScoped(coll, key, doc, field, val))) throw new ForbiddenError();
       return { ok: true };
     }
     case "hsetnx": {
-      // hsetnx = insert-if-absent. prepareWrite already stamps the owner onto
-      // the value (bind rule), so a scoped insert is owned. A dup on _id (no
-      // matter who owns it) returns inserted=false — uniform, so it never
-      // distinguishes "exists for me" from "exists for another tenant".
-      const doc = { ...(a.value as Doc), _id: a.key };
-      try {
-        await m.insertOne(doc as Doc);
-        return { inserted: true };
-      } catch (e) {
-        if (isDupKey(e)) return { inserted: false };
-        throw e;
-      }
+      // insert-if-absent. prepareWrite already stamps the owner onto the value
+      // (bind rule), so a scoped insert is owned. An existing id — no matter who
+      // owns it — returns inserted=false, so it never distinguishes "exists for
+      // me" from "exists for another tenant".
+      const inserted = await b.putIfAbsent(coll, key, stripId(a.value as Doc));
+      return { inserted };
     }
     case "hdel":
     case "del": {
-      await m.deleteMany({ _id: { $in: a.keys }, ...scope } as Filter);
+      const keys = a.keys ?? [];
+      if (!scoped) {
+        await b.del(coll, keys);
+        return { ok: true };
+      }
+      const mine: string[] = [];
+      for (const k of keys) {
+        const d = await b.get(coll, k);
+        if (d && matchFilter(withId(k, d), scope)) mine.push(k);
+      }
+      await b.del(coll, mine);
       return { ok: true };
     }
     case "hexists": {
-      const n = await m.countDocuments({ _id: a.key, ...scope } as Filter);
-      return { exists: n > 0 };
+      const doc = await b.get(coll, key);
+      if (!doc) return { exists: false };
+      return { exists: !scoped || matchFilter(withId(key, doc), scope) };
     }
     case "hgetall": {
       const out: Record<string, Doc> = {};
-      for await (const d of m.find(scope)) out[String((d as Doc)._id)] = d as Doc;
+      for (const d of await b.findDocs(coll, scope)) out[String(d._id)] = d;
       return out;
     }
     case "hkeys": {
-      const ids: string[] = [];
-      for await (const d of m.find(scope).project({ _id: 1 })) ids.push(String((d as Doc)._id));
-      return ids;
+      return (await b.findDocs(coll, scope)).map((d) => String(d._id));
     }
     case "hvals": {
-      return await m.find(scope).toArray();
+      return await b.findDocs(coll, scope);
     }
     case "hlen": {
-      return { len: await m.countDocuments(scope) };
+      if (!scoped) return { len: await b.count(coll) };
+      return { len: (await b.findDocs(coll, scope)).length };
     }
     case "hrandfield": {
-      // Redis HRANDFIELD — random field keys via $sample. scope restricts the
-      // population (owner-scope). Mirrors Go's backend.sample.
-      const size = a.count && a.count > 0 ? a.count : 1;
-      const pipe: Doc[] = [];
-      if (!empty(scope)) pipe.push({ $match: scope });
-      pipe.push({ $sample: { size } }, { $project: { _id: 1 } });
-      const ids: string[] = [];
-      for await (const d of m.aggregate(pipe)) ids.push(String((d as Doc)._id));
-      return ids;
+      // Redis HRANDFIELD — the native command when unscoped; a filtered scan
+      // otherwise, since the population has to be restricted first.
+      return await b.sample(coll, a.count && a.count > 0 ? a.count : 1, scope);
     }
     case "hscan":
     case "hscannovalues": {
-      // Redis HSCAN over Mongo: glob match -> regex on _id, paginated by a
-      // numeric cursor (offset), sorted by _id. nextCursor = cursor+len when
-      // the page is full, else 0 (done). Mirrors Go's backend.scan.
-      const count = a.count && a.count > 0 ? a.count : 10;
-      const cursor = a.cursor ?? 0;
-      const f: Filter = { ...scope };
-      if (a.match && a.match !== "*") (f as Doc)._id = { $regex: globToRegex(a.match) };
-      let q = m.find(f);
-      if (cmd === "hscannovalues") q = q.project({ _id: 1 });
-      const docs = await q.sort({ _id: 1 }).skip(cursor).limit(count).toArray();
-      const keys = docs.map((d) => String((d as Doc)._id));
-      const next = docs.length === count ? cursor + docs.length : 0;
-      if (cmd === "hscannovalues") return { cursor: next, keys };
-      return { cursor: next, keys, values: docs };
-    }
-    case "lpush":
-    case "rpush": {
-      const each = a.items ?? [];
-      const upd = cmd === "lpush" ? { $push: { items: { $each: each, $position: 0 } } } : { $push: { items: { $each: each } } };
-      await m.updateOne({ _id: a.key, ...scope } as Filter, upd as never, { upsert: true });
-      return { ok: true };
-    }
-    case "lpop":
-    case "rpop": {
-      const before = await m.findOneAndUpdate({ _id: a.key, ...scope } as Filter, { $pop: { items: cmd === "lpop" ? -1 : 1 } } as never) as Doc | null;
-      if (!before) throw new NotFoundError();
-      const its = (before.items as unknown[]) ?? [];
-      if (its.length === 0) return null;
-      return cmd === "lpop" ? its[0] : its[its.length - 1];
-    }
-    case "lrange": {
-      const doc = await m.findOne({ _id: a.key, ...scope } as Filter) as Doc | null;
-      const its = (doc?.items as unknown[]) ?? [];
-      const n = its.length;
-      let st = listIdx(n, a.start ?? 0); if (st < 0) st = 0;
-      let en = listIdx(n, a.stop ?? -1) + 1; if (en > n) en = n; if (en < st) en = st;
-      return st >= n ? [] : its.slice(st, en);
-    }
-    case "llen": {
-      const doc = await m.findOne({ _id: a.key, ...scope } as Filter) as Doc | null;
-      return { len: ((doc?.items as unknown[]) ?? []).length };
-    }
-    case "lindex": {
-      const doc = await m.findOne({ _id: a.key, ...scope } as Filter) as Doc | null;
-      const its = (doc?.items as unknown[]) ?? [];
-      const i = listIdx(its.length, a.index ?? 0);
-      return i >= 0 && i < its.length ? its[i] : null;
-    }
-    case "lset": {
-      const doc = await m.findOne({ _id: a.key, ...scope } as Filter) as Doc | null;
-      const its = (doc?.items as unknown[]) ?? [];
-      const i = listIdx(its.length, a.index ?? 0);
-      if (i < 0 || i >= its.length) throw new NotFoundError();
-      await m.updateOne({ _id: a.key, ...scope } as Filter, { $set: { [`items.${i}`]: a.item } } as never);
-      return { ok: true };
-    }
-    case "lrem": {
-      const doc = await m.findOne({ _id: a.key, ...scope } as Filter) as Doc | null;
-      const its = (doc?.items as unknown[]) ?? [];
-      const cnt = a.count ?? 0;
-      const kept: unknown[] = [];
-      let rm = 0;
-      if (cnt < 0) {
-        for (let i = its.length - 1; i >= 0; i--) {
-          if (its[i] === a.item && (cnt === 0 || rm < -cnt)) rm++;
-          else kept.unshift(its[i]);
-        }
-      } else {
-        for (const v of its) {
-          if (v === a.item && (cnt === 0 || rm < cnt)) rm++;
-          else kept.push(v);
-        }
-      }
-      await m.updateOne({ _id: a.key, ...scope } as Filter, { $set: { items: kept } } as never);
-      return { ok: true };
-    }
-    case "ltrim": {
-      const doc = await m.findOne({ _id: a.key, ...scope } as Filter) as Doc | null;
-      const its = (doc?.items as unknown[]) ?? [];
-      const n = its.length;
-      let st = listIdx(n, a.start ?? 0); if (st < 0) st = 0;
-      let en = listIdx(n, a.stop ?? -1) + 1; if (en > n) en = n; if (en < st) en = st;
-      await m.updateOne({ _id: a.key, ...scope } as Filter, { $set: { items: st < n ? its.slice(st, en) : [] } } as never);
-      return { ok: true };
-    }
-    case "linsertbefore":
-    case "linsertafter": {
-      const doc = await m.findOne({ _id: a.key, ...scope } as Filter) as Doc | null;
-      const its = (doc?.items as unknown[]) ?? [];
-      const out: unknown[] = [];
-      let ins = false;
-      const before = cmd === "linsertbefore";
-      for (const v of its) {
-        if (v === a.pivot && !ins) {
-          if (before) out.push(a.item, v);
-          else out.push(v, a.item);
-          ins = true;
-          continue;
-        }
-        out.push(v);
-      }
-      if (ins) await m.updateOne({ _id: a.key, ...scope } as Filter, { $set: { items: out } } as never);
-      return { ok: true };
-    }
-    case "sadd": {
-      await m.updateOne({ _id: a.key, ...scope } as Filter, { $addToSet: { members: { $each: a.members ?? [] } } } as never, { upsert: true });
-      return { ok: true };
-    }
-    case "srem": {
-      await m.updateOne({ _id: a.key, ...scope } as Filter, { $pull: { members: { $in: a.members ?? [] } } } as never);
-      return { ok: true };
-    }
-    case "smembers": {
-      const doc = await m.findOne({ _id: a.key, ...scope } as Filter);
-      return (doc as Doc | null)?.members ?? [];
-    }
-    case "sismember": {
-      const n = await m.countDocuments({ _id: a.key, ...scope, members: a.member } as Filter, { limit: 1 } as never);
-      return { member: n > 0 };
-    }
-    case "scard": {
-      const doc = await m.findOne({ _id: a.key, ...scope } as Filter);
-      return { card: ((doc as Doc | null)?.members as unknown[] | undefined)?.length ?? 0 };
-    }
-    case "strget": {
-      const doc = await m.findOne({ _id: a.key, ...scope } as Filter);
-      if (!doc) throw new NotFoundError();
-      return (doc as Doc).v;
-    }
-    case "strset": {
-      const setDoc: Doc = { v: a.value };
-      if (a.n && a.n > 0) setDoc.expireAt = new Date(Date.now() + a.n * 1000);
-      try {
-        await m.updateOne({ _id: a.key, ...scope } as Filter, { $set: setDoc } as never, { upsert: true });
-      } catch (e) {
-        if (isDupKey(e) && !empty(scope)) throw new ForbiddenError();
-        throw e;
-      }
-      return { ok: true };
-    }
-    case "strdel": {
-      await m.deleteMany({ _id: { $in: a.keys ?? [] }, ...scope } as Filter);
-      return { ok: true };
-    }
-    case "strgetall": {
-      const f: Filter = { ...scope };
-      if (a.match && a.match !== "*") (f as Doc)._id = { $regex: globToRegex(a.match) };
-      const out: Record<string, unknown> = {};
-      for await (const d of m.find(f)) out[String((d as Doc)._id)] = (d as Doc).v;
-      return out;
-    }
-    case "strsetall": {
-      const entries = Object.entries(a.entries ?? {});
-      if (entries.length === 0) return { ok: true };
-      const ops = entries.map(([k, v]) => ({
-        updateOne: { filter: { _id: k, ...scope } as Filter, update: { $set: { v } } as never, upsert: true },
-      }));
-      try {
-        await m.bulkWrite(ops as never, { ordered: false });
-      } catch (e) {
-        if (isDupKey(e) && !empty(scope)) throw new ForbiddenError();
-        throw e;
-      }
-      return { ok: true };
-    }
-    case "count": {
-      const safe = sanitizeFilter(a.filter);
-      return { count: await m.countDocuments(mergeScope(scope, safe)) };
+      // Redis HSCAN, natively. The cursor is the server's own, so a page may be
+      // short (or empty) with a non-zero cursor; only cursor 0 means done.
+      const r = await b.scan(coll, a.match ?? "*", a.cursor ?? 0, a.count && a.count > 0 ? a.count : 10, scope);
+      if (cmd === "hscannovalues") return { cursor: r.cursor, keys: r.ids };
+      return { cursor: r.cursor, keys: r.ids, values: r.docs };
     }
     case "hincrby":
     case "hincrbyfloat": {
-      const r = await m.updateOne(
-        { _id: a.key, ...scope } as Filter,
-        { $inc: { [a.field as string]: a.n } } as Doc,
-        { upsert: empty(scope) },
-      );
-      if (!empty(scope) && r.matchedCount === 0 && r.upsertedCount === 0) throw new ForbiddenError();
+      if (scoped) {
+        const doc = await b.get(coll, key);
+        if (!doc || !matchFilter(withId(key, doc), scope)) throw new ForbiddenError();
+      }
+      await b.incr(coll, key, a.field as string, a.n ?? 0);
       return { ok: true };
     }
     case "hmset": {
-      const entries = Object.entries(a.entries ?? {});
-      if (entries.length === 0) return { ok: true };
-      const ops = entries.map(([k, doc]) => ({
-        replaceOne: { filter: { _id: k, ...scope } as Filter, replacement: { ...doc, _id: k } as Doc, upsert: true },
-      }));
-      try {
-        await m.bulkWrite(ops as never, { ordered: false });
-      } catch (e) {
-        if (isDupKey(e) && !empty(scope)) throw new ForbiddenError();
-        throw e;
+      const entries = a.entries ?? {};
+      if (Object.keys(entries).length === 0) return { ok: true };
+      if (!scoped) {
+        const prepared: Record<string, Doc> = {};
+        for (const [k, v] of Object.entries(entries)) prepared[k] = stripId(v);
+        await b.putMany(coll, prepared);
+        return { ok: true };
+      }
+      const [field, val] = scopePair(scope)!;
+      for (const [k, v] of Object.entries(entries)) {
+        if (!(await b.putScoped(coll, k, stripId(v), field, val))) throw new ForbiddenError();
       }
       return { ok: true };
     }
     case "hmget": {
       const keys = a.keys ?? [];
       if (keys.length === 0) return [];
-      const docs = await m.find({ _id: { $in: keys }, ...scope } as Filter).toArray();
-      const byId = new Map(docs.map((d) => [String((d as Doc)._id), d as Doc]));
-      return keys.map((k) => byId.get(k) ?? null);
+      const docs = await b.getMany(coll, keys);
+      return docs.map((d, i) => {
+        if (!d) return null;
+        const full = withId(keys[i], d);
+        return scoped && !matchFilter(full, scope) ? null : full;
+      });
+    }
+    case "count": {
+      const safe = sanitizeFilter(a.filter);
+      return { count: (await b.findDocs(coll, mergeScope(scope, safe))).length };
     }
     case "find": {
       const safe = sanitizeFilter(a.filter);
-      let cur = m.find(mergeScope(scope, safe));
-      if (a.opt?.sort) cur = cur.sort(a.opt.sort);
-      if (a.opt?.projection) cur = cur.project(a.opt.projection);
-      if (a.opt?.skip != null) cur = cur.skip(a.opt.skip);
-      const lim = a.opt?.limit;
-      cur = cur.limit(lim != null ? Math.min(Math.max(lim, 0), MAX_LIMIT) : DEFAULT_LIMIT);
-      return await cur.toArray();
+      return shape(await b.findDocs(coll, mergeScope(scope, safe)), a.opt);
+    }
+    case "sql": {
+      // SQL is a front end: it compiles to the same (filter, sort, page) shape
+      // `find` uses and runs on the same evaluator. Three things happen here
+      // that the trusted path does not do — the FROM clause is checked against
+      // this collection (so SQL cannot reach a collection the caller was never
+      // granted), the owner scope is AND-ed in, and LIMIT is defaulted/clamped.
+      const q = parseSql(a.sql ?? "");
+      checkTable(q, coll);
+      const merged = mergeScope(scope, sanitizeFilter(q.filter));
+      if (q.count) return { count: (await b.findDocs(coll, merged)).length };
+      return shape(await b.findDocs(coll, merged), {
+        sort: undefined,
+        skip: q.offset,
+        limit: q.limit,
+        projection: q.projection,
+      } as FindOpt, q.sortKeys);
     }
     case "findone": {
       const safe = sanitizeFilter(a.filter);
-      const doc = await m.findOne(mergeScope(scope, safe));
-      if (!doc) throw new NotFoundError();
-      return doc;
+      const rows = shape(await b.findDocs(coll, mergeScope(scope, safe)), { ...a.opt, limit: 1 });
+      if (rows.length === 0) throw new NotFoundError();
+      return rows[0];
     }
-    // ---- ZSet (Z*) family ----
-    case "zadd": {
-      const ms = await zLoad(m, a.key, scope);
-      const idx = new Map(ms.map((x, i) => [x.m, i]));
-      let added = 0;
-      for (const [k, v] of Object.entries(a.pairs ?? {})) {
-        const i = idx.get(k);
-        if (i !== undefined) ms[i].score = v;
-        else { ms.push({ m: k, score: v }); idx.set(k, ms.length - 1); added++; }
+
+    // ---- String family: a native Redis string per key, with a native TTL ----
+    case "strget": {
+      if (!(await guardRead())) throw new NotFoundError();
+      const raw = await b.redis.getBuffer(b.memberKey(coll, key));
+      if (!raw) throw new NotFoundError();
+      return decodeValue(raw);
+    }
+    case "strset": {
+      await guardWrite();
+      const rk = b.memberKey(coll, key);
+      const buf = encodeValue(a.value);
+      if (a.n && a.n > 0) await b.redis.set(rk, buf, "EX", a.n);
+      else await b.redis.set(rk, buf);
+      return { ok: true };
+    }
+    case "strdel": {
+      const keys = a.keys ?? [];
+      const owned: string[] = [];
+      for (const k of keys) {
+        if (scoped && !(await b.checkOwner(coll, k, scope))) continue;
+        owned.push(k);
       }
-      zSort(ms, false);
-      await zSave(m, a.key, scope, ms);
-      return added;
+      if (owned.length > 0) {
+        await b.redis.del(...owned.map((k) => b.memberKey(coll, k)));
+        await b.releaseOwner(coll, owned);
+      }
+      return { ok: true };
+    }
+    case "strgetall": {
+      const keys = await b.ownedKeys(coll, a.match ?? "*", scope);
+      const out: Record<string, unknown> = {};
+      if (keys.length === 0) return out;
+      const raws = await b.redis.mgetBuffer(...keys.map((k) => b.memberKey(coll, k)));
+      raws.forEach((raw, i) => { if (raw) out[keys[i]] = decodeValue(raw); });
+      return out;
+    }
+    case "strsetall": {
+      const entries = Object.entries(a.entries ?? {});
+      if (entries.length === 0) return { ok: true };
+      const pipe = b.redis.pipeline();
+      for (const [k, v] of entries) {
+        if (scoped && !(await b.claimOwner(coll, k, scope))) throw new ForbiddenError();
+        pipe.set(b.memberKey(coll, k), encodeValue(v));
+      }
+      await pipe.exec();
+      return { ok: true };
+    }
+
+    // ---- Set family: a native Redis set per key ----
+    case "sadd": {
+      await guardWrite();
+      const ms = a.members ?? [];
+      if (ms.length > 0) await b.redis.sadd(b.memberKey(coll, key), ...ms.map(encodeValue));
+      return { ok: true };
+    }
+    case "srem": {
+      await guardWrite();
+      const ms = a.members ?? [];
+      if (ms.length > 0) await b.redis.srem(b.memberKey(coll, key), ...ms.map(encodeValue));
+      return { ok: true };
+    }
+    case "smembers": {
+      if (!(await guardRead())) return [];
+      const raws = await b.redis.smembersBuffer(b.memberKey(coll, key));
+      // Redis set iteration order is unspecified; sort so the answer is stable.
+      raws.sort(Buffer.compare);
+      return raws.map((r) => decodeValue(r));
+    }
+    case "sismember": {
+      if (!(await guardRead())) return { member: false };
+      const n = await b.redis.sismember(b.memberKey(coll, key), encodeValue(a.member));
+      return { member: n === 1 };
+    }
+    case "scard": {
+      if (!(await guardRead())) return { card: 0 };
+      return { card: await b.redis.scard(b.memberKey(coll, key)) };
+    }
+
+    // ---- List family: a native Redis list per key ----
+    case "lpush":
+    case "rpush": {
+      await guardWrite();
+      const its = a.items ?? [];
+      if (its.length === 0) return { ok: true };
+      const rk = b.memberKey(coll, key);
+      if (cmd === "lpush") {
+        // reverse so the batch lands head-first in the order the caller gave —
+        // the behaviour the Mongo build had ($each with $position:0). Raw Redis
+        // LPUSH would reverse it.
+        await b.redis.lpush(rk, ...[...its].reverse().map(encodeValue));
+      } else {
+        await b.redis.rpush(rk, ...its.map(encodeValue));
+      }
+      return { ok: true };
+    }
+    case "lpop":
+    case "rpop": {
+      await guardWrite();
+      const rk = b.memberKey(coll, key);
+      const raw = cmd === "lpop" ? await b.redis.lpopBuffer(rk) : await b.redis.rpopBuffer(rk);
+      if (!raw) throw new NotFoundError();
+      return decodeValue(raw);
+    }
+    case "lrange": {
+      if (!(await guardRead())) return [];
+      const raws = await b.redis.lrangeBuffer(b.memberKey(coll, key), a.start ?? 0, a.stop ?? -1);
+      return raws.map((r) => decodeValue(r));
+    }
+    case "llen": {
+      if (!(await guardRead())) return { len: 0 };
+      return { len: await b.redis.llen(b.memberKey(coll, key)) };
+    }
+    case "lindex": {
+      if (!(await guardRead())) return null;
+      const raw = await b.redis.lindexBuffer(b.memberKey(coll, key), a.index ?? 0);
+      return raw ? decodeValue(raw) : null;
+    }
+    case "lset": {
+      await guardWrite();
+      try {
+        await b.redis.lset(b.memberKey(coll, key), a.index ?? 0, encodeValue(a.item));
+      } catch (e) {
+        // "index out of range" / "no such key" — the previous engine's NotFound
+        const msg = String((e as Error)?.message ?? "").toLowerCase();
+        if (msg.includes("out of range") || msg.includes("no such key")) throw new NotFoundError();
+        throw e;
+      }
+      return { ok: true };
+    }
+    case "lrem": {
+      await guardWrite();
+      await b.redis.lrem(b.memberKey(coll, key), a.count ?? 0, encodeValue(a.item));
+      return { ok: true };
+    }
+    case "ltrim": {
+      await guardWrite();
+      await b.redis.ltrim(b.memberKey(coll, key), a.start ?? 0, a.stop ?? -1);
+      return { ok: true };
+    }
+    case "linsertbefore":
+    case "linsertafter": {
+      await guardWrite();
+      // LINSERT answers -1 when the pivot is absent; that is not an error here,
+      // matching the previous "pivot not found -> no change" behaviour.
+      const rk = b.memberKey(coll, key);
+      const pivot = encodeValue(a.pivot);
+      const item = encodeValue(a.item);
+      if (cmd === "linsertbefore") await b.redis.linsert(rk, "BEFORE", pivot, item);
+      else await b.redis.linsert(rk, "AFTER", pivot, item);
+      return { ok: true };
+    }
+
+    // ---- ZSet family: a native Redis sorted set per key ----
+    case "zadd": {
+      await guardWrite();
+      const pairs = Object.entries(a.pairs ?? {});
+      if (pairs.length === 0) return 0;
+      // ZADD score member [score member ...]; ioredis types the variadic form
+      // loosely, so the argument list is built as strings.
+      const flat: string[] = [];
+      for (const [m, s] of pairs) flat.push(String(s), m);
+      return await b.redis.zadd(b.memberKey(coll, key), ...flat);
     }
     case "zrem": {
-      const ms = await zLoad(m, a.key, scope);
-      const gone = new Set((a.members as string[] | undefined) ?? []);
-      let removed = 0;
-      const kept = ms.filter((x) => { if (gone.has(x.m)) { removed++; return false; } return true; });
-      await zSave(m, a.key, scope, kept);
-      return removed;
+      await guardWrite();
+      const ms = (a.members as string[] | undefined) ?? [];
+      if (ms.length === 0) return 0;
+      return await b.redis.zrem(b.memberKey(coll, key), ...ms);
     }
     case "zscore": {
-      const ms = await zLoad(m, a.key, scope);
-      const hit = ms.find((x) => x.m === (a.member as string | undefined));
-      if (!hit) throw new NotFoundError();
-      return hit.score;
+      if (!(await guardRead())) throw new NotFoundError();
+      const s = await b.redis.zscore(b.memberKey(coll, key), a.member as string);
+      if (s === null) throw new NotFoundError();
+      return Number(s);
     }
     case "zcard": {
-      const ms = await zLoad(m, a.key, scope);
-      return { card: ms.length };
+      if (!(await guardRead())) return { card: 0 };
+      return { card: await b.redis.zcard(b.memberKey(coll, key)) };
     }
     case "zcount": {
-      const ms = await zLoad(m, a.key, scope);
-      const min = a.min ?? -Infinity, max = a.max ?? Infinity;
-      return { count: ms.filter((x) => x.score >= min && x.score <= max).length };
+      if (!(await guardRead())) return { count: 0 };
+      const n = await b.redis.zcount(b.memberKey(coll, key), scoreArg(a.min ?? -Infinity), scoreArg(a.max ?? Infinity));
+      return { count: n };
     }
     case "zincrby": {
-      const ms = await zLoad(m, a.key, scope);
-      const member = a.member as string;
-      const inc = a.n ?? 0;
-      const hit = ms.find((x) => x.m === member);
-      let ns: number;
-      if (hit) { hit.score += inc; ns = hit.score; }
-      else { ms.push({ m: member, score: inc }); ns = inc; }
-      zSort(ms, false);
-      await zSave(m, a.key, scope, ms);
-      return ns;
+      await guardWrite();
+      return Number(await b.redis.zincrby(b.memberKey(coll, key), a.n ?? 0, a.member as string));
     }
     case "zrange":
     case "zrevrange": {
-      const ms = await zLoad(m, a.key, scope);
-      zSort(ms, cmd === "zrevrange");
-      const n = ms.length;
-      let st = listIdx(n, a.start ?? 0), en = listIdx(n, a.stop ?? -1) + 1;
-      if (st < 0) st = 0; if (en > n) en = n; if (en < st) en = st;
-      return zRender(st >= n ? [] : ms.slice(st, en), !!a.withscores);
+      if (!(await guardRead())) return zRender([], !!a.withscores);
+      const rk = b.memberKey(coll, key);
+      const st = String(a.start ?? 0), en = String(a.stop ?? -1);
+      const flat = cmd === "zrevrange"
+        ? await b.redis.zrevrange(rk, st, en, "WITHSCORES")
+        : await b.redis.zrange(rk, st, en, "WITHSCORES");
+      return zRender(zPairs(flat), !!a.withscores);
     }
     case "zrangebyscore":
     case "zrevrangebyscore": {
-      const ms = await zLoad(m, a.key, scope);
-      const min = a.min ?? -Infinity, max = a.max ?? Infinity;
-      const sub = ms.filter((x) => x.score >= min && x.score <= max);
-      zSort(sub, cmd === "zrevrangebyscore");
-      return zRender(sub, !!a.withscores);
+      if (!(await guardRead())) return zRender([], !!a.withscores);
+      const rk = b.memberKey(coll, key);
+      const min = scoreArg(a.min ?? -Infinity), max = scoreArg(a.max ?? Infinity);
+      const flat = cmd === "zrevrangebyscore"
+        ? await b.redis.zrevrangebyscore(rk, max, min, "WITHSCORES")
+        : await b.redis.zrangebyscore(rk, min, max, "WITHSCORES");
+      return zRender(zPairs(flat), !!a.withscores);
     }
     case "zrank":
     case "zrevrank": {
-      const ms = await zLoad(m, a.key, scope);
-      zSort(ms, cmd === "zrevrank");
-      return { rank: ms.findIndex((x) => x.m === (a.member as string | undefined)) };
+      if (!(await guardRead())) return { rank: -1 };
+      const rk = b.memberKey(coll, key);
+      const n = cmd === "zrevrank"
+        ? await b.redis.zrevrank(rk, a.member as string)
+        : await b.redis.zrank(rk, a.member as string);
+      return { rank: n === null ? -1 : n };
     }
     case "zpopmin":
     case "zpopmax": {
-      const ms = await zLoad(m, a.key, scope);
-      zSort(ms, cmd === "zpopmax");
+      await guardWrite();
+      const rk = b.memberKey(coll, key);
       let count = a.count ?? 1;
       if (count <= 0) count = 1;
-      if (count > ms.length) count = ms.length;
-      const popped = ms.slice(0, count);
-      await zSave(m, a.key, scope, ms.slice(count));
-      return zRender(popped, true);
+      const flat = cmd === "zpopmax" ? await b.redis.zpopmax(rk, count) : await b.redis.zpopmin(rk, count);
+      return zRender(zPairs(flat), true);
     }
     case "zremrangebyrank": {
-      const ms = await zLoad(m, a.key, scope);
-      zSort(ms, false);
-      const n = ms.length;
-      let st = listIdx(n, a.start ?? 0), en = listIdx(n, a.stop ?? -1) + 1;
-      if (st < 0) st = 0; if (en > n) en = n; if (en < st) en = st;
-      let removed = 0;
-      const kept = ms.filter((_x, i) => { if (st < n && i >= st && i < en) { removed++; return false; } return true; });
-      await zSave(m, a.key, scope, kept);
-      return removed;
+      await guardWrite();
+      return await b.redis.zremrangebyrank(b.memberKey(coll, key), a.start ?? 0, a.stop ?? -1);
     }
     case "zremrangebyscore": {
-      const ms = await zLoad(m, a.key, scope);
-      const min = a.min ?? -Infinity, max = a.max ?? Infinity;
-      let removed = 0;
-      const kept = ms.filter((x) => { if (x.score >= min && x.score <= max) { removed++; return false; } return true; });
-      await zSave(m, a.key, scope, kept);
-      return removed;
+      await guardWrite();
+      return await b.redis.zremrangebyscore(
+        b.memberKey(coll, key),
+        scoreArg(a.min ?? -Infinity),
+        scoreArg(a.max ?? Infinity),
+      );
     }
     default:
       throw new NotFoundError(`unknown command: ${cmd}`);
   }
 }
 
-// globToRegex converts a Redis glob (used by HSCAN match) to an anchored regex,
-// mirroring Go's globToRegex.
-function listIdx(n: number, i: number): number { return i < 0 ? n + i : i; }
-type ZM = { m: string; score: number };
-async function zLoad(m: MongoCollection<Doc>, key: string | undefined, scope: Filter): Promise<ZM[]> {
-  const doc = await m.findOne({ _id: key, ...scope } as Filter) as Doc | null;
-  return ((doc?.members as ZM[]) ?? []);
-}
-async function zSave(m: MongoCollection<Doc>, key: string | undefined, scope: Filter, ms: ZM[]): Promise<void> {
-  await m.updateOne({ _id: key, ...scope } as Filter, { $set: { members: ms } } as never, { upsert: true });
-}
-function zSort(ms: ZM[], rev: boolean): void {
-  ms.sort((x, y) => x.score !== y.score ? (rev ? y.score - x.score : x.score - y.score) : (rev ? (y.m > x.m ? 1 : -1) : (x.m < y.m ? -1 : 1)));
-}
-function zRender(ms: ZM[], withScores: boolean): unknown {
-  return withScores ? ms.map((x) => ({ m: x.m, score: x.score })) : ms.map((x) => x.m);
-}
-
-function globToRegex(glob: string): string {
-  let r = "^";
-  for (const ch of glob) {
-    if (ch === "*") r += ".*";
-    else if (ch === "?") r += ".";
-    else if (".+()|[]{}^$\\".includes(ch)) r += "\\" + ch;
-    else r += ch;
-  }
-  return r + "$";
-}
-
 // ----------------------------------------------------------------------------
 // serverDb — raw, trusted, typed db for handler/server code (no scope, no JWT).
 // ----------------------------------------------------------------------------
 
-function makeServerApi<C extends Collection<any>>(coll: C, m: MongoCollection<Doc>): DbApi<C> {
+function makeServerApi<C extends Collection<any>>(coll: C, b: KvBackend, storage: string): DbApi<C> {
   const w = (v: Record<string, unknown>) => prepareWrite(coll, v, { trusted: true });
+  const run = (cmd: string, a: ExecArgs) => exec(b, storage, cmd, a, {});
   const hget = async (key: string) => {
     try {
-      return (await exec(m, "hget", { key }, {})) as any;
+      return (await run("hget", { key })) as any;
     } catch (e) {
       if (e instanceof NotFoundError) return null;
       throw e;
     }
   };
   const hset = async (key: string, value: any) => {
-    await exec(m, "hset", { key, value: w(value) }, {});
+    await run("hset", { key, value: w(value) });
   };
   return {
     hget,
     hset,
     get: hget,
     set: hset,
-    hsetnx: async (key, value) => ((await exec(m, "hsetnx", { key, value: w(value as Doc) }, {})) as any).inserted,
-    hdel: async (...keys) => void (await exec(m, "hdel", { keys }, {})),
-    del: async (...keys) => void (await exec(m, "del", { keys }, {})),
+    hsetnx: async (key, value) => ((await run("hsetnx", { key, value: w(value as Doc) })) as any).inserted,
+    hdel: async (...keys) => void (await run("hdel", { keys })),
+    del: async (...keys) => void (await run("del", { keys })),
     save: async (value) => {
       const v = w(value as Record<string, unknown>);
-      await exec(m, "hset", { key: String((v as Doc)._id), value: v }, {});
+      await run("hset", { key: String((v as Doc)._id), value: v });
     },
-    hexists: async (key) => ((await exec(m, "hexists", { key }, {})) as any).exists,
-    hgetall: async () => (await exec(m, "hgetall", {}, {})) as any,
-    hkeys: async () => (await exec(m, "hkeys", {}, {})) as any,
-    hvals: async () => (await exec(m, "hvals", {}, {})) as any,
-    hlen: async () => ((await exec(m, "hlen", {}, {})) as any).len,
-    hincrby: async (key, field, n) => void (await exec(m, "hincrby", { key, field, n }, {})),
-    hincrbyfloat: async (key, field, n) => void (await exec(m, "hincrbyfloat", { key, field, n }, {})),
+    hexists: async (key) => ((await run("hexists", { key })) as any).exists,
+    hgetall: async () => (await run("hgetall", {})) as any,
+    hkeys: async () => (await run("hkeys", {})) as any,
+    hvals: async () => (await run("hvals", {})) as any,
+    hlen: async () => ((await run("hlen", {})) as any).len,
+    hincrby: async (key, field, n) => void (await run("hincrby", { key, field, n })),
+    hincrbyfloat: async (key, field, n) => void (await run("hincrbyfloat", { key, field, n })),
     hmset: async (entries) => {
-      const prepared: Doc = {};
+      const prepared: Record<string, Doc> = {};
       for (const [k, v] of Object.entries(entries)) prepared[k] = w(v as Record<string, unknown>) as Doc;
-      await exec(m, "hmset", { entries: prepared as Record<string, Doc> }, {});
+      await run("hmset", { entries: prepared });
     },
-    hmget: async (keys) => (await exec(m, "hmget", { keys }, {})) as any,
-    hrandfield: async (count) => (await exec(m, "hrandfield", count ? { count } : {}, {})) as string[],
-    hscan: async (cursor = 0, match, count) => (await exec(m, "hscan", { cursor, match, count }, {})) as any,
-    hscannovalues: async (cursor = 0, match, count) => (await exec(m, "hscannovalues", { cursor, match, count }, {})) as any,
-    count: async (filter = {}) => ((await exec(m, "count", { filter }, {})) as any).count ?? 0,
-    find: async (filter = {}, opt = {}) => (await exec(m, "find", { filter, opt }, {})) as any,
+    hmget: async (keys) => (await run("hmget", { keys })) as any,
+    hrandfield: async (count) => (await run("hrandfield", count ? { count } : {})) as string[],
+    hscan: async (cursor = 0, match, count) => (await run("hscan", { cursor, match, count })) as any,
+    hscannovalues: async (cursor = 0, match, count) => (await run("hscannovalues", { cursor, match, count })) as any,
+    count: async (filter = {}) => ((await run("count", { filter })) as any).count ?? 0,
+    find: async (filter = {}, opt = {}) => (await run("find", { filter, opt })) as any,
+    sql: async (statement: string) => (await run("sql", { sql: statement })) as any,
+    sqlCount: async (statement: string) => ((await run("sql", { sql: statement })) as any).count ?? 0,
     findone: async (filter = {}) => {
       try {
-        return (await exec(m, "findone", { filter }, {})) as any;
+        return (await run("findone", { filter })) as any;
       } catch (e) {
         if (e instanceof NotFoundError) return null;
         throw e;
       }
     },
     watch: async (onEvent: WatchHandler<any>): Promise<Unsubscribe> => {
-      const stream = m.watch(ownerPipeline({}), { fullDocument: "updateLookup" });
-      void (async () => {
-        try {
-          for await (const ev of stream) {
-            const w = toWatchEvent(ev as unknown as Record<string, unknown>);
-            if (w) onEvent(w);
-          }
-        } catch {
-          /* stream closed */
-        }
-      })();
-      return () => {
-        void (stream as { close?: () => Promise<void> }).close?.();
-      };
+      const sub = await subscribeChanges(b, storage, {}, (ev) => onEvent(ev as WatchEvent<any>));
+      return () => { void sub(); };
     },
   };
 }
 
-/** Build a raw, trusted, typed db bound directly to a Mongo database. Use inside
- * API handlers and server code. No owner-scope and no JWT — full access. */
-export function serverDb<M extends Record<string, Collection<any>>>(schema: M, db: MongoDb): Db<M> {
+/** Build a raw, trusted, typed db bound directly to a KVRocks namespace. Use
+ * inside API handlers and server code. No owner-scope and no JWT — full access. */
+export function serverDb<M extends Record<string, Collection<any>>>(schema: M, backend: KvBackend): Db<M> {
   const out = {} as Db<M>;
   for (const name of Object.keys(schema) as (keyof M & string)[]) {
-    (out as any)[name] = makeServerApi(schema[name], db.collection<Doc>(schema[name].opts.name ?? name));
+    const storage = schema[name].opts.name ?? name;
+    (out as any)[name] = makeServerApi(schema[name], backend, storage);
   }
   return out;
 }
 
-/** Ensure every index declared in the schema exists (idempotent). */
-export async function ensureIndexes(schema: Record<string, Collection<any>>, db: MongoDb): Promise<void> {
+/** Register the index declarations the schema carries.
+ *
+ * KVRocks has no secondary indexes, so this is no longer "create indexes on the
+ * server". Only `unique` has runtime meaning and dopdb enforces it itself (see
+ * kvrocks.ts enforceUnique); asc/desc/text declarations are recorded for
+ * declaration fidelity and are inert, and a TTL declaration on a Hash field has
+ * no equivalent at all — a Hash collection is ONE Redis key, so a per-document
+ * expiry cannot be expressed. Per-key TTL survives where it is native: the
+ * String family's `?expiration=`.
+ *
+ * Kept as an exported function, and still called at startup, so the schema stays
+ * the single place indexes are declared. */
+export async function ensureIndexes(schema: Record<string, Collection<any>>, backend: KvBackend): Promise<void> {
   for (const name of Object.keys(schema)) {
     const spec = specOf(name, schema[name]);
-    const m = db.collection<Doc>(spec.name);
-    for (const idx of spec.indexes) {
-      const dir: 1 | -1 | "text" = idx.kind === "text" ? "text" : idx.kind === "desc" ? -1 : 1;
-      const key: Record<string, 1 | -1 | "text"> = { [idx.field]: dir };
-      const opts: { name: string; unique?: boolean; expireAfterSeconds?: number } = { name: idx.name };
-      if (idx.expireAfterSeconds != null) opts.expireAfterSeconds = idx.expireAfterSeconds;
-      else opts.unique = idx.unique;
-      await m.createIndex(key, opts);
-    }
+    const unique = spec.indexes.filter((i) => i.unique && i.expireAfterSeconds == null).map((i) => i.field);
+    backend.registerUnique(spec.name, unique);
   }
+}
+
+// ---- change events ----------------------------------------------------------
+//
+// Mongo change streams are gone. watch consumes dopdb's own publication channel
+// (kvrocks.ts publish), on a dedicated subscriber connection. The observable
+// contract is unchanged: writes are delivered, and a scoped watcher never sees
+// deletes (they carry no document to scope on).
+//
+// What does NOT survive is resume: Redis pub/sub is fire-and-forget, so a
+// reconnect starts fresh and events during the gap are missed. The server
+// therefore emits no SSE `id:` lines, and the client sends no Last-Event-ID.
+
+async function subscribeChanges(
+  b: KvBackend,
+  coll: string,
+  scope: Filter,
+  onEvent: (ev: WatchEvent<Doc>) => void,
+): Promise<() => Promise<void>> {
+  const sub = b.redis.duplicate();
+  await sub.subscribe(b.eventChannel(coll));
+  const scoped = Object.keys(scope).length > 0;
+  sub.on("message", (_ch: string, payload: string) => {
+    let ev: { op?: string; id?: string; doc?: Doc | null };
+    try { ev = JSON.parse(payload); } catch { return; }
+    const op = ev.op;
+    if (op !== "insert" && op !== "update" && op !== "replace" && op !== "delete") return;
+    const doc = ev.doc ?? null;
+    if (scoped) {
+      if (!doc) return; // deletes carry no document to scope on
+      if (!matchFilter({ ...doc, _id: ev.id }, scope)) return;
+    }
+    onEvent({ type: op, key: String(ev.id ?? ""), doc: doc ? { ...doc, _id: ev.id } : null });
+  });
+  return async () => {
+    try { await sub.unsubscribe(); } catch { /* already gone */ }
+    sub.disconnect();
+  };
 }
 
 // ----------------------------------------------------------------------------
@@ -743,7 +764,7 @@ export async function ensureIndexes(schema: Record<string, Collection<any>>, db:
 
 const DATA_COMMANDS = new Set([
   "hget", "hset", "hsetnx", "hdel", "del", "hexists", "hgetall",
-  "hkeys", "hvals", "hlen", "hincrby", "hincrbyfloat", "hmset", "hmget", "count", "find", "findone",
+  "hkeys", "hvals", "hlen", "hincrby", "hincrbyfloat", "hmset", "hmget", "count", "find", "findone", "sql",
   "hrandfield", "hscan", "hscannovalues",
   "strget", "strset", "strsetall", "strgetall", "strdel",
   "sadd", "srem", "smembers", "sismember", "scard",
@@ -754,15 +775,18 @@ const DATA_COMMANDS = new Set([
 const STREAM_COMMANDS = new Set(["watch"]);
 const ROUTED_COMMANDS = new Set([...DATA_COMMANDS, ...STREAM_COMMANDS]);
 
-type MongoConn = MongoDb | { uri: string; db: string };
+/** A datasource: either an already-open backend, or the connection details to
+ * open one. `namespace` is the KVRocks stand-in for a Mongo database name — it
+ * prefixes every key this datasource writes. */
+export type KvSource = KvBackend | KvConn;
 
 export interface ServeConfig {
   /** The single schema map. */
   schema: Record<string, Collection<any>>;
   /** A single datasource (registered as "default"); or omit and use datasources. */
-  mongo?: MongoConn;
+  kvrocks?: KvSource;
   /** Several named datasources; a request selects one with ?ds=<name>. */
-  datasources?: { name: string; mongo: MongoConn }[];
+  datasources?: { name: string; kvrocks: KvSource }[];
   /** Secret for verifying bearer tokens: an HS256 key, or an RS256 public key
    * (PEM/SPKI). Omit only in trusted dev. */
   jwtSecret?: string;
@@ -817,7 +841,7 @@ interface ReqInput {
 // adapter turns into an SSE stream in its own transport.
 type Outcome =
   | { kind: "json"; status: number; body: unknown }
-  | { kind: "watch"; m: MongoCollection<Doc>; scope: Filter; resumeAfter: unknown };
+  | { kind: "watch"; backend: KvBackend; coll: string; scope: Filter };
 
 interface Runtime {
   db: Db<any>;
@@ -902,55 +926,46 @@ interface SSESink {
   onAbort(cb: () => void): void;
 }
 
-// streamWatch opens an owner-scoped change stream and pumps SSE lines into a
-// transport-neutral sink. Shared by the Node and Web adapters. Owner-scoped
-// streams match on fullDocument.<owner>, so deletes are not delivered to scoped
-// watchers. Requires MongoDB to run as a replica set.
-async function streamWatch(m: MongoCollection<Doc>, scope: Filter, resumeAfter: unknown, sink: SSESink): Promise<void> {
-  let stream: ChangeStream<Doc>;
-  try {
-    const opts = { fullDocument: "updateLookup" } as ChangeStreamOptions;
-    if (resumeAfter) (opts as { resumeAfter?: unknown }).resumeAfter = resumeAfter;
-    stream = m.watch(ownerPipeline(scope), opts);
-  } catch {
-    try { sink.write(`event: error\ndata: {"code":"watch_error"}\n\n`); } catch { /* gone */ }
-    sink.close();
-    return;
-  }
-  sink.write(": connected\n\n");
-  const ping = setInterval(() => sink.write(": ping\n\n"), 25000);
+// streamWatch subscribes to the collection's change channel and pumps SSE lines
+// into a transport-neutral sink. Shared by the Node and Web adapters. Scoped
+// watchers never see deletes (no document to scope on).
+//
+// Redis pub/sub has no replay, so there is no resume token and no SSE `id:`
+// line: a reconnect starts fresh and events during the gap are missed. That is
+// weaker than a change-stream resume token and is called out in docs/02-http.md.
+async function streamWatch(b: KvBackend, coll: string, scope: Filter, sink: SSESink): Promise<void> {
+  let unsubscribe: (() => Promise<void>) | null = null;
   let finished = false;
   const finish = () => {
     if (finished) return;
     finished = true;
     clearInterval(ping);
-    void stream.close().catch(() => {});
+    void unsubscribe?.();
     sink.close();
   };
+  const ping = setInterval(() => {
+    try { sink.write(": ping\n\n"); } catch { finish(); }
+  }, 25000);
   sink.onAbort(finish);
   try {
-    for await (const ev of stream) {
-      const rec = ev as unknown as Record<string, unknown>;
-      const w = toWatchEvent(rec);
-      if (!w) continue;
-      const token = rec._id;
-      if (token !== undefined) sink.write(`id: ${Buffer.from(JSON.stringify(token)).toString("base64")}\n`);
-      sink.write(`data: ${JSON.stringify(w)}\n\n`);
-    }
+    unsubscribe = await subscribeChanges(b, coll, scope, (ev) => {
+      try { sink.write(`data: ${JSON.stringify(ev)}\n\n`); } catch { finish(); }
+    });
   } catch {
-    // resume token likely invalid/expired → tell the client to reconnect fresh
     try { sink.write(`event: error\ndata: {"code":"watch_error"}\n\n`); } catch { /* gone */ }
+    finish();
+    return;
   }
-  finish();
+  sink.write(": connected\n\n");
 }
 
 // ---- the runtime (shared by every adapter) ----------------------------------
 
 async function buildRuntime(cfg: ServeConfig): Promise<Runtime> {
-  // Validate schema config BEFORE any side effects (Mongo connect). Fail-closed:
+  // Validate schema config BEFORE any side effects (connecting). Fail-closed:
   // a row-scoped collection MUST bind its owner field to an identity claim, or
   // prepareWrite never sets the owner and the {owner:@uid} predicate matches
-  // nothing — scoping would silently break. Reject at startup; needs no Mongo.
+  // nothing — scoping would silently break. Reject at startup; needs no server.
   for (const key of Object.keys(cfg.schema)) {
     const c = cfg.schema[key];
     const of = c.opts.ownerField;
@@ -962,22 +977,18 @@ async function buildRuntime(cfg: ServeConfig): Promise<Runtime> {
     }
   }
 
-  // Datasource registry: name -> Db. A single `mongo` registers as "default";
-  // `datasources` registers several. ?ds=<name> selects one per request.
-  const dbs = new Map<string, MongoDb>();
-  const ownClients: MongoClient[] = [];
-  const open = async (conn: MongoConn): Promise<MongoDb> => {
-    if ("uri" in conn) {
-      const { MongoClient } = await mongodb();
-      const client = new MongoClient(conn.uri);
-      await client.connect();
-      ownClients.push(client);
-      return client.db(conn.db);
-    }
-    return conn;
+  // Datasource registry: name -> backend. A single `kvrocks` registers as
+  // "default"; `datasources` registers several. ?ds=<name> selects one per request.
+  const dbs = new Map<string, KvBackend>();
+  const owned: KvBackend[] = [];
+  const open = (src: KvSource): KvBackend => {
+    if (src instanceof KvBackend) return src;
+    const b = KvBackend.connect(src);
+    owned.push(b);
+    return b;
   };
-  if (cfg.datasources) for (const d of cfg.datasources) dbs.set(d.name, await open(d.mongo));
-  if (cfg.mongo) dbs.set("default", await open(cfg.mongo));
+  if (cfg.datasources) for (const d of cfg.datasources) dbs.set(d.name, open(d.kvrocks));
+  if (cfg.kvrocks) dbs.set("default", open(cfg.kvrocks));
   if (!dbs.has("default")) {
     const first = dbs.keys().next().value as string | undefined;
     if (!first) throw new Error("dopdb serve: no datasources configured");
@@ -1049,16 +1060,12 @@ async function buildRuntime(cfg: ServeConfig): Promise<Runtime> {
 
     const scope = ownerScope(coll, claims);
     const ds = input.url.searchParams.get("ds") || "default";
-    const reqDb = dbs.get(ds) ?? defaultDb;
-    const m = reqDb.collection<Doc>(entry.storage);
+    const backend = dbs.get(ds) ?? defaultDb;
 
     if (r.cmd === "watch") {
-      const rawResume = input.header("last-event-id");
-      let resumeAfter: unknown;
-      if (rawResume) {
-        try { resumeAfter = JSON.parse(Buffer.from(rawResume, "base64").toString("utf8")); } catch { resumeAfter = undefined; }
-      }
-      return { kind: "watch", m, scope, resumeAfter };
+      // No resume token: Redis pub/sub does not replay, so Last-Event-ID is
+      // deliberately ignored rather than silently pretending to resume.
+      return { kind: "watch", backend, coll: entry.storage, scope };
     }
 
     // Request context for @-resolution: verified claims + server-injected context.
@@ -1172,6 +1179,24 @@ async function buildRuntime(cfg: ServeConfig): Promise<Runtime> {
       }
     }
 
+    // A SQL statement is not JSON, so both a raw body and {"sql":"..."} are
+    // accepted; ?q= carries it on a GET.
+    let sqlText: string | undefined;
+    if (r.cmd === "sql") {
+      sqlText = input.url.searchParams.get("q") ?? undefined;
+      if (!sqlText && bodyText) {
+        try {
+          const wrapper = JSON.parse(bodyText) as { sql?: string };
+          sqlText = typeof wrapper?.sql === "string" ? wrapper.sql : bodyText;
+        } catch {
+          sqlText = bodyText;
+        }
+      }
+      if (!sqlText || !sqlText.trim()) {
+        return { kind: "json", status: 400, body: { error: 'sql requires ?q=<statement> or a body of {"sql":"..."}', code: "validation" } };
+      }
+    }
+
     let filter: Filter | undefined;
     if (r.cmd === "find" || r.cmd === "findone" || r.cmd === "count") {
       if (bodyText) {
@@ -1195,7 +1220,7 @@ async function buildRuntime(cfg: ServeConfig): Promise<Runtime> {
       return { kind: "json", status: 400, body: { error: msg, code: "validation" } };
     }
 
-    const out = await exec(m, r.cmd, {
+    const out = await exec(backend, entry.storage, r.cmd, {
       key,
       keys,
       value,
@@ -1218,13 +1243,14 @@ async function buildRuntime(cfg: ServeConfig): Promise<Runtime> {
       min: input.url.searchParams.has("min") ? Number(input.url.searchParams.get("min")) : undefined,
       max: input.url.searchParams.has("max") ? Number(input.url.searchParams.get("max")) : undefined,
       withscores: input.url.searchParams.get("withscores") === "true" || input.url.searchParams.get("withscores") === "1",
+      sql: sqlText,
       opt,
     }, scope);
     return { kind: "json", status: 200, body: out ?? null };
   }
 
   async function close(): Promise<void> {
-    for (const c of ownClients) await c.close();
+    for (const b of owned) await b.close();
   }
 
   return { db: rawDb, specs, cors: cfg.cors, resolve, close };
@@ -1283,7 +1309,7 @@ async function nodeHandle(rt: Runtime, req: IncomingMessage, res: ServerResponse
     close: () => { try { res.end(); } catch { /* already ended */ } },
     onAbort: (cb) => req.on("close", cb),
   };
-  await streamWatch(outcome.m, outcome.scope, outcome.resumeAfter, sink);
+  await streamWatch(outcome.backend, outcome.coll, outcome.scope, sink);
 }
 
 /** Start a standalone server (and/or obtain a Node request listener usable from
@@ -1327,15 +1353,15 @@ export type NextRouteHandler = (
  *   import { schema } from "@/dopdb-schema";
  *   const perms = new Permissions().grant("HGET", "users").grant("HSET", "users");
  *   export const { GET, POST, OPTIONS } =
- *     createNextHandler({ schema, mongo: { uri: process.env.MONGO_URI!, db: "appdb" },
+ *     createNextHandler({ schema, kvrocks: { uri: process.env.KVROCKS_URI!, namespace: "appdb" },
  *                         jwtSecret: process.env.JWT_SECRET!, permissions: perms });
- *   export const runtime = "nodejs"; // the MongoDB driver is not Edge-compatible
+ *   export const runtime = "nodejs"; // the redis client is not Edge-compatible
  *
  * The route prefix is just the folder you mount in (the catch-all segments are
  * used directly), so renaming `api` to anything else needs no code change — set
  * the matching `apiBase` on the client.
  *
- * The Mongo connection is opened lazily on the first request and reused.
+ * The KVRocks connection is opened lazily on the first request and reused.
  */
 export function createNextHandler(cfg: ServeConfig): {
   GET: NextRouteHandler;
@@ -1345,7 +1371,7 @@ export function createNextHandler(cfg: ServeConfig): {
   let rtPromise: Promise<Runtime> | null = null;
   const getRuntime = () => (rtPromise ??= buildRuntime(cfg));
   const handler: NextRouteHandler = async (req, ctx) => {
-    // Answer CORS preflight without opening a Mongo connection.
+    // Answer CORS preflight without opening a KVRocks connection.
     if (req.method.toUpperCase() === "OPTIONS") {
       return new Response(null, { status: 204, headers: corsHeadersWeb(cfg.cors, req.headers.get("origin") ?? undefined) });
     }
@@ -1414,7 +1440,7 @@ async function webHandle(
       });
     }
     // watch → SSE via a ReadableStream.
-    const { m, scope, resumeAfter } = outcome;
+    const { backend, coll, scope } = outcome;
     const stream = new ReadableStream<Uint8Array>({
       start(controller) {
         const enc = new TextEncoder();
@@ -1424,7 +1450,7 @@ async function webHandle(
           close: () => { if (!closed) { closed = true; try { controller.close(); } catch { /* closed */ } } },
           onAbort: (cb) => req.signal?.addEventListener("abort", cb),
         };
-        void streamWatch(m, scope, resumeAfter, sink);
+        void streamWatch(backend, coll, scope, sink);
       },
     });
     return new Response(stream, {
@@ -1457,8 +1483,9 @@ export interface ServeFromConfigOptions {
 }
 
 /** Start a standalone Node server from a config file (TOML/JSON). Secrets and the
- * Mongo URIs are resolved from environment variables per the config, never from
- * the file. All [[mongo]] sources are loaded as datasources (?ds= selects one). */
+ * URIs and passwords are resolved from environment variables per the config,
+ * never from the file. All [[kvrocks]] sources are loaded as datasources
+ * (?ds= selects one). */
 export async function serveFromConfig(path: string, opts: ServeFromConfigOptions): Promise<DopdbServer> {
   const cfg = loadConfig(path);
   return serve({
@@ -1467,7 +1494,7 @@ export async function serveFromConfig(path: string, opts: ServeFromConfigOptions
     permit: opts.permit,
     permissions: opts.permissions,
     basePath: opts.basePath,
-    datasources: cfg.mongo.map((m) => ({ name: m.name, mongo: { uri: m.uri, db: m.db } })),
+    datasources: cfg.kvrocks.map((k) => ({ name: k.name, kvrocks: { uri: k.uri, namespace: k.namespace, password: k.password } })),
     jwtSecret: cfg.http.jwtSecret,
     cors: cfg.http.corsOrigins,
     port: portFromAddr(cfg.http.addr),
@@ -1489,7 +1516,7 @@ export function nextHandlerFromConfig(path: string, opts: ServeFromConfigOptions
     permit: opts.permit,
     permissions: opts.permissions,
     basePath: opts.basePath,
-    datasources: cfg.mongo.map((m) => ({ name: m.name, mongo: { uri: m.uri, db: m.db } })),
+    datasources: cfg.kvrocks.map((k) => ({ name: k.name, kvrocks: { uri: k.uri, namespace: k.namespace, password: k.password } })),
     jwtSecret: cfg.http.jwtSecret,
     cors: cfg.http.corsOrigins,
   });
