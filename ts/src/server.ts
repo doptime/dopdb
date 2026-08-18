@@ -225,8 +225,17 @@ async function exec(b: KvBackend, coll: string, cmd: string, a: ExecArgs, scope:
 
   // Non-Hash collection types keep their row isolation in the collection's owner
   // index, because a native list/set/zset has no document to hold an owner field.
-  const guardRead = async (): Promise<boolean> => (scoped ? await b.checkOwner(coll, key, scope) : true);
+  //
+  // Both guards validate the key name FIRST. Ordering matters: claiming
+  // ownership before rejecting a reserved name would write a claim for a key the
+  // request is about to be refused, leaving the name owned by someone who never
+  // stored anything under it.
+  const guardRead = async (): Promise<boolean> => {
+    b.entryKey(coll, key);
+    return scoped ? await b.checkOwner(coll, key, scope) : true;
+  };
   const guardWrite = async (): Promise<void> => {
+    b.entryKey(coll, key);
     if (scoped && !(await b.claimOwner(coll, key, scope))) throw new ForbiddenError();
   };
 
@@ -307,11 +316,11 @@ async function exec(b: KvBackend, coll: string, cmd: string, a: ExecArgs, scope:
     }
     case "hincrby":
     case "hincrbyfloat": {
-      if (scoped) {
-        const doc = await b.get(coll, key);
-        if (!doc || !matchFilter(withId(key, doc), scope)) throw new ForbiddenError();
-      }
-      await b.incr(coll, key, a.field as string, a.n ?? 0);
+      // The ownership test runs INSIDE the increment's transaction, not here: a
+      // check followed by an unscoped increment is a check-then-act, and the
+      // window is reachable by an owner racing their own delete-and-recreate.
+      const pair = scoped ? scopePair(scope) : null;
+      await b.incr(coll, key, a.field as string, a.n ?? 0, pair?.[0], pair?.[1]);
       return { ok: true };
     }
     case "hmset": {
@@ -374,13 +383,13 @@ async function exec(b: KvBackend, coll: string, cmd: string, a: ExecArgs, scope:
     // ---- String family: a native Redis string per key, with a native TTL ----
     case "strget": {
       if (!(await guardRead())) throw new NotFoundError();
-      const raw = await b.redis.getBuffer(b.memberKey(coll, key));
+      const raw = await b.redis.getBuffer(b.entryKey(coll, key));
       if (!raw) throw new NotFoundError();
       return decodeValue(raw);
     }
     case "strset": {
       await guardWrite();
-      const rk = b.memberKey(coll, key);
+      const rk = b.entryKey(coll, key);
       const buf = encodeValue(a.value);
       if (a.n && a.n > 0) await b.redis.set(rk, buf, "EX", a.n);
       else await b.redis.set(rk, buf);
@@ -423,30 +432,31 @@ async function exec(b: KvBackend, coll: string, cmd: string, a: ExecArgs, scope:
     case "sadd": {
       await guardWrite();
       const ms = a.members ?? [];
-      if (ms.length > 0) await b.redis.sadd(b.memberKey(coll, key), ...ms.map(encodeValue));
+      if (ms.length > 0) await b.redis.sadd(b.entryKey(coll, key), ...ms.map(encodeValue));
       return { ok: true };
     }
     case "srem": {
       await guardWrite();
       const ms = a.members ?? [];
-      if (ms.length > 0) await b.redis.srem(b.memberKey(coll, key), ...ms.map(encodeValue));
+      if (ms.length > 0) await b.redis.srem(b.entryKey(coll, key), ...ms.map(encodeValue));
+      await b.releaseIfEmpty(coll, key, scope);
       return { ok: true };
     }
     case "smembers": {
       if (!(await guardRead())) return [];
-      const raws = await b.redis.smembersBuffer(b.memberKey(coll, key));
+      const raws = await b.redis.smembersBuffer(b.entryKey(coll, key));
       // Redis set iteration order is unspecified; sort so the answer is stable.
       raws.sort(Buffer.compare);
       return raws.map((r) => decodeValue(r));
     }
     case "sismember": {
       if (!(await guardRead())) return { member: false };
-      const n = await b.redis.sismember(b.memberKey(coll, key), encodeValue(a.member));
+      const n = await b.redis.sismember(b.entryKey(coll, key), encodeValue(a.member));
       return { member: n === 1 };
     }
     case "scard": {
       if (!(await guardRead())) return { card: 0 };
-      return { card: await b.redis.scard(b.memberKey(coll, key)) };
+      return { card: await b.redis.scard(b.entryKey(coll, key)) };
     }
 
     // ---- List family: a native Redis list per key ----
@@ -455,7 +465,7 @@ async function exec(b: KvBackend, coll: string, cmd: string, a: ExecArgs, scope:
       await guardWrite();
       const its = a.items ?? [];
       if (its.length === 0) return { ok: true };
-      const rk = b.memberKey(coll, key);
+      const rk = b.entryKey(coll, key);
       if (cmd === "lpush") {
         // reverse so the batch lands head-first in the order the caller gave —
         // the behaviour the Mongo build had ($each with $position:0). Raw Redis
@@ -469,29 +479,31 @@ async function exec(b: KvBackend, coll: string, cmd: string, a: ExecArgs, scope:
     case "lpop":
     case "rpop": {
       await guardWrite();
-      const rk = b.memberKey(coll, key);
+      const rk = b.entryKey(coll, key);
       const raw = cmd === "lpop" ? await b.redis.lpopBuffer(rk) : await b.redis.rpopBuffer(rk);
       if (!raw) throw new NotFoundError();
+      // Redis drops the key when the last element goes; the claim must go too.
+      await b.releaseIfEmpty(coll, key, scope);
       return decodeValue(raw);
     }
     case "lrange": {
       if (!(await guardRead())) return [];
-      const raws = await b.redis.lrangeBuffer(b.memberKey(coll, key), a.start ?? 0, a.stop ?? -1);
+      const raws = await b.redis.lrangeBuffer(b.entryKey(coll, key), a.start ?? 0, a.stop ?? -1);
       return raws.map((r) => decodeValue(r));
     }
     case "llen": {
       if (!(await guardRead())) return { len: 0 };
-      return { len: await b.redis.llen(b.memberKey(coll, key)) };
+      return { len: await b.redis.llen(b.entryKey(coll, key)) };
     }
     case "lindex": {
       if (!(await guardRead())) return null;
-      const raw = await b.redis.lindexBuffer(b.memberKey(coll, key), a.index ?? 0);
+      const raw = await b.redis.lindexBuffer(b.entryKey(coll, key), a.index ?? 0);
       return raw ? decodeValue(raw) : null;
     }
     case "lset": {
       await guardWrite();
       try {
-        await b.redis.lset(b.memberKey(coll, key), a.index ?? 0, encodeValue(a.item));
+        await b.redis.lset(b.entryKey(coll, key), a.index ?? 0, encodeValue(a.item));
       } catch (e) {
         // "index out of range" / "no such key" — the previous engine's NotFound
         const msg = String((e as Error)?.message ?? "").toLowerCase();
@@ -502,12 +514,14 @@ async function exec(b: KvBackend, coll: string, cmd: string, a: ExecArgs, scope:
     }
     case "lrem": {
       await guardWrite();
-      await b.redis.lrem(b.memberKey(coll, key), a.count ?? 0, encodeValue(a.item));
+      await b.redis.lrem(b.entryKey(coll, key), a.count ?? 0, encodeValue(a.item));
+      await b.releaseIfEmpty(coll, key, scope);
       return { ok: true };
     }
     case "ltrim": {
       await guardWrite();
-      await b.redis.ltrim(b.memberKey(coll, key), a.start ?? 0, a.stop ?? -1);
+      await b.redis.ltrim(b.entryKey(coll, key), a.start ?? 0, a.stop ?? -1);
+      await b.releaseIfEmpty(coll, key, scope);
       return { ok: true };
     }
     case "linsertbefore":
@@ -515,7 +529,7 @@ async function exec(b: KvBackend, coll: string, cmd: string, a: ExecArgs, scope:
       await guardWrite();
       // LINSERT answers -1 when the pivot is absent; that is not an error here,
       // matching the previous "pivot not found -> no change" behaviour.
-      const rk = b.memberKey(coll, key);
+      const rk = b.entryKey(coll, key);
       const pivot = encodeValue(a.pivot);
       const item = encodeValue(a.item);
       if (cmd === "linsertbefore") await b.redis.linsert(rk, "BEFORE", pivot, item);
@@ -532,37 +546,39 @@ async function exec(b: KvBackend, coll: string, cmd: string, a: ExecArgs, scope:
       // loosely, so the argument list is built as strings.
       const flat: string[] = [];
       for (const [m, s] of pairs) flat.push(String(s), m);
-      return await b.redis.zadd(b.memberKey(coll, key), ...flat);
+      return await b.redis.zadd(b.entryKey(coll, key), ...flat);
     }
     case "zrem": {
       await guardWrite();
       const ms = (a.members as string[] | undefined) ?? [];
       if (ms.length === 0) return 0;
-      return await b.redis.zrem(b.memberKey(coll, key), ...ms);
+      const removed = await b.redis.zrem(b.entryKey(coll, key), ...ms);
+      await b.releaseIfEmpty(coll, key, scope);
+      return removed;
     }
     case "zscore": {
       if (!(await guardRead())) throw new NotFoundError();
-      const s = await b.redis.zscore(b.memberKey(coll, key), a.member as string);
+      const s = await b.redis.zscore(b.entryKey(coll, key), a.member as string);
       if (s === null) throw new NotFoundError();
       return Number(s);
     }
     case "zcard": {
       if (!(await guardRead())) return { card: 0 };
-      return { card: await b.redis.zcard(b.memberKey(coll, key)) };
+      return { card: await b.redis.zcard(b.entryKey(coll, key)) };
     }
     case "zcount": {
       if (!(await guardRead())) return { count: 0 };
-      const n = await b.redis.zcount(b.memberKey(coll, key), scoreArg(a.min ?? -Infinity), scoreArg(a.max ?? Infinity));
+      const n = await b.redis.zcount(b.entryKey(coll, key), scoreArg(a.min ?? -Infinity), scoreArg(a.max ?? Infinity));
       return { count: n };
     }
     case "zincrby": {
       await guardWrite();
-      return Number(await b.redis.zincrby(b.memberKey(coll, key), a.n ?? 0, a.member as string));
+      return Number(await b.redis.zincrby(b.entryKey(coll, key), a.n ?? 0, a.member as string));
     }
     case "zrange":
     case "zrevrange": {
       if (!(await guardRead())) return zRender([], !!a.withscores);
-      const rk = b.memberKey(coll, key);
+      const rk = b.entryKey(coll, key);
       const st = String(a.start ?? 0), en = String(a.stop ?? -1);
       const flat = cmd === "zrevrange"
         ? await b.redis.zrevrange(rk, st, en, "WITHSCORES")
@@ -572,7 +588,7 @@ async function exec(b: KvBackend, coll: string, cmd: string, a: ExecArgs, scope:
     case "zrangebyscore":
     case "zrevrangebyscore": {
       if (!(await guardRead())) return zRender([], !!a.withscores);
-      const rk = b.memberKey(coll, key);
+      const rk = b.entryKey(coll, key);
       const min = scoreArg(a.min ?? -Infinity), max = scoreArg(a.max ?? Infinity);
       const flat = cmd === "zrevrangebyscore"
         ? await b.redis.zrevrangebyscore(rk, max, min, "WITHSCORES")
@@ -582,7 +598,7 @@ async function exec(b: KvBackend, coll: string, cmd: string, a: ExecArgs, scope:
     case "zrank":
     case "zrevrank": {
       if (!(await guardRead())) return { rank: -1 };
-      const rk = b.memberKey(coll, key);
+      const rk = b.entryKey(coll, key);
       const n = cmd === "zrevrank"
         ? await b.redis.zrevrank(rk, a.member as string)
         : await b.redis.zrank(rk, a.member as string);
@@ -591,23 +607,28 @@ async function exec(b: KvBackend, coll: string, cmd: string, a: ExecArgs, scope:
     case "zpopmin":
     case "zpopmax": {
       await guardWrite();
-      const rk = b.memberKey(coll, key);
+      const rk = b.entryKey(coll, key);
       let count = a.count ?? 1;
       if (count <= 0) count = 1;
       const flat = cmd === "zpopmax" ? await b.redis.zpopmax(rk, count) : await b.redis.zpopmin(rk, count);
+      await b.releaseIfEmpty(coll, key, scope);
       return zRender(zPairs(flat), true);
     }
     case "zremrangebyrank": {
       await guardWrite();
-      return await b.redis.zremrangebyrank(b.memberKey(coll, key), a.start ?? 0, a.stop ?? -1);
+      const n = await b.redis.zremrangebyrank(b.entryKey(coll, key), a.start ?? 0, a.stop ?? -1);
+      await b.releaseIfEmpty(coll, key, scope);
+      return n;
     }
     case "zremrangebyscore": {
       await guardWrite();
-      return await b.redis.zremrangebyscore(
-        b.memberKey(coll, key),
+      const n = await b.redis.zremrangebyscore(
+        b.entryKey(coll, key),
         scoreArg(a.min ?? -Infinity),
         scoreArg(a.max ?? Infinity),
       );
+      await b.releaseIfEmpty(coll, key, scope);
+      return n;
     }
     default:
       throw new NotFoundError(`unknown command: ${cmd}`);

@@ -6,6 +6,53 @@
 - **Node** ≥ 20 (the TS implementation; `ioredis` ^5 is a peer dependency, `cbor-x` a dependency). For the conformance test's TS subprocess, **Node ≥ 20.6** (the `--import tsx` loader); older defaults: run via the local `node_modules/.bin/tsx`, or set `DOPDB_TS_NODE` to a newer node.
 - **KVRocks**: any recent version. Every integration test runs against a plain instance — there is no replica-set requirement any more, because `watch` no longer uses change streams. Any Redis-protocol server works for the test suite, since dopdb uses only the common command set.
 
+## KVRocks server requirements (read before production)
+
+Two settings are load-bearing. dopdb does not check them at startup, and getting
+either wrong fails in a way that looks like an application bug.
+
+**1 · Eviction must be off.** dopdb assumes persistent storage. Everything it
+owns lives in ordinary keys — the documents, the `__owner` isolation index, the
+`__uniq:` claim hashes — so an eviction policy that discards keys under memory
+pressure discards *data and access control*, silently. A collection can lose its
+owner index and start answering scoped reads for the wrong tenant.
+
+```
+# kvrocks.conf — required
+maxmemory-policy noeviction
+```
+
+If a key must expire, say so explicitly with a String-family `?expiration=`; that
+is a TTL dopdb sets deliberately and `claimOwner` knows how to recover from.
+
+**2 · Standalone only, for now.** `ConnectDatasources` parses the URL and opens a
+single-node client. A KVRocks cluster URL is treated as one node, so the
+connection will fail or silently talk to a single shard. There is no cluster
+support; use one KVRocks instance per datasource, or several `[[kvrocks]]`
+sources for horizontal partitioning by collection.
+
+**3 · Persistence.** RocksDB is the store, so durability is KVRocks' own concern
+rather than dopdb's — but a run with the data directory on ephemeral storage will
+lose everything on restart, including the `__uniq:` claims that make unique
+indexes work.
+
+## Sizing the query surface
+
+`FIND`, `COUNT`, `FINDONE`, `SQL` and every scoped whole-collection read
+(`hgetall`/`hkeys`/`hlen` under an owner scope) walk the entire collection hash
+and decode every document. `LIMIT` bounds the response, **not** the work.
+
+Practical guidance:
+
+- Keep collections you query by content in the low tens of thousands of documents.
+  Past that, reach for a key you can address directly (`HGET`, `HMGET`).
+- `hgetall` has no response cap. The 1 MiB limit applies to the *request* body;
+  a large collection can return far more than that. On a big collection, page
+  with `HSCAN` instead.
+- A multi-tenant collection is the worst case: every tenant's read costs
+  O(all tenants). If tenant counts are large, give each tenant a key prefix and
+  use `HSCAN` with a glob, or a separate collection.
+
 ## Go: build and test
 
 ```bash

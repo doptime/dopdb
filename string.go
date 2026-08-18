@@ -58,12 +58,16 @@ type StringAccessor interface {
 // HttpStrGet returns the bare value at key (Redis GET).
 func (s *StringCollection[K]) HttpStrGet(ctx context.Context, ds, key string, scope M) (any, error) {
 	b := s.k.backend(ds)
+	rk, err := b.entryKey(s.k.coll, key)
+	if err != nil {
+		return nil, err
+	}
 	if err := b.checkOwner(ctx, s.k.coll, key, scope); err != nil {
 		// a foreign-owned key must look absent, not forbidden — same
 		// non-leakage the Hash family gets from its scoped filter
 		return nil, ErrNoDoc
 	}
-	raw, err := b.rdb.Get(ctx, b.memberKey(s.k.coll, key)).Bytes()
+	raw, err := b.rdb.Get(ctx, rk).Bytes()
 	if isRedisNil(err) {
 		return nil, ErrNoDoc
 	}
@@ -80,6 +84,10 @@ func (s *StringCollection[K]) HttpStrGet(ctx context.Context, ds, key string, sc
 // HttpStrSet sets the value at key (Redis SET). exp>0 sets a native TTL.
 func (s *StringCollection[K]) HttpStrSet(ctx context.Context, ds, key string, value any, exp time.Duration, scope M) error {
 	b := s.k.backend(ds)
+	rk, err := b.entryKey(s.k.coll, key)
+	if err != nil {
+		return err
+	}
 	if err := b.claimOwner(ctx, s.k.coll, key, scope); err != nil {
 		return err
 	}
@@ -87,7 +95,7 @@ func (s *StringCollection[K]) HttpStrSet(ctx context.Context, ds, key string, va
 	if err != nil {
 		return err
 	}
-	return b.rdb.Set(ctx, b.memberKey(s.k.coll, key), raw, exp).Err()
+	return b.rdb.Set(ctx, rk, raw, exp).Err()
 }
 
 // HttpStrSetAll sets many key→value pairs (Redis MSET semantics, one pipeline).
@@ -98,6 +106,10 @@ func (s *StringCollection[K]) HttpStrSetAll(ctx context.Context, ds string, item
 	b := s.k.backend(ds)
 	pipe := b.rdb.Pipeline()
 	for k, v := range items {
+		rk, err := b.entryKey(s.k.coll, k)
+		if err != nil {
+			return err
+		}
 		if err := b.claimOwner(ctx, s.k.coll, k, scope); err != nil {
 			return err
 		}
@@ -105,7 +117,7 @@ func (s *StringCollection[K]) HttpStrSetAll(ctx context.Context, ds string, item
 		if err != nil {
 			return err
 		}
-		pipe.Set(ctx, b.memberKey(s.k.coll, k), raw, 0)
+		pipe.Set(ctx, rk, raw, 0)
 	}
 	_, err := pipe.Exec(ctx)
 	return err
@@ -153,10 +165,14 @@ func (s *StringCollection[K]) HttpStrDel(ctx context.Context, ds string, scope M
 	del := make([]string, 0, len(keys))
 	owned := make([]string, 0, len(keys))
 	for _, k := range keys {
+		rk, kerr := b.entryKey(s.k.coll, k)
+		if kerr != nil {
+			return kerr
+		}
 		if err := b.checkOwner(ctx, s.k.coll, k, scope); err != nil {
 			continue // not the caller's key: silently skipped, as before
 		}
-		del = append(del, b.memberKey(s.k.coll, k))
+		del = append(del, rk)
 		owned = append(owned, k)
 	}
 	if len(del) == 0 {

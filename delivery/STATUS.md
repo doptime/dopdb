@@ -1,3 +1,9 @@
+> ⚠️ **历史过程日志(R1–R11,MongoDB 时期)。不要照本文件配置环境。**
+> 本目录记录的是 KVRocks 迁移**之前**的交付过程,其中的 `DOPDB_TEST_MONGO_URI`、
+> 副本集要求、`bson` 标签、`mongo.go` 文件图等全部已作废。现行事实以仓库根目录的
+> `README.md` / `AGENTS.md` / `docs/` 为准(存储为 KVRocks,值格式 CBOR,
+> 测试环境变量为 `DOPDB_TEST_KVROCKS_URI`,不需要副本集)。
+
 # STATUS · dopdb 项目总台账(2026-06-27 · 本机 M5 完成后更新)
 
 > 本次为**承重门 Opus 终审后本机修复**:M5 Go↔TS conformance 已真做(9/9 PASS),F10/F13 已修复并验证,go build/vet/test 本机全绿。剩余:M1/M2/M3 回执 + I-P4 补充 + Opus 终审联签。

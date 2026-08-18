@@ -37,7 +37,7 @@ Selected Hash semantics:
 | `hmset`/`hmget` | POST/GET | batch write (`{id:{...}}`) / batch get (aligned to input, missing = null) |
 | `count`/`find`/`findone` | POST | count / array / first (filter in body; scoped AND-ed) |
 | `hscan`/`hscannovalues`/`hrandfield` | GET | glob scan (paginated) / random keys |
-| `watch` | GET | change stream → SSE |
+| `watch` | GET | dopdb change channel → SSE (no replay) |
 
 Reads are GET, writes are POST, `watch` is GET + SSE. Every command is guarded by the Go↔TS conformance harness.
 
@@ -85,6 +85,9 @@ Buys:
 - **No replica set**, and no `notify-keyspace-events` configuration — it works on a stock KVRocks.
 - The event carries the decoded document, not a cursor token.
 
+The Go and TypeScript engines both send a `: ping` comment every 25 s so proxies
+and load balancers do not drop an idle stream.
+
 Costs, stated plainly:
 
 - **No replay.** Redis pub/sub is fire-and-forget. There is no resume token, the server sends **no SSE `id:` line**, `Last-Event-ID` is deliberately ignored rather than pretending to resume, and a reconnect starts fresh — changes during the gap are missed.
@@ -102,11 +105,11 @@ Every non-2xx response uses a uniform shape: `{ "error": "...", "code": "..." }`
 
 | Status | code | Meaning |
 |---|---|---|
-| 400 | `validation` | invalid params/input; may also carry `fields` per-field detail |
+| 400 | `validation` | invalid params/input; may also carry `fields` per-field detail. Includes a String/List/Set/ZSet entry key that collides with dopdb's own bookkeeping names (`ErrReservedKey`) |
 | 401 | `unauthorized` | not authenticated / invalid JWT |
 | 403 | `forbidden` | not authorized, or row-level isolation denial (write to another → 403) |
 | 404 | `not_found` | document missing or collection not registered |
-| 409 | `conflict` | a `index:"unique"` violation (`ErrDuplicate`) — enforced by dopdb itself, since KVRocks has no unique index |
+| 409 | `conflict` | a `index:"unique"` violation (`ErrDuplicate`), or an increment against a field that does not hold a number (`ErrFieldType`) |
 | 500 | `error` | internal server error fallback |
 
 Both engines match; the client reconstructs a typed error from `code` (preferred) → `status` for `instanceof` branching.

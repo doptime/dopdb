@@ -1,60 +1,21 @@
-# delivery/ — Grounded Delivery 协作运行库(v3.1)
+# delivery/ — 历史过程日志(R1–R11,MongoDB 时期)
 
-> 本目录是**四方协作**的唯一组织信息落点,对四方都可见可读:
-> 人看甘特与承重门、意图层(Opus)看意图与承重证据、运营层(GLM)看台账与当前回合、执行层(Qwen)看当前回合的包。
-> **任何一方开工前,先读 `ROLES.md` 认领角色,再读 `STATUS.md` 找到"现在该做什么"。**
->
-> **v3.1 变更**:旧单一"云端"一分为二——**意图层 Opus(人工上传,定意图/契约/承重终判)** 与 **运营层 GLM(本地自动,跑日常审计/封包/对账/出包)**。回合从"两段两往返"细化为**显式 6 步**(见下)。文件重命名:`v0-plan.md`→`plan.md`;第 2 步范围简报统一叫 `brief.md`。防 facade 内核(🟢/🔴/suspend、RL1–8、L0/L1/L2、封存、单写者)**一字未动**。
+⚠️ **不要照本目录配置环境或理解现行架构。**
 
-## 目录结构(寿命从长到短,目录即模块)
+本目录是 dopdb 在 **KVRocks 迁移之前**(后端为 MongoDB)的交付过程记录:轮次台账、
+评审回执、项目卡。它保留下来是为了追溯"当时为什么这么决定",不是为了描述当前系统。
 
-```
-delivery/
-├─ README.md        本文件:目录定位与放置规则
-├─ ROLES.md         四方角色卡(人 / 意图-Opus / 运营-GLM / 执行-Qwen),静态
-├─ STATUS.md        项目总台账:甘特、阶段表、回合台账、封存清单(运营层 GLM 每回合刷新)
-├─ HISTORY.md       历史留存(已删回合的高密度等效)
-├─ kit/             方法论本体,跨项目通用 ── 换项目整目录拷走
-│  ├─ 00-protocol.md      四方契约:6 步、格式、红线、冻结、升级闸、打包(唯一权威)
-│  ├─ 01-cloud-manual.md  云端手册:上半=意图层 Opus(SOP),下半=运营层 GLM(SOP)
-│  └─ 02-local-manual.md  本地手册:执行层 Qwen 的执行循环与回执纪律
-├─ agents/          本地两层 agent 的模型绑定(omp 格式)── 审计层 ≠ 执行层
-│  ├─ glm-auditor.md      运营层 GLM:model moyu/glm-5.2(审计/封包/对账/出包)
-│  ├─ qwen-executor.md    执行层 Qwen:本地执行模型(≠ glm-5.2)
-│  └─ README.md           三种绑定法 + contextWindow/maxTokens + 放置位置
-├─ project/         本项目慢变事实 + 全量意图清单(换项目换这一格)
-│  └─ 10-project-card-dopdb.md
-└─ rounds/          回合目录:一回合一目录
-   └─ Ri/   brief.md(GLM↓)· plan.md(Qwen↑)· packet-*.md(GLM↓)·
-            receipt-*.md / progress.md / oob.md(Qwen↑)· SEALED.md(封存)
-```
+其中已经**全部作废**的内容包括,但不限于:
 
-## 一个回合的 6 步(= 两段交换,云端一分为二)
+| 过时说法 | 现行事实 |
+|---|---|
+| 后端 MongoDB / 需要副本集 | KVRocks(Redis 协议),单实例即可 |
+| `DOPDB_TEST_MONGO_URI` | `DOPDB_TEST_KVROCKS_URI` |
+| `bson:"..."` 结构体标签 | 已删除;字段名来自 `json:"..."`,存储格式 CBOR |
+| `mongo.go` / mongostore / memstore | `kvrocks.go` + `codec.go` + `query.go` + `index.go` |
+| `[[mongo]]` 配置段、`db = "..."` | `[[kvrocks]]` 配置段、`namespace = "..."` |
+| watch = change stream(可续传) | watch = dopdb 自建 pub/sub 频道(**不可续传**) |
+| 索引由服务端建立 | 只有 `unique` 由 dopdb 自己强制;其余标签为空操作 |
 
-> 这是 v3.0 两段式(规划交换 + 执行交换)的细化:把"云端"那几步明确分给 Opus 与 GLM。
-
-1. **意图层 Opus(人工上传)**:把全部意图/需求梳理进项目卡,定里程碑(合适粒度)、终态、决策表、红线、冻结,并为每个承重 🔴 写死硬判据 + 内嵌测试。**只在冷启动/换阶段/被升级/收尾时做**。
-2. **运营层 GLM(本地自动)**:审上一回合(三层审计苦力)→ 封存例行回合 → 刷新 `STATUS.md` → 开新回合写 `rounds/Ri/brief.md`(点范围+规格切片)。
-3. **执行层 Qwen(本地自动)**:据 `brief.md` 写 `plan.md`(拟议包的 目标/拟建/拟自证,**只写不执行**)。
-4. **运营层 GLM(本地自动)**:对账 `plan.md` → 定稿发布 `rounds/Ri/packet-*.md`(逐包 🟢/🔴 + 决策表 + 并行轨)。
-5. **执行层 Qwen(本地自动)**:按包执行——🟢 放手做,🔴 过硬判据则 done、过不了 suspend。
-6. **回到第 2 步**(下一回合),**或升级 Opus**(规格含糊 / 承重裁决不好判 → 第 1 步),**或结束**。
-
-**承重门 = 唯一需要人的点**:GLM 撞承重 🔴 → 产 SEAL 草稿 + 证据 → 置 `pending-opus` → 暂停/转并行轨 → 人把仓库 zip 给 Opus 落终判(方案 B)。两个承重门之间,2–5 步可**全自动连跑数小时**。
-
-## 防重复机制(为什么能快进)
-
-1. **回合目录 + `SEALED.md`**:GLM 审完例行回合即封存;封存目录是档案,谁也不再读/审。承重回合的终判由 Opus 联签后封存。
-2. **`STATUS.md` 是唯一滚动摘要**:想知道"到哪了"只读它;深究再进对应回合目录。
-3. 因此每回合,GLM 只读 `STATUS.md`+未封存回合;Qwen 只读 `STATUS.md`+当前回合;Opus 只在承重门读整仓。
-
-## 写入权属(单写者原则)
-
-| 路径 | 谁写 | 谁读 |
-|---|---|---|
-| `kit/`、`project/`、L0/L1 冻结、各承重 🔴 硬判据/内嵌测试、承重件终判 | **意图层 Opus**(人放置) | 四方 |
-| `STATUS.md`、`SEALED.md`(例行)、`brief.md`、`packet-*.md` | **运营层 GLM**(本地落库) | 四方 |
-| `plan.md`、`receipt-*.md`、`progress.md`、`oob.md` | **执行层 Qwen**(本地落库) | 四方 |
-| 已封存回合目录 | 谁也不写 | 原则上不再读 |
-
-> 优先级(非红线):包 > brief > 项目卡 > 手册 > 协议。红线只可收紧。`STATUS`/`SEALED` 由 GLM 独写、承重终判由 Opus 联签;`plan.md` 是 Qwen 的提议,定稿包一经下行即覆盖它。
+**现行事实以仓库根目录为准**:`README.md`、`AGENTS.md`、`docs/`(尤其
+`docs/01-data.md`、`docs/RUNBOOK.md`)、`MIGRATION-KVROCKS.md`。

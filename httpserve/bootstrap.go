@@ -108,7 +108,16 @@ func ServeWithHandle(cfg *config.Config, opts ...ServeOption) (*ServeHandle, err
 	return &ServeHandle{
 		Server: srv,
 		Close: func(ctx context.Context) error {
-			return srv.Shutdown(ctx)
+			// Shut the listener down first, then hand back the KVRocks
+			// connections this call opened. Closing only the HTTP server left
+			// the whole pool behind, which the "shuts it down gracefully"
+			// contract does not allow — and it leaks on every restart of a
+			// long-lived process that uses this handle.
+			err := srv.Shutdown(ctx)
+			if cerr := ds.Close(); err == nil {
+				err = cerr
+			}
+			return err
 		},
 	}, nil
 }

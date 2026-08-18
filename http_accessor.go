@@ -46,6 +46,12 @@ type HttpAccessor interface {
 	HttpLen(ctx context.Context, ds string) (int64, error)
 	HttpIncrBy(ctx context.Context, ds, key, field string, delta float64) error
 
+	// HttpIncrByScoped increments with the ownership test inside the same
+	// transaction as the write. Splitting the two (check here, increment there)
+	// let an owner racing their own delete create an unowned ghost row, and let
+	// a third party's recreate absorb the increment.
+	HttpIncrByScoped(ctx context.Context, ds, key, field string, delta float64, ownerField, ownerVal string) error
+
 	// HttpKeysScoped / HttpLenScoped return only the caller's own keys / count
 	// for a row-scoped collection.
 	HttpKeysScoped(ctx context.Context, ds string, scope M) (any, error)
@@ -256,6 +262,13 @@ func (c *Collection[K, V]) HttpLen(ctx context.Context, ds string) (int64, error
 
 func (c *Collection[K, V]) HttpIncrBy(ctx context.Context, ds, key, field string, delta float64) error {
 	return c.backend(ds).incr(ctx, c.coll, key, field, delta)
+}
+
+// HttpIncrByScoped increments only a document the caller owns. A missing document
+// is ErrForbidden, never an upsert: an upsert here would write a row with no
+// owner field, invisible to every scoped read and delete afterwards.
+func (c *Collection[K, V]) HttpIncrByScoped(ctx context.Context, ds, key, field string, delta float64, ownerField, ownerVal string) error {
+	return c.backend(ds).incrScoped(ctx, c.coll, key, field, delta, ownerField, ownerVal)
 }
 
 // keysByScope returns the keys of documents matching the (server-derived) owner

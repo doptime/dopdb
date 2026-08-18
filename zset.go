@@ -100,18 +100,26 @@ func memberString(v any) string {
 
 func (z *ZSetCollection[K]) rw(ctx context.Context, ds, key string, scope M) (*kvBackend, string, error) {
 	b := z.k.backend(ds)
+	rk, err := b.entryKey(z.k.coll, key)
+	if err != nil {
+		return nil, "", err
+	}
 	if err := b.claimOwner(ctx, z.k.coll, key, scope); err != nil {
 		return nil, "", err
 	}
-	return b, b.memberKey(z.k.coll, key), nil
+	return b, rk, nil
 }
 
 func (z *ZSetCollection[K]) ro(ctx context.Context, ds, key string, scope M) (*kvBackend, string, error) {
 	b := z.k.backend(ds)
+	rk, err := b.entryKey(z.k.coll, key)
+	if err != nil {
+		return nil, "", err
+	}
 	if err := b.checkOwner(ctx, z.k.coll, key, scope); err != nil {
 		return nil, "", err
 	}
-	return b, b.memberKey(z.k.coll, key), nil
+	return b, rk, nil
 }
 
 func (z *ZSetCollection[K]) HttpZAdd(ctx context.Context, ds, key string, pairs map[string]float64, scope M) (int, error) {
@@ -143,6 +151,10 @@ func (z *ZSetCollection[K]) HttpZRem(ctx context.Context, ds, key string, member
 		args[i] = m
 	}
 	n, err := b.rdb.ZRem(ctx, rk, args...).Result()
+	if err == nil {
+		// Redis drops the key when the last member goes; the claim must go too.
+		b.releaseIfEmpty(ctx, z.k.coll, key, scope)
+	}
 	return int(n), err
 }
 
@@ -270,6 +282,7 @@ func (z *ZSetCollection[K]) HttpZPop(ctx context.Context, ds, key string, count 
 	if rerr != nil && !isRedisNil(rerr) {
 		return nil, rerr
 	}
+	b.releaseIfEmpty(ctx, z.k.coll, key, scope)
 	return zrender(ms, true), nil
 }
 
@@ -279,6 +292,9 @@ func (z *ZSetCollection[K]) HttpZRemRangeByRank(ctx context.Context, ds, key str
 		return 0, err
 	}
 	n, err := b.rdb.ZRemRangeByRank(ctx, rk, int64(start), int64(stop)).Result()
+	if err == nil {
+		b.releaseIfEmpty(ctx, z.k.coll, key, scope)
+	}
 	return int(n), err
 }
 
@@ -288,5 +304,8 @@ func (z *ZSetCollection[K]) HttpZRemRangeByScore(ctx context.Context, ds, key st
 		return 0, err
 	}
 	n, err := b.rdb.ZRemRangeByScore(ctx, rk, scoreArg(min), scoreArg(max)).Result()
+	if err == nil {
+		b.releaseIfEmpty(ctx, z.k.coll, key, scope)
+	}
 	return int(n), err
 }

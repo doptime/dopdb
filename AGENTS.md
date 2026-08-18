@@ -64,7 +64,7 @@ Terse, full-coverage usage reference. For an AI coding agent or an experienced d
 |---|---|
 | read | `hget` `hgetall` `hkeys` `hvals` `hlen` `hexists` `hmget` `count` `find` `findone` `hscan` `hscannovalues` `hrandfield` |
 | write | `hset` `hsetnx` `hdel` `del` `hincrby` `hincrbyfloat` `hmset` |
-| stream | `watch` (change stream → SSE) |
+| stream | `watch` (dopdb pub/sub channel → SSE; no replay, no resume) |
 
 `hset` on an existing key overwrites; `hsetnx` on an existing key (regardless of owner) returns `{inserted:false}` — never 403, never leaks ownership.
 

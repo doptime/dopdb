@@ -59,6 +59,16 @@ const schema = {
   })
     .named("notes")
     .ownerScope("owner"),
+  Slist: collection({
+    _id: f.string(),
+    items: f.string(),
+    owner: f.string().bind("@uid"),
+  }).named("slists").ownerScope("owner"),
+  Sstr: collection({
+    _id: f.string(),
+    v: f.string(),
+    owner: f.string().bind("@uid"),
+  }).named("sstrs").ownerScope("owner"),
   Uniq: collection({
     _id: f.string(),
     email: f.string().unique(),
@@ -444,6 +454,71 @@ test("concurrent hincrby loses no increments", { skip }, async () => {
 
   const got = await call("GET", "/api/hget/uniqs?f=ctr", tokA);
   assert.equal(got.body.n, N, `expected ${N} increments to land, got ${got.body.n}`);
+});
+
+// ---- post-migration audit regressions ---------------------------------------
+
+// A scoped increment used to check ownership in the dispatcher and then run an
+// UNSCOPED increment. The window let an owner racing their own delete create a
+// document with NO owner field — invisible to every scoped read and delete —
+// and let a third party's recreate absorb the increment.
+test("scoped hincrby never creates an unowned row and never crosses tenants", { skip }, async () => {
+  // an absent document must be refused, not upserted
+  const ghost = await call("POST", "/api/hincrby/notes?f=ghost&field=n&n=1", tokA);
+  assert.equal(ghost.status, 403, "scoped incr on an absent document must be forbidden");
+  const after = await call("GET", "/api/hget/notes?f=ghost", tokA);
+  assert.equal(after.status, 404, "no unowned ghost row may be created");
+
+  // and must not touch another tenant's document
+  await call("POST", "/api/hset/notes?f=@uid", tokA, { text: "mine", n: 0 });
+  const cross = await call("POST", "/api/hincrby/notes?f=userA&field=n&n=100", tokB);
+  assert.equal(cross.status, 403);
+  const mine = await call("GET", "/api/hget/notes?f=@uid", tokA);
+  assert.equal(mine.body.n ?? 0, 0, "the other tenant's value was modified");
+
+  // the owner's own increment still works
+  assert.equal((await call("POST", "/api/hincrby/notes?f=@uid&field=n&n=3", tokA)).status, 200);
+  assert.equal((await call("GET", "/api/hget/notes?f=@uid", tokA)).body.n, 3);
+});
+
+// Incrementing a field holding a string used to overwrite it with a number and
+// answer 200. Mongo's $inc refused; silently destroying the value is worse.
+test("hincrby refuses a non-numeric field instead of overwriting it", { skip }, async () => {
+  await call("POST", "/api/hset/notes?f=typed", tokA, { text: "keep-me", n: 10 });
+  const bad = await call("POST", "/api/hincrby/notes?f=typed&field=text&n=5", tokA);
+  assert.equal(bad.status, 409, "a type clash is a conflict");
+  const got = await call("GET", "/api/hget/notes?f=typed", tokA);
+  assert.equal(got.body.text, "keep-me", "the original value was overwritten");
+
+  assert.equal((await call("POST", "/api/hincrby/notes?f=typed&field=n&n=5", tokA)).status, 200);
+  assert.equal((await call("GET", "/api/hget/notes?f=typed", tokA)).body.n, 15);
+});
+
+// Redis deletes a list key when its last element goes, but the owner claim used
+// to survive — so the first user to touch a key name owned it forever and
+// everyone else got a permanent 403 for a key that did not exist.
+test("an owner claim is released when the key empties", { skip }, async () => {
+  assert.equal((await call("POST", "/api/lpush/slists?f=q", tokA, { items: ["a"] })).status, 200);
+  // a live claim blocks another user
+  assert.equal((await call("POST", "/api/lpush/slists?f=q", tokB, { items: ["b"] })).status, 403);
+  // empty it, then the name is free
+  await call("POST", "/api/rpop/slists?f=q", tokA);
+  assert.equal((await call("POST", "/api/lpush/slists?f=q", tokB, { items: ["b"] })).status, 200,
+    "the freed key name is still owned by the previous user");
+});
+
+// User entries and dopdb's bookkeeping share one keyspace, so an entry named
+// "__owner" resolved to the collection's isolation index. On KVRocks a SET over
+// a hash key converts the type rather than raising WRONGTYPE, so one such write
+// destroyed the index and broke every later scoped write in the collection.
+test("reserved key names are refused and the collection stays usable", { skip }, async () => {
+  for (const bad of ["__owner", "__events"]) {
+    const r = await call("POST", `/api/strset/sstrs?f=${bad}`, tokB, { v: "evil" });
+    assert.equal(r.status, 400, `strset ${bad} must be refused`);
+  }
+  // the isolation index survived: a normal scoped write still works
+  assert.equal((await call("POST", "/api/strset/sstrs?f=normal", tokA, { v: "ok" })).status, 200);
+  assert.equal((await call("GET", "/api/strget/sstrs?f=normal", tokA)).status, 200);
 });
 
 // ---- httpOn permission gate (Task 2) ----------------------------------------

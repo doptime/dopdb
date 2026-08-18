@@ -67,7 +67,7 @@ jobs:
       - name: Build
         run: npm run build
 
-      - name: Test (Mongo-dependent tests auto-skip without DOPDB_TEST_MONGO_URI)
+      - name: Test (KVRocks-dependent tests auto-skip without DOPDB_TEST_KVROCKS_URI)
         run: npm test
 
       - name: Pack (always — artifact + dry-run visibility)

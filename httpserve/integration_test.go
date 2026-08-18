@@ -453,3 +453,156 @@ func TestIntegrationSQLLimitIsClamped(t *testing.T) {
 		t.Errorf("LIMIT 2 => %v", arr)
 	}
 }
+
+// ---- post-migration audit regressions ---------------------------------------
+//
+// Four defects the KVRocks migration introduced, each reproduced before it was
+// fixed. None had a test, which is why they survived; these are those tests.
+
+// A scoped increment used to check ownership in the dispatcher and then run an
+// UNSCOPED increment. An owner racing their own delete could land the increment
+// after the delete, where it upserted a document with NO owner field — a row
+// invisible to every scoped read and delete afterwards. A third party could also
+// have the increment land on their freshly recreated document.
+func TestIntegrationScopedIncrIsAtomic(t *testing.T) {
+	type ctr struct {
+		Owner string `json:"owner"`
+		N     int    `json:"n"`
+	}
+	coll := "it_incr_scoped"
+	h, done := setupKVHandler(t,
+		[][2]string{{"HSET", coll}, {"HGET", coll}, {"HDEL", coll}, {"HINCRBY", coll}, {"HGETALL", coll}},
+		func() {
+			dopdb.RegisterHttp(dopdb.New[string, *ctr](dopdb.WithCollection(coll)))
+			dopdb.SetOwnerScope(coll, "owner", "uid")
+		},
+	)
+	defer done()
+	alice, bob := tokenFor(t, "alice"), tokenFor(t, "bob")
+
+	// a scoped increment must never create a document
+	if rr := do(h, "POST", "/api/hincrby/"+coll+"?f=ghost&field=n&n=1", "", alice); rr.Code != 403 {
+		t.Errorf("scoped incr on an absent document = %d want 403 (body=%s)", rr.Code, rr.Body.String())
+	}
+	if rr := do(h, "GET", "/api/hget/"+coll+"?f=ghost", "", alice); rr.Code != 404 {
+		t.Errorf("an unowned ghost row was created: hget = %d", rr.Code)
+	}
+
+	// and must not touch another tenant's document
+	if rr := do(h, "POST", "/api/hset/"+coll+"?f=@uid", `{"n":0}`, alice); rr.Code != 200 {
+		t.Fatalf("alice hset = %d", rr.Code)
+	}
+	if rr := do(h, "POST", "/api/hincrby/"+coll+"?f=alice&field=n&n=100", "", bob); rr.Code != 403 {
+		t.Errorf("bob incrementing alice's row = %d want 403", rr.Code)
+	}
+	rr := do(h, "GET", "/api/hget/"+coll+"?f=@uid", "", alice)
+	if obj := decodeObj(t, rr); obj["n"].(float64) != 0 {
+		t.Errorf("alice's counter was modified by bob: n=%v", obj["n"])
+	}
+
+	// the owner's own increment still works
+	if rr := do(h, "POST", "/api/hincrby/"+coll+"?f=@uid&field=n&n=3", "", alice); rr.Code != 200 {
+		t.Fatalf("alice incrementing her own row = %d", rr.Code)
+	}
+	rr = do(h, "GET", "/api/hget/"+coll+"?f=@uid", "", alice)
+	if obj := decodeObj(t, rr); obj["n"].(float64) != 3 {
+		t.Errorf("n=%v want 3", obj["n"])
+	}
+}
+
+// Incrementing a field that holds a string used to overwrite it with a number
+// and answer 200. Mongo's $inc refused; silently destroying the value is worse
+// than an error.
+func TestIntegrationIncrRefusesNonNumericField(t *testing.T) {
+	type doc struct {
+		V string `json:"v"`
+		N int    `json:"n"`
+	}
+	coll := "it_incr_type"
+	h, done := setupKVHandler(t,
+		[][2]string{{"HSET", coll}, {"HGET", coll}, {"HINCRBY", coll}},
+		func() { dopdb.RegisterHttp(dopdb.New[string, *doc](dopdb.WithCollection(coll))) },
+	)
+	defer done()
+	tok := tokenFor(t, "u1")
+
+	if rr := do(h, "POST", "/api/hset/"+coll+"?f=k", `{"v":"abc","n":10}`, tok); rr.Code != 200 {
+		t.Fatalf("hset = %d", rr.Code)
+	}
+	rr := do(h, "POST", "/api/hincrby/"+coll+"?f=k&field=v&n=5", "", tok)
+	if rr.Code != 409 {
+		t.Errorf("incr on a string field = %d want 409 (body=%s)", rr.Code, rr.Body.String())
+	}
+	got := do(h, "GET", "/api/hget/"+coll+"?f=k", "", tok)
+	if obj := decodeObj(t, got); obj["v"] != "abc" {
+		t.Errorf("the string value was overwritten: v=%v", obj["v"])
+	}
+	// a numeric field still increments
+	if rr := do(h, "POST", "/api/hincrby/"+coll+"?f=k&field=n&n=5", "", tok); rr.Code != 200 {
+		t.Fatalf("incr on a numeric field = %d", rr.Code)
+	}
+	if obj := decodeObj(t, do(h, "GET", "/api/hget/"+coll+"?f=k", "", tok)); obj["n"].(float64) != 15 {
+		t.Errorf("n=%v want 15", obj["n"])
+	}
+}
+
+// Redis deletes a list/set/zset key when its last element goes, but the owner
+// claim used to survive — so the first user to touch a key name owned it
+// forever and everyone else got a permanent 403 for a key that did not exist.
+func TestIntegrationOwnerClaimIsReleasedWhenKeyEmpties(t *testing.T) {
+	coll := "it_owner_release"
+	h, done := setupKVHandler(t,
+		[][2]string{{"LPUSH", coll}, {"RPOP", coll}, {"LLEN", coll}},
+		func() {
+			dopdb.NewList[string, string](dopdb.WithCollection(coll)).HttpOn()
+			dopdb.SetOwnerScope(coll, "owner", "uid")
+		},
+	)
+	defer done()
+	u1, u2 := tokenFor(t, "u1"), tokenFor(t, "u2")
+
+	if rr := do(h, "POST", "/api/lpush/"+coll+"?f=q", `{"items":["a"]}`, u1); rr.Code != 200 {
+		t.Fatalf("u1 lpush = %d body=%s", rr.Code, rr.Body.String())
+	}
+	// a live claim blocks another user
+	if rr := do(h, "POST", "/api/lpush/"+coll+"?f=q", `{"items":["b"]}`, u2); rr.Code != 403 {
+		t.Errorf("u2 pushing to u1's live list = %d want 403", rr.Code)
+	}
+	// empty it: the key disappears, and so must the claim
+	for i := 0; i < 2; i++ {
+		do(h, "POST", "/api/rpop/"+coll+"?f=q", "", u1)
+	}
+	if rr := do(h, "POST", "/api/lpush/"+coll+"?f=q", `{"items":["b"]}`, u2); rr.Code != 200 {
+		t.Errorf("u2 claiming the freed key name = %d want 200 (body=%s)", rr.Code, rr.Body.String())
+	}
+}
+
+// User entries and dopdb's bookkeeping share one keyspace, so an entry named
+// "__owner" resolved to the collection's isolation index. On KVRocks a SET over
+// a hash key converts the type instead of raising WRONGTYPE, so one such write
+// destroyed the index and broke every later scoped write in the collection.
+func TestIntegrationReservedKeyNamesAreRefused(t *testing.T) {
+	coll := "it_reserved"
+	h, done := setupKVHandler(t,
+		[][2]string{{"STRSET", coll}, {"STRGET", coll}},
+		func() {
+			dopdb.NewString[string](dopdb.WithCollection(coll)).HttpOn()
+			dopdb.SetOwnerScope(coll, "owner", "uid")
+		},
+	)
+	defer done()
+	u1, u2 := tokenFor(t, "u1"), tokenFor(t, "u2")
+
+	for _, bad := range []string{"__owner", "__events"} {
+		if rr := do(h, "POST", "/api/strset/"+coll+"?f="+bad, `{"v":"evil"}`, u2); rr.Code != 400 {
+			t.Errorf("strset %s = %d want 400 (body=%s)", bad, rr.Code, rr.Body.String())
+		}
+	}
+	// the collection is still usable — the isolation index was not corrupted
+	if rr := do(h, "POST", "/api/strset/"+coll+"?f=normal", `{"v":"ok"}`, u1); rr.Code != 200 {
+		t.Errorf("a normal key after the attack = %d want 200 (body=%s)", rr.Code, rr.Body.String())
+	}
+	if rr := do(h, "GET", "/api/strget/"+coll+"?f=normal", "", u1); rr.Code != 200 {
+		t.Errorf("strget after the attack = %d want 200", rr.Code)
+	}
+}

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/doptime/dopdb"
@@ -280,12 +281,17 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 			return
 		}
 		if scoped {
-			// only increment if the document is owned by the caller
-			ok, err := ha.HttpExistsScoped(ctx, c.DB, key, scope)
-			if err != nil || !ok {
+			// The ownership test runs INSIDE the increment's transaction, not
+			// here: a check in the dispatcher followed by an unscoped increment
+			// is a check-then-act, and the window is reachable by an owner
+			// racing their own delete-and-recreate.
+			ownerField, ownerVal, ok := soleScopePair(scope)
+			if !ok {
 				writeErr(w, http.StatusForbidden, "forbidden", dopdb.ErrForbidden)
 				return
 			}
+			writeOK(w, ha.HttpIncrByScoped(ctx, c.DB, key, field, delta, ownerField, ownerVal))
+			return
 		}
 		writeOK(w, ha.HttpIncrBy(ctx, c.DB, key, field, delta))
 
@@ -848,8 +854,35 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 		w.Header().Set("Connection", "keep-alive")
 		w.WriteHeader(http.StatusOK)
 		flusher.Flush()
+
+		// A comment line every 25s keeps proxies and load balancers from
+		// dropping an idle stream. The TypeScript engine already did this; the
+		// Go one did not, so a quiet collection lost its watchers to timeouts.
+		// The ticker writes from another goroutine, hence the mutex.
+		var mu sync.Mutex
+		pingCtx, stopPing := context.WithCancel(ctx)
+		defer stopPing()
+		go func() {
+			t := time.NewTicker(25 * time.Second)
+			defer t.Stop()
+			for {
+				select {
+				case <-pingCtx.Done():
+					return
+				case <-t.C:
+					mu.Lock()
+					if _, err := w.Write([]byte(": ping\n\n")); err == nil {
+						flusher.Flush()
+					}
+					mu.Unlock()
+				}
+			}
+		}()
+
 		emit := func(op, id string, doc any) error {
 			payload, _ := json.Marshal(map[string]any{"type": op, "id": id, "doc": doc})
+			mu.Lock()
+			defer mu.Unlock()
 			if _, err := w.Write([]byte("data: " + string(payload) + "\n\n")); err != nil {
 				return err
 			}
@@ -858,6 +891,17 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 		}
 		_ = ha.HttpWatch(ctx, c.DB, scope, emit)
 	}
+}
+
+// soleScopePair unpacks the single (field, value) pair of an owner scope.
+func soleScopePair(scope dopdb.M) (string, string, bool) {
+	for k, v := range scope {
+		if sv, ok := v.(string); ok {
+			return k, sv, true
+		}
+		return k, fmt.Sprint(v), true
+	}
+	return "", "", false
 }
 
 // sqlFromBody accepts either a JSON object {"sql":"..."} or the raw statement as
@@ -939,6 +983,12 @@ func statusForError(w http.ResponseWriter, err error) {
 		// a statement that will not parse, names the wrong table, or asks for
 		// something dopdb does not implement is the caller's mistake
 		writeErr(w, http.StatusBadRequest, "validation", err)
+	case errors.Is(err, dopdb.ErrReservedKey):
+		// the key name collides with dopdb's own bookkeeping keys
+		writeErr(w, http.StatusBadRequest, "validation", err)
+	case errors.Is(err, dopdb.ErrFieldType):
+		// incrementing a field that holds something other than a number
+		writeErr(w, http.StatusConflict, "conflict", err)
 	case errors.Is(err, dopdb.ErrDuplicate):
 		// a unique-index violation; dopdb enforces these itself on KVRocks
 		writeErr(w, http.StatusConflict, "conflict", err)

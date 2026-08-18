@@ -19,7 +19,7 @@ import { Redis } from "ioredis";
 import type { Redis as RedisClient } from "ioredis";
 
 import { decodeDoc, encodeValue, uniqueSlot } from "./codec.js";
-import { ConflictError } from "./errors.js";
+import { ConflictError, ForbiddenError, ValidationError } from "./errors.js";
 import { matchFilter, type Doc } from "./query.js";
 import type { Filter } from "./sanitize.js";
 
@@ -54,9 +54,9 @@ export class KvBackend {
   private readonly owned: boolean;
   /** collection -> unique-tagged fields, populated by ensureIndexes. */
   private readonly uniqueFields = new Map<string, string[]>();
-  /** Dedicated connection for WATCH/MULTI, plus the queue that serialises it. */
-  private txRedis: RedisClient | null = null;
-  private txQueue: Promise<unknown> = Promise.resolve();
+  /** Dedicated connections for WATCH/MULTI, each with its own queue. */
+  private txPool: (RedisClient | null)[] = new Array(TX_LANES).fill(null);
+  private txQueues: Promise<unknown>[] = new Array(TX_LANES).fill(null).map(() => Promise.resolve());
 
   constructor(redis: RedisClient, namespace: string, owned = false) {
     this.redis = redis;
@@ -70,10 +70,10 @@ export class KvBackend {
   }
 
   async close(): Promise<void> {
-    if (this.txRedis) {
-      const tx = this.txRedis;
-      this.txRedis = null;
-      await tx.quit().catch(() => tx.disconnect());
+    for (let i = 0; i < this.txPool.length; i++) {
+      const tx = this.txPool[i];
+      this.txPool[i] = null;
+      if (tx) await tx.quit().catch(() => tx.disconnect());
     }
     if (this.owned) await this.redis.quit().catch(() => this.redis.disconnect());
   }
@@ -84,16 +84,24 @@ export class KvBackend {
    * whole process over ONE socket. Two concurrent read-modify-writes sharing
    * that socket would share a watch set: the first EXEC clears it, and the
    * second transaction then commits unprotected — a silently lost update. So
-   * transactions get their own connection, and an in-process queue keeps only
-   * one on it at a time. Across processes, WATCH still does its job. */
-  private tx<T>(fn: (r: RedisClient) => Promise<T>): Promise<T> {
-    if (!this.txRedis) this.txRedis = this.redis.duplicate();
-    const conn = this.txRedis;
-    const run = this.txQueue.then(
+   * transactions need a connection to themselves.
+   *
+   * A single dedicated connection gave that correctness but serialised EVERY
+   * scoped write and increment in the process behind one socket: one contended
+   * transaction (up to 64 WATCH retries, ~0.6-1.9s) blocked writes to unrelated
+   * collections behind it. So there is a small pool instead, and the lane is
+   * chosen by the watched key — transactions that would contend on the server
+   * anyway share a lane, unrelated ones run in parallel. Go gets the same
+   * property from its connection pool. */
+  private tx<T>(lane: string, fn: (r: RedisClient) => Promise<T>): Promise<T> {
+    const i = laneFor(lane);
+    if (!this.txPool[i]) this.txPool[i] = this.redis.duplicate();
+    const conn = this.txPool[i]!;
+    const run = this.txQueues[i].then(
       () => fn(conn),
-      () => fn(conn), // a previous transaction's failure must not block the queue
+      () => fn(conn), // a previous transaction's failure must not block the lane
     );
-    this.txQueue = run.catch(() => undefined);
+    this.txQueues[i] = run.catch(() => undefined);
     return run;
   }
 
@@ -101,6 +109,25 @@ export class KvBackend {
   private prefix(): string { return this.ns ? this.ns + ":" : ""; }
   hashKey(coll: string): string { return this.prefix() + coll; }
   memberKey(coll: string, key: string): string { return `${this.prefix()}${coll}:${key}`; }
+
+  /** memberKey with the reserved-name check every String/List/Set/ZSet path must
+   * pass.
+   *
+   * User entries and dopdb's own bookkeeping (the owner index, the change
+   * channel, the unique-index claim hashes) share one keyspace, so an entry
+   * literally named "__owner" resolves to the same Redis key as the collection's
+   * isolation index. Enumeration already skipped those names; the WRITE paths did
+   * not, and that is the dangerous direction: on KVRocks a SET over an existing
+   * hash key does not raise WRONGTYPE the way stock Redis does — it converts the
+   * key to a string, destroying the collection's owner index and breaking every
+   * later scoped write. The names are refused instead. */
+  entryKey(coll: string, key: string): string {
+    const rk = this.memberKey(coll, key);
+    if (!key || rk.endsWith(":__owner") || rk.endsWith(":__events") || rk.includes(":__uniq:")) {
+      throw new ValidationError([{ field: "f", message: "reserved key name" }], `dopdb: reserved key name: ${JSON.stringify(key)}`);
+    }
+    return rk;
+  }
   memberPattern(coll: string, glob: string): string { return `${this.prefix()}${coll}:${glob || "*"}`; }
   ownerKey(coll: string): string { return `${this.prefix()}${coll}:__owner`; }
   uniqKey(coll: string, field: string): string { return `${this.prefix()}${coll}:__uniq:${field}`; }
@@ -204,7 +231,7 @@ export class KvBackend {
   async putScoped(coll: string, id: string, doc: Doc, ownerField: string, ownerVal: unknown): Promise<boolean> {
     const hk = this.hashKey(coll);
     const release = await this.enforceUnique(coll, id, doc);
-    const ok = await this.tx(async (r) => {
+    const ok = await this.tx(hk, async (r) => {
       for (let attempt = 0; attempt < WATCH_ATTEMPTS; attempt++) {
         await r.watch(hk);
         const prev = await r.hgetBuffer(hk, id);
@@ -304,17 +331,40 @@ export class KvBackend {
     return out;
   }
 
-  /** Atomically add delta to a numeric field (dot path) of a document. Redis
-   * HINCRBYFLOAT increments a hash FIELD, but a field here holds a whole CBOR
-   * document, so the increment is an optimistic read-modify-write guarded by
-   * WATCH — still atomic, just not one command. */
-  async incr(coll: string, id: string, fieldPath: string, delta: number): Promise<void> {
+  /** Atomically add delta to a numeric field (dot path) of a document.
+   *
+   * Redis HINCRBYFLOAT increments a hash FIELD, but a field here holds a whole
+   * CBOR document, so this is an optimistic read-modify-write guarded by WATCH —
+   * still atomic, just not one command.
+   *
+   * ownerField/ownerVal make it SCOPED, and the ownership test runs inside the
+   * transaction beside the write. It used to live in the dispatcher — "does a
+   * document with this id and this owner exist?", then a separate unscoped
+   * increment — which is a check-then-act with two failure modes, both reachable
+   * by an owner racing their own delete-and-recreate: the increment could land
+   * after the delete and UPSERT a document with no owner field (a permanent
+   * ghost row, invisible to every scoped read and delete), or land on a third
+   * party's freshly recreated document. Scoped, a missing document is now
+   * forbidden rather than an upsert. */
+  async incr(coll: string, id: string, fieldPath: string, delta: number, ownerField?: string, ownerVal?: unknown): Promise<void> {
     const hk = this.hashKey(coll);
-    const written = await this.tx(async (r) => {
+    const scoped = !!ownerField;
+    const written = await this.tx(hk, async (r) => {
       for (let attempt = 0; attempt < WATCH_ATTEMPTS; attempt++) {
         await r.watch(hk);
         const prev = await r.hgetBuffer(hk, id);
+        if (!prev && scoped) {
+          await r.unwatch();
+          throw new ForbiddenError();
+        }
         const doc: Doc = prev ? decodeDoc(prev) : {};
+        if (scoped) {
+          const cur = doc[ownerField!];
+          if (cur === undefined || String(cur) !== String(ownerVal)) {
+            await r.unwatch();
+            throw new ForbiddenError();
+          }
+        }
         const parts = fieldPath.split(".");
         let cur: Doc = doc;
         for (let i = 0; i < parts.length - 1; i++) {
@@ -323,8 +373,16 @@ export class KvBackend {
           cur = cur[parts[i]] as Doc;
         }
         const leaf = parts[parts.length - 1];
-        const before = typeof cur[leaf] === "number" ? (cur[leaf] as number) : 0;
-        cur[leaf] = before + delta;
+        const before = cur[leaf];
+        // A field already holding a string, bool, array or object is REFUSED
+        // rather than replaced by a number: Mongo's $inc refused it too, and
+        // silently overwriting is data loss dressed up as success. Absent or
+        // null starts from zero, which destroys nothing.
+        if (before !== undefined && before !== null && typeof before !== "number") {
+          await r.unwatch();
+          throw new ConflictError(`dopdb: field is not numeric: ${fieldPath} holds ${Array.isArray(before) ? "array" : typeof before}`);
+        }
+        cur[leaf] = (typeof before === "number" ? before : 0) + delta;
         const res = await r.multi().hset(hk, id, encodeValue(doc)).exec();
         if (res !== null) return doc;
         await backoff(attempt);
@@ -392,14 +450,55 @@ export class KvBackend {
   }
 
   /** Take ownership of key for the caller, atomically. False when already held by
-   * someone else. */
+   * someone else.
+   *
+   * It also reclaims STALE claims. A claim outlives its data in three ordinary
+   * ways: Redis drops a list/set/zset key the moment its last element is
+   * removed, a String key can expire on its TTL, and a crash can land between
+   * the claim and the write. Without this, the first user to touch a key name
+   * owns it forever — everyone else gets a permanent 403 for a key that does not
+   * exist, and the owner hash grows without bound. */
   async claimOwner(coll: string, key: string, scope: Filter): Promise<boolean> {
     const want = this.scopeOwner(scope);
     if (want === null) return true;
     const claimed = await this.redis.hsetnx(this.ownerKey(coll), key, want);
     if (claimed === 1) return true;
     const got = await this.redis.hget(this.ownerKey(coll), key);
-    return got === want;
+    if (got === want) return true;
+    return await this.takeOverStaleClaim(coll, key, got, want);
+  }
+
+  /** Transfer a claim whose data no longer exists, under a WATCH so two racing
+   * claimants cannot both win. */
+  private async takeOverStaleClaim(coll: string, key: string, holder: string | null, want: string): Promise<boolean> {
+    const ok = this.ownerKey(coll);
+    const mk = this.memberKey(coll, key);
+    if ((await this.redis.exists(mk)) > 0) return false; // the holder's data is really there
+    return await this.tx(ok, async (r) => {
+      for (let attempt = 0; attempt < WATCH_ATTEMPTS; attempt++) {
+        await r.watch(ok, mk);
+        const cur = await r.hget(ok, key);
+        if (cur !== null && cur !== holder && cur !== want) { await r.unwatch(); return false; }
+        if ((await r.exists(mk)) > 0) { await r.unwatch(); return false; }
+        const res = await r.multi().hset(ok, key, want).exec();
+        if (res !== null) return true;
+        await backoff(attempt);
+      }
+      return false;
+    });
+  }
+
+  /** Drop the ownership record when the entry key no longer exists.
+   *
+   * Redis deletes a list/set/zset key as soon as its last element goes, so every
+   * path that can empty one has to call this — otherwise the claim outlives the
+   * data and the owner hash grows forever. claimOwner can recover from a missed
+   * call, but recovering is not a reason to leak. */
+  async releaseIfEmpty(coll: string, key: string, scope: Filter): Promise<void> {
+    if (this.scopeOwner(scope) === null) return;
+    if ((await this.redis.exists(this.memberKey(coll, key))) === 0) {
+      await this.releaseOwner(coll, [key]);
+    }
   }
 
   async releaseOwner(coll: string, keys: string[]): Promise<void> {
@@ -441,6 +540,19 @@ export class KvBackend {
 // transaction never writes.
 
 const WATCH_ATTEMPTS = 64;
+
+/** How many dedicated transaction connections a backend keeps. Small: the point
+ * is to stop unrelated collections queueing behind each other, not to make every
+ * write concurrent. */
+const TX_LANES = 8;
+
+/** Pick a transaction lane from the watched key, so writes that would contend on
+ * the server share a lane and unrelated ones do not. */
+function laneFor(key: string): number {
+  let h = 5381;
+  for (let i = 0; i < key.length; i++) h = ((h << 5) + h + key.charCodeAt(i)) | 0;
+  return Math.abs(h) % TX_LANES;
+}
 
 function backoff(attempt: number): Promise<void> {
   const base = Math.min((attempt + 1) * 0.2, 20); // ms

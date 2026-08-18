@@ -64,9 +64,19 @@ func uniqueValueKey(v any) (string, bool) {
 	return string(b), true
 }
 
+// takenSlot records one unique-value slot this call claimed, so a write that
+// never lands can give it back.
+type takenSlot struct {
+	field string
+	slot  string
+	fresh bool // true when this call created the claim (nobody held it before)
+}
+
 // claimUnique verifies and takes the unique-value slots a document needs.
-// It returns ErrDuplicate if any value is already held by a different id.
-func (b *kvBackend) claimUnique(ctx context.Context, coll, id string, doc map[string]any, fields []string) error {
+// It returns ErrDuplicate if any value is already held by a different id, plus
+// the slots it took so the caller can undo them.
+func (b *kvBackend) claimUnique(ctx context.Context, coll, id string, doc map[string]any, fields []string) ([]takenSlot, error) {
+	var taken []takenSlot
 	for _, f := range fields {
 		v, ok := doc[f]
 		if !ok {
@@ -79,16 +89,32 @@ func (b *kvBackend) claimUnique(ctx context.Context, coll, id string, doc map[st
 		idxKey := b.uniqKey(coll, f)
 		holder, err := b.rdb.HGet(ctx, idxKey, slot).Result()
 		if err == nil && holder != id {
-			return fmt.Errorf("%w: %s.%s", ErrDuplicate, coll, f)
+			return taken, fmt.Errorf("%w: %s.%s", ErrDuplicate, coll, f)
 		}
 		if err != nil && !isRedisNil(err) {
-			return err
+			return taken, err
 		}
+		fresh := isRedisNil(err) // nobody held this value before
 		if err := b.rdb.HSet(ctx, idxKey, slot, id).Err(); err != nil {
-			return err
+			return taken, err
+		}
+		taken = append(taken, takenSlot{field: f, slot: slot, fresh: fresh})
+	}
+	return taken, nil
+}
+
+// unclaim gives back the slots a call took when its write did not land. Only the
+// slots this call CREATED are dropped: one it found already pointing at the same
+// id belongs to the stored document and must survive.
+func (b *kvBackend) unclaim(ctx context.Context, coll, id string, taken []takenSlot) {
+	for _, t := range taken {
+		if !t.fresh {
+			continue
+		}
+		if holder, err := b.rdb.HGet(ctx, b.uniqKey(coll, t.field), t.slot).Result(); err == nil && holder == id {
+			_ = b.rdb.HDel(ctx, b.uniqKey(coll, t.field), t.slot).Err()
 		}
 	}
-	return nil
 }
 
 // releaseUnique drops the slots that oldDoc held and newDoc no longer does.
@@ -119,16 +145,24 @@ func (b *kvBackend) releaseUnique(ctx context.Context, coll, id string, oldDoc, 
 }
 
 // enforceUnique is the whole write-side protocol in one call: read the previous
-// document, claim the new values, and return a release function the caller runs
-// once the document has actually been written.
-func (b *kvBackend) enforceUnique(ctx context.Context, coll, id string, newDoc []byte) (release func(), err error) {
+// document, claim the new values, and hand back the two ways the call can end.
+//
+//   - commit()   — the document was written: release the values it no longer holds.
+//   - rollback() — the write did NOT happen (error, forbidden, contention, or an
+//     insert that found the id taken): give back the values this call claimed.
+//
+// Exactly one of them must run. Without rollback, a write that fails after the
+// claim leaves the value reserved for a document that does not have it, and the
+// next writer of that value gets a spurious 409 until the process restarts.
+func (b *kvBackend) enforceUnique(ctx context.Context, coll, id string, newDoc []byte) (commit func(), rollback func(), err error) {
+	noop := func() {}
 	fields := uniqueFieldsOf(coll)
 	if len(fields) == 0 {
-		return func() {}, nil
+		return noop, noop, nil
 	}
 	nd, err := decodeDoc(newDoc)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	var od map[string]any
 	if prev, err := b.rdb.HGet(ctx, b.hashKey(coll), id).Bytes(); err == nil {
@@ -136,12 +170,18 @@ func (b *kvBackend) enforceUnique(ctx context.Context, coll, id string, newDoc [
 			od = m
 		}
 	} else if !isRedisNil(err) {
-		return nil, err
+		return nil, nil, err
 	}
-	if err := b.claimUnique(ctx, coll, id, nd, fields); err != nil {
-		return nil, err
+	taken, err := b.claimUnique(ctx, coll, id, nd, fields)
+	if err != nil {
+		// a rejected claim must not leave the earlier fields of the same
+		// document claimed either
+		b.unclaim(ctx, coll, id, taken)
+		return nil, nil, err
 	}
-	return func() { b.releaseUnique(ctx, coll, id, od, nd, fields) }, nil
+	return func() { b.releaseUnique(ctx, coll, id, od, nd, fields) },
+		func() { b.unclaim(ctx, coll, id, taken) },
+		nil
 }
 
 // dropUnique releases every slot held by the given ids (used by delete).

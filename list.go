@@ -95,19 +95,27 @@ func decodeItems(raws []string) ([]any, error) {
 // rw resolves the backend and enforces the write-side ownership claim.
 func (l *ListCollection[K, E]) rw(ctx context.Context, ds, key string, scope M) (*kvBackend, string, error) {
 	b := l.k.backend(ds)
+	rk, err := b.entryKey(l.k.coll, key)
+	if err != nil {
+		return nil, "", err
+	}
 	if err := b.claimOwner(ctx, l.k.coll, key, scope); err != nil {
 		return nil, "", err
 	}
-	return b, b.memberKey(l.k.coll, key), nil
+	return b, rk, nil
 }
 
 // ro resolves the backend and enforces the read-side ownership check.
 func (l *ListCollection[K, E]) ro(ctx context.Context, ds, key string, scope M) (*kvBackend, string, error) {
 	b := l.k.backend(ds)
+	rk, err := b.entryKey(l.k.coll, key)
+	if err != nil {
+		return nil, "", err
+	}
 	if err := b.checkOwner(ctx, l.k.coll, key, scope); err != nil {
 		return nil, "", err
 	}
-	return b, b.memberKey(l.k.coll, key), nil
+	return b, rk, nil
 }
 
 func (l *ListCollection[K, E]) HttpLPush(ctx context.Context, ds, key string, items []any, scope M) error {
@@ -157,6 +165,8 @@ func (l *ListCollection[K, E]) HttpLPop(ctx context.Context, ds, key string, sco
 	if err != nil {
 		return nil, err
 	}
+	// Redis drops the key when the last element goes; the claim must go too.
+	b.releaseIfEmpty(ctx, l.k.coll, key, scope)
 	return decodeItem(raw)
 }
 
@@ -172,6 +182,8 @@ func (l *ListCollection[K, E]) HttpRPop(ctx context.Context, ds, key string, sco
 	if err != nil {
 		return nil, err
 	}
+	// Redis drops the key when the last element goes; the claim must go too.
+	b.releaseIfEmpty(ctx, l.k.coll, key, scope)
 	return decodeItem(raw)
 }
 
@@ -242,7 +254,11 @@ func (l *ListCollection[K, E]) HttpLRem(ctx context.Context, ds, key string, cou
 	if err != nil {
 		return err
 	}
-	return b.rdb.LRem(ctx, rk, int64(count), raw).Err()
+	if err := b.rdb.LRem(ctx, rk, int64(count), raw).Err(); err != nil {
+		return err
+	}
+	b.releaseIfEmpty(ctx, l.k.coll, key, scope)
+	return nil
 }
 
 func (l *ListCollection[K, E]) HttpLTrim(ctx context.Context, ds, key string, start, stop int, scope M) error {
@@ -250,7 +266,11 @@ func (l *ListCollection[K, E]) HttpLTrim(ctx context.Context, ds, key string, st
 	if err != nil {
 		return err
 	}
-	return b.rdb.LTrim(ctx, rk, int64(start), int64(stop)).Err()
+	if err := b.rdb.LTrim(ctx, rk, int64(start), int64(stop)).Err(); err != nil {
+		return err
+	}
+	b.releaseIfEmpty(ctx, l.k.coll, key, scope)
+	return nil
 }
 
 func (l *ListCollection[K, E]) HttpLInsert(ctx context.Context, ds, key string, before bool, pivot, item any, scope M) error {

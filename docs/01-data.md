@@ -53,7 +53,7 @@ Unique enforcement uses a side hash `<ns>:<coll>:__uniq:<field>` mapping an enco
 
 Two limitations, stated rather than hidden:
 
-- The claim and the document write are separate commands, so a crash between them can leave a stale claim. It is self-healing: the next write of the same document id re-claims it, and reads are unaffected.
+- The claim and the document write are separate commands, so a crash between them can leave a stale claim. It is self-healing: the next write of the same document id re-claims it, and reads are unaffected. Within a process, a write that does not land — a refused scoped write, an insert that finds the id taken, exhausted contention, a server error — gives its claim back explicitly, so it cannot reserve a value for a document that does not have it.
 - A missing/nil value is **not** claimed (sparse behaviour), so several documents may omit a unique field. A non-sparse Mongo unique index would have rejected the second null.
 
 ## Native methods (Hash, signatures)
@@ -80,11 +80,37 @@ FindOne(filter M) (V, err)
 
 The TS engine mirrors the names (`hget/hset/.../find/findone/watch/hscan/hrandfield` + `get/set/save` aliases on the server).
 
+### Reserved entry key names
+
+For the String/List/Set/ZSet families, user entries and dopdb's own bookkeeping
+share one keyspace. An entry named `__owner` would resolve to the same Redis key
+as the collection's isolation index, and on KVRocks a `SET` over an existing hash
+key **converts the type** instead of raising `WRONGTYPE` — one such write would
+destroy the index and break every later scoped write in that collection. So these
+names are refused with `ErrReservedKey` (HTTP **400**), on read and write alike:
+
+- an entry key ending in `__owner` or `__events`
+- an entry key containing `__uniq:`
+- an empty entry key
+
+Hash collections are unaffected: their document ids are hash *fields*, not keys.
+
 ### About `HIncrBy`
 
 Redis `HINCRBYFLOAT` increments a hash *field*, but a field here holds a whole CBOR document. So the increment is a `WATCH`-guarded read-modify-write: still atomic, just not one command. An integral result is stored as an integer, exactly as Mongo's `$inc` kept `int + int` an `int` — writing `25.0` where the struct field is an `int` would make the document undecodable on the next read.
 
+A field that already holds a string, bool, array or object is **refused**
+(`ErrFieldType`, HTTP **409**) rather than replaced by a number — Mongo's `$inc`
+refused it too, and silently overwriting is data loss dressed up as success. An
+absent field, or one explicitly `null`, starts from zero, which destroys nothing.
+
 `WATCH` granularity is the **key**, and a Hash collection is one key, so a concurrent write to *any* document in the collection aborts the transaction. That is paid in retries (64, with jittered backoff), never in correctness: an aborted transaction does not write.
+
+**Scoped increments carry the ownership test inside the transaction.** Under an
+owner scope a missing document is `ErrForbidden`, never an upsert: creating a row
+with no owner field would make it invisible to every scoped read and delete
+afterwards. `HIncrByScoped` / the `hincrby` HTTP command handle this; the
+unscoped `HIncrBy` still upserts, as before.
 
 ## The Redis-compatible data structures (String / List / Set / ZSet)
 
@@ -100,6 +126,13 @@ board := dopdb.NewZSet[string](dopdb.WithCollection("board")).HttpOn()       // 
 - These types expose the **HTTP command layer** (`HttpStrGet`, `HttpSAdd`, `HttpLPush`, `HttpZAdd`, …); the Hash family additionally has native non-HTTP Go methods.
 - Element/member values are stored CBOR-encoded, so any JSON value round-trips. ZSet members are plain strings (Redis requires it), which the accessor signatures already assumed.
 - **Owner-scope** applies identically, but a native list has no document in which to store an owner, so isolation for these four is enforced against the collection's `__owner` index: first writer claims the key; a foreign key reads as absent and writes as `403`.
+  - A claim does **not** outlive its data. Redis drops a list/set/zset key the
+    moment its last element goes, so every emptying path (`LPOP`/`RPOP`/`LREM`/
+    `LTRIM`/`SREM`/`ZREM`/`ZPOP*`/`ZREMRANGEBY*`) releases the claim, and
+    `claimOwner` additionally reclaims a claim whose key no longer exists — which
+    also covers a String key expiring on its TTL and a crash between claim and
+    write. Without that, the first user to touch a key name would own it forever
+    and everyone else would get a permanent 403 for a key that does not exist.
 - **TTL** (String): `?expiration=` is now the server's own `EXPIRE`, not a swept index. `EnsureTTL(...)` is kept for source compatibility and does nothing.
 - Every op is atomic because it is one Redis command — including the ZSet ops, which on Mongo were read-modify-write and could lose a concurrent `ZINCRBY`.
 - **`LPUSH` with several items** inserts them at the head *in the order given* (`[a,b]` onto `[c]` yields `[a,b,c]`), which is what the Mongo build did. Raw Redis `LPUSH` would yield `[b,a,c]`; dopdb reverses before pushing so existing callers and the TS engine keep agreeing.

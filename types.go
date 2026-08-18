@@ -26,6 +26,19 @@ var ErrForbidden = errors.New("dopdb: forbidden")
 // enforces it itself (see index.go), so it needs a sentinel of its own.
 var ErrDuplicate = errors.New("dopdb: duplicate key")
 
+// ErrReservedKey is returned when a String/List/Set/ZSet entry key would collide
+// with one of dopdb's own bookkeeping keys (the owner index, the change channel,
+// a unique-index claim hash). Those live in the same keyspace as user entries, so
+// the names have to be refused rather than silently overwritten — on KVRocks a
+// SET over a hash key does not even raise WRONGTYPE, it converts the type and
+// takes the whole collection's isolation index with it.
+var ErrReservedKey = errors.New("dopdb: reserved key name")
+
+// ErrFieldType is returned when an increment targets a field that holds a
+// non-numeric value. Mongo's $inc refused this; silently overwriting the value
+// with a number would destroy data.
+var ErrFieldType = errors.New("dopdb: field is not numeric")
+
 // M is a free-form document/filter/update map, intentionally identical in shape
 // to a JSON object so the wire protocol is a trivial conversion.
 type M = map[string]any

@@ -54,6 +54,10 @@ func (s *SetCollection[K]) HttpSAdd(ctx context.Context, ds, key string, members
 		return nil
 	}
 	b := s.k.backend(ds)
+	rk, err := b.entryKey(s.k.coll, key)
+	if err != nil {
+		return err
+	}
 	if err := b.claimOwner(ctx, s.k.coll, key, scope); err != nil {
 		return err
 	}
@@ -61,7 +65,7 @@ func (s *SetCollection[K]) HttpSAdd(ctx context.Context, ds, key string, members
 	if err != nil {
 		return err
 	}
-	return b.rdb.SAdd(ctx, b.memberKey(s.k.coll, key), args...).Err()
+	return b.rdb.SAdd(ctx, rk, args...).Err()
 }
 
 // HttpSRem removes members (Redis SREM).
@@ -70,6 +74,10 @@ func (s *SetCollection[K]) HttpSRem(ctx context.Context, ds, key string, members
 		return nil
 	}
 	b := s.k.backend(ds)
+	rk, err := b.entryKey(s.k.coll, key)
+	if err != nil {
+		return err
+	}
 	if err := b.claimOwner(ctx, s.k.coll, key, scope); err != nil {
 		return err
 	}
@@ -77,16 +85,25 @@ func (s *SetCollection[K]) HttpSRem(ctx context.Context, ds, key string, members
 	if err != nil {
 		return err
 	}
-	return b.rdb.SRem(ctx, b.memberKey(s.k.coll, key), args...).Err()
+	if err := b.rdb.SRem(ctx, rk, args...).Err(); err != nil {
+		return err
+	}
+	// Redis drops the key when the last member goes; the claim must go too.
+	b.releaseIfEmpty(ctx, s.k.coll, key, scope)
+	return nil
 }
 
 // HttpSMembers returns the members (empty if the key is absent).
 func (s *SetCollection[K]) HttpSMembers(ctx context.Context, ds, key string, scope M) (any, error) {
 	b := s.k.backend(ds)
+	rk, kerr := b.entryKey(s.k.coll, key)
+	if kerr != nil {
+		return nil, kerr
+	}
 	if err := b.checkOwner(ctx, s.k.coll, key, scope); err != nil {
 		return []any{}, nil
 	}
-	raws, err := b.rdb.SMembers(ctx, b.memberKey(s.k.coll, key)).Result()
+	raws, err := b.rdb.SMembers(ctx, rk).Result()
 	if err != nil {
 		return nil, err
 	}
@@ -104,6 +121,10 @@ func (s *SetCollection[K]) HttpSMembers(ctx context.Context, ds, key string, sco
 // HttpSIsMember reports membership (Redis SISMEMBER).
 func (s *SetCollection[K]) HttpSIsMember(ctx context.Context, ds, key string, member any, scope M) (bool, error) {
 	b := s.k.backend(ds)
+	rk, kerr := b.entryKey(s.k.coll, key)
+	if kerr != nil {
+		return false, kerr
+	}
 	if err := b.checkOwner(ctx, s.k.coll, key, scope); err != nil {
 		return false, nil
 	}
@@ -111,14 +132,18 @@ func (s *SetCollection[K]) HttpSIsMember(ctx context.Context, ds, key string, me
 	if err != nil {
 		return false, err
 	}
-	return b.rdb.SIsMember(ctx, b.memberKey(s.k.coll, key), raw).Result()
+	return b.rdb.SIsMember(ctx, rk, raw).Result()
 }
 
 // HttpSCard returns the member count (Redis SCARD).
 func (s *SetCollection[K]) HttpSCard(ctx context.Context, ds, key string, scope M) (int64, error) {
 	b := s.k.backend(ds)
+	rk, kerr := b.entryKey(s.k.coll, key)
+	if kerr != nil {
+		return 0, kerr
+	}
 	if err := b.checkOwner(ctx, s.k.coll, key, scope); err != nil {
 		return 0, nil
 	}
-	return b.rdb.SCard(ctx, b.memberKey(s.k.coll, key)).Result()
+	return b.rdb.SCard(ctx, rk).Result()
 }

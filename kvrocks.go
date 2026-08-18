@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"math/rand"
 	"sort"
@@ -71,6 +72,25 @@ func (b *kvBackend) hashKey(coll string) string { return b.prefix() + coll }
 
 // memberKey is the Redis key holding one String/List/Set/ZSet entry.
 func (b *kvBackend) memberKey(coll, key string) string { return b.prefix() + coll + ":" + key }
+
+// entryKey is memberKey with the reserved-name check that every String/List/Set/
+// ZSet path must pass.
+//
+// User entries and dopdb's own bookkeeping (the owner index, the change channel,
+// the unique-index claim hashes) share one keyspace, so an entry literally named
+// "__owner" resolves to the same Redis key as the collection's isolation index.
+// Enumeration already skipped those names; the WRITE paths did not, and that is
+// the dangerous direction: on KVRocks a SET over an existing hash key does not
+// raise WRONGTYPE the way stock Redis does — it converts the key to a string.
+// One such write therefore destroys the whole collection's owner index and every
+// later scoped write fails. The names are refused instead.
+func (b *kvBackend) entryKey(coll, key string) (string, error) {
+	rk := b.memberKey(coll, key)
+	if key == "" || isReservedKey(rk) {
+		return "", fmt.Errorf("%w: %q", ErrReservedKey, key)
+	}
+	return rk, nil
+}
 
 // memberPattern is the glob matching every entry of a non-Hash collection.
 func (b *kvBackend) memberPattern(coll, glob string) string {
@@ -364,18 +384,20 @@ func watchRetry(ctx context.Context, rdb *redis.Client, what string, keys []stri
 // ---- writes ------------------------------------------------------------------
 
 func (b *kvBackend) put(ctx context.Context, coll, id string, doc []byte) error {
-	release, err := b.enforceUnique(ctx, coll, id, doc)
+	commit, rollback, err := b.enforceUnique(ctx, coll, id, doc)
 	if err != nil {
 		return err
 	}
 	existed, err := b.rdb.HExists(ctx, b.hashKey(coll), id).Result()
 	if err != nil {
+		rollback()
 		return err
 	}
 	if err := b.rdb.HSet(ctx, b.hashKey(coll), id, doc).Err(); err != nil {
+		rollback()
 		return err
 	}
-	release()
+	commit()
 	op := "insert"
 	if existed {
 		op = "replace"
@@ -390,12 +412,14 @@ func (b *kvBackend) put(ctx context.Context, coll, id string, doc []byte) error 
 // got the same guarantee from a filtered upsert).
 func (b *kvBackend) putScoped(ctx context.Context, coll, id string, doc []byte, ownerField, ownerVal string) error {
 	hk := b.hashKey(coll)
+	existed := false
 	txf := func(tx *redis.Tx) error {
 		prev, err := tx.HGet(ctx, hk, id).Bytes()
 		if err != nil && !isRedisNil(err) {
 			return err
 		}
-		if err == nil {
+		existed = err == nil
+		if existed {
 			m, derr := decodeDoc(prev)
 			if derr != nil {
 				return derr
@@ -410,32 +434,45 @@ func (b *kvBackend) putScoped(ctx context.Context, coll, id string, doc []byte, 
 		})
 		return err
 	}
-	release, err := b.enforceUnique(ctx, coll, id, doc)
+	commit, rollback, err := b.enforceUnique(ctx, coll, id, doc)
 	if err != nil {
 		return err
 	}
 	if err := watchRetry(ctx, b.rdb, coll+":"+id, []string{hk}, txf); err != nil {
+		// forbidden, or contention exhausted: the write did NOT happen, so the
+		// values this call claimed must not stay claimed
+		rollback()
 		return err
 	}
-	release()
-	b.publish(ctx, coll, "replace", id, doc)
+	commit()
+	op := "insert"
+	if existed {
+		op = "replace"
+	}
+	b.publish(ctx, coll, op, id, doc)
 	return nil
 }
 
 func (b *kvBackend) putIfAbsent(ctx context.Context, coll, id string, doc []byte) (bool, error) {
-	release, err := b.enforceUnique(ctx, coll, id, doc)
+	commit, rollback, err := b.enforceUnique(ctx, coll, id, doc)
 	if err != nil {
 		return false, err
 	}
 	inserted, err := b.rdb.HSetNX(ctx, b.hashKey(coll), id, doc).Result()
 	if err != nil {
+		rollback()
 		return false, err
 	}
-	if inserted {
-		release()
-		b.publish(ctx, coll, "insert", id, doc)
+	if !inserted {
+		// the id was taken, so nothing was written — releasing the values this
+		// call claimed is what keeps a no-op insert from blocking a later,
+		// legitimate writer of the same unique value
+		rollback()
+		return false, nil
 	}
-	return inserted, nil
+	commit()
+	b.publish(ctx, coll, "insert", id, doc)
+	return true, nil
 }
 
 func (b *kvBackend) putMany(ctx context.Context, coll string, ids []string, docs [][]byte) error {
@@ -468,13 +505,66 @@ func (b *kvBackend) putMany(ctx context.Context, coll string, ids []string, docs
 // upserting the document if absent. Redis HINCRBYFLOAT increments a hash FIELD,
 // but a field here holds a whole CBOR document, so the increment is an optimistic
 // read-modify-write guarded by WATCH — still atomic, just not a single command.
+// applyIncr computes the new value of a numeric field inside a decoded document.
+//
+// A field that already holds a string, bool, array or object is REFUSED
+// (ErrFieldType) rather than replaced by a number: Mongo's $inc refused it too,
+// and silently overwriting is data loss dressed up as success. An absent field —
+// or one explicitly null — starts from zero, which destroys nothing.
+func applyIncr(m map[string]any, fieldPath string, delta float64) error {
+	cur := 0.0
+	if v, ok := lookupPath(m, fieldPath); ok && v != nil {
+		f, isNum := asFloat(v)
+		if !isNum {
+			return fmt.Errorf("%w: %s holds %s", ErrFieldType, fieldPath, typeName(v))
+		}
+		cur = f
+	}
+	next := cur + delta
+	// Keep an integral result an integer. CBOR is typed, so writing 25.0 where
+	// the struct field is an int would make the document undecodable on the next
+	// read — the same reason Mongo's $inc kept int+int an int.
+	if next == math.Trunc(next) && !math.IsInf(next, 0) {
+		setPath(m, fieldPath, int64(next))
+	} else {
+		setPath(m, fieldPath, next)
+	}
+	return nil
+}
+
 func (b *kvBackend) incr(ctx context.Context, coll, id, fieldPath string, delta float64) error {
+	return b.incrScoped(ctx, coll, id, fieldPath, delta, "", "")
+}
+
+// incrScoped is the increment, with the ownership test INSIDE the transaction.
+//
+// The check used to live in the HTTP dispatcher: "does a document with this id
+// and this owner exist?", then a separate, unscoped increment. That is a
+// check-then-act with two failure modes, both reachable by an owner racing their
+// own delete-and-recreate:
+//
+//   - the document is gone by the time the increment runs, and the increment
+//     UPSERTS it — creating a document with no owner field at all. Scoped reads
+//     never match it and scoped deletes never reach it: a permanent ghost row.
+//   - a third party recreates the id in the window, and the increment lands on
+//     THEIR document.
+//
+// So the owner test moved in here, beside the write, under the same WATCH. When
+// ownerField is empty the call is unscoped and behaves as before; when it is set,
+// a missing document is ErrForbidden rather than an upsert — there is nothing to
+// own yet, and inventing an unowned row is exactly the bug.
+func (b *kvBackend) incrScoped(ctx context.Context, coll, id, fieldPath string, delta float64, ownerField, ownerVal string) error {
 	hk := b.hashKey(coll)
+	scoped := ownerField != ""
 	txf := func(tx *redis.Tx) error {
 		var m map[string]any
 		prev, err := tx.HGet(ctx, hk, id).Bytes()
 		switch {
 		case isRedisNil(err):
+			if scoped {
+				// no document to own: refuse rather than create an unowned one
+				return ErrForbidden
+			}
 			m = map[string]any{}
 		case err != nil:
 			return err
@@ -482,21 +572,15 @@ func (b *kvBackend) incr(ctx context.Context, coll, id, fieldPath string, delta 
 			if m, err = decodeDoc(prev); err != nil {
 				return err
 			}
-		}
-		cur := 0.0
-		if v, ok := lookupPath(m, fieldPath); ok {
-			if f, ok := asFloat(v); ok {
-				cur = f
+			if scoped {
+				cur, ok := m[ownerField]
+				if !ok || !equalValues(cur, ownerVal) {
+					return ErrForbidden
+				}
 			}
 		}
-		next := cur + delta
-		// Keep an integral result an integer. CBOR is typed, so writing 25.0
-		// where the struct field is an int would make the document undecodable
-		// on the next read — the same reason Mongo's $inc kept int+int an int.
-		if next == math.Trunc(next) && !math.IsInf(next, 0) {
-			setPath(m, fieldPath, int64(next))
-		} else {
-			setPath(m, fieldPath, next)
+		if err := applyIncr(m, fieldPath, delta); err != nil {
+			return err
 		}
 		doc, err := encodeCBOR(m)
 		if err != nil {
@@ -555,17 +639,22 @@ func (b *kvBackend) del(ctx context.Context, coll string, ids []string) (int64, 
 			b.dropUnique(ctx, coll, ids, docs)
 		}
 	}
-	n, err := b.rdb.HDel(ctx, b.hashKey(coll), ids...).Result()
-	if err != nil {
+	// One HDEL per id, pipelined: same single round trip as a batched HDEL, but
+	// each reply says whether THAT id existed, so the change events are exact
+	// instead of announcing a deletion for every id in a mixed batch.
+	pipe := b.rdb.Pipeline()
+	cmds := make([]*redis.IntCmd, len(ids))
+	for i, id := range ids {
+		cmds[i] = pipe.HDel(ctx, b.hashKey(coll), id)
+	}
+	if _, err := pipe.Exec(ctx); err != nil && !isRedisNil(err) {
 		return 0, err
 	}
-	// Only announce a deletion when something was actually removed. HDEL reports
-	// a count, not which ids it hit, so a mixed batch may still over-announce —
-	// a watcher seeing a delete for an absent id is harmless, inventing one for
-	// an entirely no-op delete is not.
-	if n > 0 {
-		for _, id := range ids {
-			b.publish(ctx, coll, "delete", id, nil)
+	var n int64
+	for i, cmd := range cmds {
+		if cmd.Val() > 0 {
+			n += cmd.Val()
+			b.publish(ctx, coll, "delete", ids[i], nil)
 		}
 	}
 	return n, nil
@@ -855,6 +944,15 @@ func (b *kvBackend) checkOwner(ctx context.Context, coll, key string, scope M) e
 
 // claimOwner takes ownership of key for the caller, or fails if it is already
 // held by someone else. HSETNX makes the claim atomic.
+//
+// It also reclaims STALE claims. A claim outlives its data in three ordinary
+// ways: Redis drops a list/set/zset key the moment its last element is removed,
+// a String key can expire on its TTL, and a crash can land between the claim and
+// the write. Without this, the first user to touch a key name owns it forever —
+// everyone else gets a permanent 403 for a key that does not exist, and the
+// owner hash grows without bound. So when the holder differs and the underlying
+// key is gone, ownership transfers, under a WATCH so two racing claimants cannot
+// both win.
 func (b *kvBackend) claimOwner(ctx context.Context, coll, key string, scope M) error {
 	if len(scope) == 0 {
 		return nil
@@ -863,21 +961,69 @@ func (b *kvBackend) claimOwner(ctx context.Context, coll, key string, scope M) e
 	if !ok {
 		return nil
 	}
-	claimed, err := b.rdb.HSetNX(ctx, b.ownerKey(coll), key, want).Result()
+	ok2, err := b.rdb.HSetNX(ctx, b.ownerKey(coll), key, want).Result()
 	if err != nil {
 		return err
 	}
-	if claimed {
+	if ok2 {
 		return nil
 	}
 	got, err := b.rdb.HGet(ctx, b.ownerKey(coll), key).Result()
 	if err != nil && !isRedisNil(err) {
 		return err
 	}
-	if got != want {
-		return ErrForbidden
+	if got == want {
+		return nil
 	}
-	return nil
+	return b.takeOverStaleClaim(ctx, coll, key, got, want)
+}
+
+// takeOverStaleClaim transfers a claim whose data no longer exists.
+func (b *kvBackend) takeOverStaleClaim(ctx context.Context, coll, key, holder, want string) error {
+	ok := b.rdb.Exists(ctx, b.memberKey(coll, key))
+	if n, err := ok.Result(); err != nil {
+		return err
+	} else if n > 0 {
+		return ErrForbidden // the holder's data is really there
+	}
+	txf := func(tx *redis.Tx) error {
+		// re-check under WATCH: the holder may have rewritten in the meantime
+		cur, err := tx.HGet(ctx, b.ownerKey(coll), key).Result()
+		if err != nil && !isRedisNil(err) {
+			return err
+		}
+		if err == nil && cur != holder && cur != want {
+			return ErrForbidden
+		}
+		n, err := tx.Exists(ctx, b.memberKey(coll, key)).Result()
+		if err != nil {
+			return err
+		}
+		if n > 0 {
+			return ErrForbidden
+		}
+		_, err = tx.TxPipelined(ctx, func(p redis.Pipeliner) error {
+			p.HSet(ctx, b.ownerKey(coll), key, want)
+			return nil
+		})
+		return err
+	}
+	return watchRetry(ctx, b.rdb, coll+":"+key, []string{b.ownerKey(coll), b.memberKey(coll, key)}, txf)
+}
+
+// releaseIfEmpty drops the ownership record when the entry key no longer exists.
+//
+// Redis deletes a list/set/zset key as soon as its last element goes, so every
+// path that can empty one has to call this — otherwise the claim outlives the
+// data and the owner hash grows forever. claimOwner can recover from a missed
+// call, but recovering is not a reason to leak.
+func (b *kvBackend) releaseIfEmpty(ctx context.Context, coll, key string, scope M) {
+	if len(scope) == 0 {
+		return
+	}
+	if n, err := b.rdb.Exists(ctx, b.memberKey(coll, key)).Result(); err == nil && n == 0 {
+		b.releaseOwner(ctx, coll, key)
+	}
 }
 
 // releaseOwner drops the ownership record for a deleted key.

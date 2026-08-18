@@ -529,3 +529,85 @@ func TestIntegrationNamespaceIsolation(t *testing.T) {
 		t.Errorf("namespaces leaked into each other: a=%q b=%q", a.Name, b.Name)
 	}
 }
+
+// A unique value claimed by a write that never lands must be given back.
+// Without a rollback the value stayed reserved for a document that does not have
+// it, and the next writer of that value got a spurious 409 until restart.
+func TestIntegrationUniqueClaimRollback(t *testing.T) {
+	defer withTestDS(t)()
+	users := New[string, *itUser](WithCollection("it_uniq_rollback"))
+
+	// an insert that finds the id taken writes nothing, so it must not keep the
+	// unique value it claimed on the way in
+	if err := users.HSet("u1", &itUser{Name: "Ada", Email: "held@x.io"}); err != nil {
+		t.Fatal(err)
+	}
+	if ins, err := users.HSetNX("u1", &itUser{Name: "Other", Email: "free@x.io"}); ins || err != nil {
+		t.Fatalf("HSetNX on an existing id: inserted=%v err=%v", ins, err)
+	}
+	// "free@x.io" was claimed by that no-op insert; another document must still get it
+	if err := users.HSet("u2", &itUser{Name: "Bob", Email: "free@x.io"}); err != nil {
+		t.Errorf("a value claimed by a no-op insert stayed reserved: %v", err)
+	}
+
+	// a scoped write refused on ownership must also give its claim back
+	type owned struct {
+		Owner string `json:"owner"`
+		Email string `json:"email" index:"unique"`
+	}
+	notes := New[string, *owned](WithCollection("it_uniq_rollback2"))
+	if err := notes.HSetScoped("n1", &owned{Owner: "alice", Email: "a@x.io"}, "owner", "alice"); err != nil {
+		t.Fatal(err)
+	}
+	if err := notes.HSetScoped("n1", &owned{Owner: "bob", Email: "b@x.io"}, "owner", "bob"); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("bob overwriting alice = %v want ErrForbidden", err)
+	}
+	// bob's rejected write claimed "b@x.io"; it must be available again
+	if err := notes.HSetScoped("n2", &owned{Owner: "bob", Email: "b@x.io"}, "owner", "bob"); err != nil {
+		t.Errorf("a value claimed by a refused write stayed reserved: %v", err)
+	}
+}
+
+// Deleting a mixed batch used to announce a deletion for every id in it, including
+// ids that were never there.
+func TestIntegrationDeleteEventsAreExact(t *testing.T) {
+	defer withTestDS(t)()
+	users := New[string, itUser](WithCollection("it_del_events"))
+
+	b, ok := defaultDatasources.get("")
+	if !ok {
+		t.Fatal("no backend")
+	}
+	var mu sync.Mutex
+	var deleted []string
+	done := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		_ = b.watch(ctx, "it_del_events", nil, func(op, id string, raw []byte) error {
+			if op == "delete" {
+				mu.Lock()
+				deleted = append(deleted, id)
+				mu.Unlock()
+			}
+			return nil
+		})
+		close(done)
+	}()
+	time.Sleep(300 * time.Millisecond)
+
+	if err := users.HSet("real", itUser{Name: "A", Email: "a@x.io"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := users.HDel("real", "never-existed"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(400 * time.Millisecond)
+	cancel()
+	<-done
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(deleted) != 1 || deleted[0] != "real" {
+		t.Errorf("delete events = %v want exactly [real]", deleted)
+	}
+}
