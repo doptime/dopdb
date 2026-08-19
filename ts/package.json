@@ -1,7 +1,7 @@
 {
   "name": "@kequnyang/dopdb",
-  "version": "0.1.202606301552",
-  "description": "One schema, two equivalent engines (Go + TypeScript), one wire protocol. Declare a collection once and get native types, runtime validation, a typed browser client (fetch), and a Node + KVRocks server \u2014 no codegen, no double-write. Redis-compatible data structures (Hash/String/List/Set/ZSet) stored natively on KVRocks, values encoded as CBOR.",
+  "version": "0.2.0",
+  "description": "One schema, two equivalent engines (Go + TypeScript), one wire protocol. Declare a collection once and get native types, runtime validation, a typed browser client (fetch), and a Node + KVRocks server — no codegen, no double-write. Redis-compatible data structures (Hash/String/List/Set/ZSet) stored natively on KVRocks, values encoded as CBOR.",
   "type": "module",
   "license": "MIT",
   "author": "doptime",

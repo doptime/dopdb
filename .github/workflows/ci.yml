@@ -1,0 +1,99 @@
+name: CI
+
+# The repository had no CI at all: the only workflow was npm publish, and its
+# test step ran with no server, so every server-dependent test skipped. That is
+# how two engines drifted on hgetall's response shape and on hash commands
+# against non-hash collections — nothing ever ran the cross-engine diff.
+#
+# This runs the whole suite, including conformance, against a real
+# Redis-protocol server on every push and pull request.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  DOPDB_TEST_KVROCKS_URI: redis://127.0.0.1:6666
+
+jobs:
+  go:
+    name: Go (unit + integration + conformance)
+    runs-on: ubuntu-latest
+    services:
+      kvrocks:
+        # Apache Kvrocks speaks the Redis protocol; dopdb uses only the common
+        # command set, so the image is interchangeable with redis for testing.
+        image: apache/kvrocks:latest
+        ports: ["6666:6666"]
+        options: >-
+          --health-cmd "redis-cli -p 6666 ping || exit 1"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: true
+
+      # The conformance test spawns the TypeScript server as a subprocess, so the
+      # Go job needs node and the TS dependencies too.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: ts/package-lock.json
+      - run: npm ci
+        working-directory: ts
+
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then echo "unformatted:"; echo "$out"; exit 1; fi
+
+      - run: go vet ./...
+
+      - name: go test (with a live server — conformance included)
+        run: go test -count=1 ./...
+
+      - name: assert conformance actually ran
+        # A skipped conformance suite is the failure mode this job exists to
+        # prevent, so a run that skips it fails the build rather than passing
+        # green on nothing.
+        run: |
+          go test -count=1 -run Conformance -v ./httpserve/ 2>&1 | tee /tmp/conf.log
+          if grep -q -- "--- SKIP" /tmp/conf.log; then
+            echo "conformance skipped — the server was not reachable"; exit 1
+          fi
+          grep -q -- "--- PASS: TestConformance" /tmp/conf.log
+
+  ts:
+    name: TypeScript (typecheck + tests)
+    runs-on: ubuntu-latest
+    services:
+      kvrocks:
+        image: apache/kvrocks:latest
+        ports: ["6666:6666"]
+        options: >-
+          --health-cmd "redis-cli -p 6666 ping || exit 1"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    defaults:
+      run:
+        working-directory: ts
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: ts/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
