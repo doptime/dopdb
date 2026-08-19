@@ -2,6 +2,7 @@ package dopdb
 
 import (
 	"context"
+	"errors"
 	"time"
 )
 
@@ -63,9 +64,12 @@ func (s *StringCollection[K]) HttpStrGet(ctx context.Context, ds, key string, sc
 		return nil, err
 	}
 	if err := b.checkOwner(ctx, s.k.coll, key, scope); err != nil {
-		// a foreign-owned key must look absent, not forbidden — same
-		// non-leakage the Hash family gets from its scoped filter
-		return nil, ErrNoDoc
+		if errors.Is(err, ErrForbidden) {
+			// a foreign-owned key must look absent, not forbidden — same
+			// non-leakage the Hash family gets from its scoped filter
+			return nil, ErrNoDoc
+		}
+		return nil, err // a real failure must not read as "not found"
 	}
 	raw, err := b.rdb.Get(ctx, rk).Bytes()
 	if isRedisNil(err) {
@@ -170,6 +174,9 @@ func (s *StringCollection[K]) HttpStrDel(ctx context.Context, ds string, scope M
 			return kerr
 		}
 		if err := b.checkOwner(ctx, s.k.coll, k, scope); err != nil {
+			if !errors.Is(err, ErrForbidden) {
+				return err
+			}
 			continue // not the caller's key: silently skipped, as before
 		}
 		del = append(del, rk)

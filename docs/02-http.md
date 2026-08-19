@@ -39,7 +39,7 @@ Selected Hash semantics:
 | `hscan`/`hscannovalues`/`hrandfield` | GET | glob scan (paginated) / random keys |
 | `watch` | GET | dopdb change channel → SSE (no replay) |
 
-Reads are GET, writes are POST, `watch` is GET + SSE. Every command is guarded by the Go↔TS conformance harness.
+Reads are GET, writes are POST (**enforced**: a write sent as GET is `405`), `watch` is GET + SSE. See `docs/TESTING.md` for exactly which commands the Go↔TS conformance harness compares.
 
 ## `@`-binding (anti-forgery identity injection)
 

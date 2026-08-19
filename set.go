@@ -2,6 +2,7 @@ package dopdb
 
 import (
 	"context"
+	"errors"
 	"sort"
 )
 
@@ -101,7 +102,10 @@ func (s *SetCollection[K]) HttpSMembers(ctx context.Context, ds, key string, sco
 		return nil, kerr
 	}
 	if err := b.checkOwner(ctx, s.k.coll, key, scope); err != nil {
-		return []any{}, nil
+		if errors.Is(err, ErrForbidden) {
+			return []any{}, nil // someone else's key looks absent
+		}
+		return nil, err // a real failure must not read as "no data"
 	}
 	raws, err := b.rdb.SMembers(ctx, rk).Result()
 	if err != nil {
@@ -126,7 +130,10 @@ func (s *SetCollection[K]) HttpSIsMember(ctx context.Context, ds, key string, me
 		return false, kerr
 	}
 	if err := b.checkOwner(ctx, s.k.coll, key, scope); err != nil {
-		return false, nil
+		if errors.Is(err, ErrForbidden) {
+			return false, nil
+		}
+		return false, err
 	}
 	raw, err := encodeCBOR(member)
 	if err != nil {
@@ -143,7 +150,10 @@ func (s *SetCollection[K]) HttpSCard(ctx context.Context, ds, key string, scope 
 		return 0, kerr
 	}
 	if err := b.checkOwner(ctx, s.k.coll, key, scope); err != nil {
-		return 0, nil
+		if errors.Is(err, ErrForbidden) {
+			return 0, nil
+		}
+		return 0, err
 	}
 	return b.rdb.SCard(ctx, rk).Result()
 }

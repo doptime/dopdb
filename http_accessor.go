@@ -41,7 +41,9 @@ type HttpAccessor interface {
 
 	// HttpGetAll returns all values; if scope is non-nil it is applied as a
 	// mandatory filter (the row-level isolation predicate).
+	// HttpGetAll returns {id: document}; HttpVals returns just the documents.
 	HttpGetAll(ctx context.Context, ds string, scope M) (any, error)
+	HttpVals(ctx context.Context, ds string, scope M) (any, error)
 	HttpKeys(ctx context.Context, ds string) (any, error)
 	HttpLen(ctx context.Context, ds string) (int64, error)
 	HttpIncrBy(ctx context.Context, ds, key, field string, delta float64) error
@@ -237,7 +239,37 @@ func (c *Collection[K, V]) HttpExists(ctx context.Context, ds, key string) (bool
 	return c.backend(ds).exists(ctx, c.coll, key)
 }
 
+// HttpGetAll returns {id: document}. The shape is a contract, not an accident:
+// the TypeScript client types it as Record<id, T> and the docs show `all[id]`,
+// so returning an array here — which this used to do — silently broke every
+// consumer that switched engines.
 func (c *Collection[K, V]) HttpGetAll(ctx context.Context, ds string, scope M) (any, error) {
+	var (
+		ids  []string
+		docs [][]byte
+		err  error
+	)
+	if len(scope) > 0 {
+		ids, docs, err = c.backend(ds).find(ctx, c.coll, scope, FindOpt{})
+	} else {
+		ids, docs, err = c.backend(ds).all(ctx, c.coll)
+	}
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]V, len(ids))
+	for i, id := range ids {
+		v, derr := c.decodeAt(docs[i], id)
+		if derr != nil {
+			return nil, derr
+		}
+		out[id] = v
+	}
+	return out, nil
+}
+
+// HttpVals returns the documents as an array (HVALS semantics).
+func (c *Collection[K, V]) HttpVals(ctx context.Context, ds string, scope M) (any, error) {
 	if len(scope) > 0 {
 		return c.findDS(ctx, ds, scope, FindOpt{})
 	}

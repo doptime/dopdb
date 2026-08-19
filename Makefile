@@ -12,11 +12,12 @@
 GO ?= go
 export GOFLAGS = -mod=mod
 
-.PHONY: help test test-kvrocks vet fmt fmt-check build tidy ts ts-test ts-typecheck clean
+.PHONY: help test test-kvrocks bench vet fmt fmt-check build tidy ts ts-test ts-typecheck clean
 
 help:
 	@echo "make test          - go test ./...  (integration tests skip without DOPDB_TEST_KVROCKS_URI)"
-	@echo "make test-kvrocks  - run integration tests against DOPDB_TEST_KVROCKS_URI"
+	@echo "make test-kvrocks  - run integration + conformance tests against DOPDB_TEST_KVROCKS_URI"
+	@echo "make bench         - query-engine benchmarks (needs DOPDB_TEST_KVROCKS_URI)"
 	@echo "make vet           - go vet ./..."
 	@echo "make fmt           - gofmt -w ."
 	@echo "make fmt-check     - fail if anything is unformatted"
@@ -31,7 +32,11 @@ test:
 
 test-kvrocks:
 	@if [ -z "$(DOPDB_TEST_KVROCKS_URI)" ]; then echo "set DOPDB_TEST_KVROCKS_URI=redis://localhost:6666"; exit 1; fi
-	$(GO) test -count=1 -run Integration -v ./...
+	$(GO) test -count=1 -run 'Integration|Conformance' -v ./...
+
+bench:
+	@if [ -z "$(DOPDB_TEST_KVROCKS_URI)" ]; then echo "set DOPDB_TEST_KVROCKS_URI=redis://localhost:6666"; exit 1; fi
+	$(GO) test -run XXX -bench . -benchmem -benchtime=5x .
 
 vet:
 	$(GO) vet ./...

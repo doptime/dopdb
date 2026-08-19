@@ -149,6 +149,29 @@ Blocking list ops (`BLPop`/`BRPop`/`BRPopLPush`) remain unimplemented. See `REDI
 
 KVRocks cannot query by content, so `query.go` (and its twin `ts/src/query.ts`) walks the collection hash with `HSCAN`, decodes each document, evaluates the filter in-process, then sorts, skips, limits and projects.
 
+### The cost model, measured
+
+Numbers from `make bench` on a 20,000-document collection (`bench_test.go`):
+
+| query | time | allocated |
+|---|---|---|
+| `count` with no filter | **0.013 ms** | 205 B |
+| `find` paging, no filter | 20 ms | 3.1 MB |
+| `find` with an equality filter | 55 ms | 13 MB |
+| `find` with `$regex` | 63 ms | 13 MB |
+
+Three things that are worth knowing about those numbers:
+
+- **`count` with no filter is a single `HLEN`.** It does not scan. Any other
+  count does.
+- **A `$regex` filter is no longer several times the cost of an equality one.**
+  The pattern is compiled once per query, not once per document (it used to be
+  the latter: 121 ms and 57 MB for the same query).
+- **`LIMIT` bounds memory, not work.** The scan still reads every document —
+  KVRocks has no index to consult — but only the rows that can still make the
+  answer are retained. A sorted `limit 10` over 20,000 matches holds ten rows,
+  not twenty thousand (`mem_test.go` asserts it: ~0 KiB vs 1.87 MiB).
+
 What that costs you, plainly:
 
 - Cost is **O(collection)**, not O(result). Filter on a small collection, or keep the working set addressable by key.

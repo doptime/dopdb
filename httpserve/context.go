@@ -210,13 +210,15 @@ func (s *Server) buildParams(r *http.Request, c *ReqCtx) {
 			c.Params[k] = v
 		}
 	}
-	for k, v := range r.Header {
-		if len(v) == 1 {
-			c.Params[k] = v[0]
-		} else {
-			c.Params[k] = v
-		}
-	}
+	// Request headers are NOT merged into Params.
+	//
+	// They used to be, every one of them. On a collection whose value type is a
+	// free-form map, HSET stores Params verbatim — so `Authorization: Bearer
+	// <jwt>` and every Cookie were written into the document and came back out of
+	// any hgetall or find the caller (or a co-tenant with read access) could run.
+	// A credential store is not what a document collection is for. Nothing in the
+	// framework reads request headers as data: @-binding takes identity from the
+	// verified claims, and the few headers that matter are read explicitly.
 
 	// Strip forged @-params: clients may never supply @-prefixed keys.
 	for k := range c.Params {

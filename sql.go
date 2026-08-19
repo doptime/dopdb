@@ -286,10 +286,33 @@ func sqlString(s string) (string, int, error) {
 
 // ---- parser -----------------------------------------------------------------
 
+// maxSQLDepth bounds expression nesting.
+//
+// parsePrimary recurses through parseOr/parseAnd/parseNot for every '(' — about
+// four stack frames per level — and the request body limit allows on the order of
+// a quarter-million of them. A single POST of nested parentheses would grow one
+// goroutine's stack into the tens of megabytes, and a handful of concurrent ones
+// would take the process out. FIND's JSON filter has had a depth limit all along;
+// SQL had none.
+const maxSQLDepth = 64
+
 type sqlParser struct {
-	toks []sqlTok
-	pos  int
+	toks  []sqlTok
+	pos   int
+	depth int
 }
+
+// enter/leave track expression nesting so the parser fails with a syntax error
+// instead of a stack overflow.
+func (p *sqlParser) enter() error {
+	p.depth++
+	if p.depth > maxSQLDepth {
+		return sqlErr("expression nested deeper than %d levels", maxSQLDepth)
+	}
+	return nil
+}
+
+func (p *sqlParser) leave() { p.depth-- }
 
 func (p *sqlParser) peek() sqlTok { return p.toks[p.pos] }
 func (p *sqlParser) next() sqlTok { t := p.toks[p.pos]; p.pos++; return t }
@@ -540,6 +563,10 @@ func (p *sqlParser) parseAnd() (M, error) {
 
 func (p *sqlParser) parseNot() (M, error) {
 	if p.kw("NOT") {
+		if err := p.enter(); err != nil {
+			return nil, err
+		}
+		defer p.leave()
 		inner, err := p.parseNot()
 		if err != nil {
 			return nil, err
@@ -551,6 +578,10 @@ func (p *sqlParser) parseNot() (M, error) {
 
 func (p *sqlParser) parsePrimary() (M, error) {
 	if p.sym("(") {
+		if err := p.enter(); err != nil {
+			return nil, err
+		}
+		defer p.leave()
 		inner, err := p.parseOr()
 		if err != nil {
 			return nil, err

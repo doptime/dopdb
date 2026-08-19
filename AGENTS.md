@@ -80,13 +80,13 @@ Terse, full-coverage usage reference. For an AI coding agent or an experienced d
 ### ZSet (`{_id, members:[{m,score}]}`)
 `zadd` `zrem` `zscore` `zcard` `zcount` `zincrby` `zrange` `zrevrange` `zrangebyscore` `zrevrangebyscore` `zrank` `zrevrank` `zpopmin` `zpopmax` `zremrangebyrank` `zremrangebyscore`. Range/score params via query: `?start=&stop=`, `?min=&max=`, `?count=`, `?withscores=1`.
 
-> Every command above is covered by the Go↔TS conformance harness (both engines, one server, separate namespaces, per-command diff). Naming avoids collisions: String uses the `STR*` prefix so it never clashes with Set's `S*`.
+> The Go↔TS conformance harness (both engines, one server, separate namespaces, per-command diff) covers the Hash family, all four Redis-type families, SQL, method enforcement, owner-scope and the error classes. `watch`, TTL, `?ds=` and 409/413 differentials are **not** covered yet — see `docs/TESTING.md` for the current list. Naming avoids collisions: String uses the `STR*` prefix so it never clashes with Set's `S*`.
 
 ---
 
 ## 4. Backend (Go)
 
-**Lang**: Go 1.24+ **Package**: `github.com/doptime/dopdb` (+ `api/` `httpserve/` `config/`).
+**Lang**: Go 1.22+ (matches `go.mod`) **Package**: `github.com/doptime/dopdb` (+ `api/` `httpserve/` `config/`).
 
 ### 4.1 Hash collection (the primary, fullest-surface type)
 

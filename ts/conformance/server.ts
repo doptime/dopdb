@@ -9,7 +9,7 @@
 // "DOPDB_TS_READY <port>" once listening, then blocks until killed.
 
 import { serve } from "../src/server.js";
-import { collection, f } from "../src/schema.js";
+import { collection, f, All } from "../src/schema.js";
 
 // Schema mirrors httpserve/conformance_test.go:
 //   notes  — owner-scoped, owner field bound to @uid
@@ -21,31 +21,32 @@ const schema = {
     owner: f.string().bind("@uid"),
   })
     .named("notes")
+    .httpOn(All)
     .ownerScope("owner"),
   Items: collection({
     _id: f.string(),
     label: f.string(),
-  }).named("items"),
+  }).named("items").httpOn(All),
   // String family (STR*): a native Redis string per key, non-scoped.
   Strs: collection({
     _id: f.string(),
     v: f.string(),
-  }).named("strvals"),
+  }).named("strvals").httpOn(All),
   // Set family (S*): a native Redis set per key, non-scoped.
   Setvals: collection({
     _id: f.string(),
     members: f.string(), // array via wire; not schema-validated for S*
-  }).named("setvals"),
+  }).named("setvals").httpOn(All),
   // List family (L*/R*): a native Redis list per key, non-scoped.
   Listvals: collection({
     _id: f.string(),
     items: f.string(), // array via wire
-  }).named("listvals"),
+  }).named("listvals").httpOn(All),
   // ZSet family (Z*): a native Redis sorted set per key, non-scoped.
   Zsetvals: collection({
     _id: f.string(),
     members: f.string(), // array via wire
-  }).named("zsetvals"),
+  }).named("zsetvals").httpOn(All),
 };
 
 async function main(): Promise<void> {
@@ -62,7 +63,11 @@ async function main(): Promise<void> {
     kvrocks: { uri, namespace },
     jwtSecret,
     port,
-    permit: () => true, // behavioral conformance, not the permission gate
+    // No blanket permit. The harness used to pass `permit: () => true`, which
+    // made the TypeScript engine allow everything and so made every 403 in the
+    // Go engine an unreachable difference — the gate was the one thing the
+    // "conformance" suite could never compare. Each collection declares its own
+    // bitmask instead, exactly as the Go side grants them.
   });
   process.stdout.write(`DOPDB_TS_READY ${port}\n`);
   // Block until signaled.

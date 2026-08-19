@@ -94,7 +94,22 @@ Unchanged by the storage swap. URL `/api/<cmd>/<coll>?ds=`, key `?f=`, range/sco
 
 ## 9 · Consistency (conformance)
 
-Every command has a two-engine case in `httpserve/conformance_test.go` (Go server vs TS subprocess, both against a real KVRocks in separate namespaces), covering normal + edge cases (empty key, out-of-range index, missing member, cross-tenant owner-scope). The two engines must agree on status + code + body shape per command; a single-engine test does not count as consistency evidence.
+`httpserve/conformance_test.go` runs both engines (Go server vs TS subprocess, one real KVRocks, separate namespaces) and diffs status + code + body. A single-engine test does not count as consistency evidence.
+
+**What the harness covers today** (`TestConformance*`): the Hash family
+(hget/hset/hsetnx/hdel/del/hexists/hgetall/hkeys/hvals/hlen/hmget/count/find/
+findone/hscan/hscannovalues/hrandfield), the full String/List/Set/ZSet command
+sets, SQL, sort+projection shaping, owner-scope, method enforcement (writes are
+POST-only on both engines), the error-status classes (400/401/403/404/405), and
+the response *shapes* that differ structurally (hgetall is a map, hvals an array).
+
+**What it does not cover yet**: `watch` event streams, TTL expiry, `?ds=`
+selection, and 409/413 differentials. Those are named here rather than implied to
+be covered — the claim "every command is covered" was in four documents while the
+suite had sixteen cases, and the two defects found in the last audit (hgetall's
+response shape, hash commands against a non-hash collection) both sat squarely in
+the uncovered set. That is not a coincidence: an overstated coverage claim is
+worse than an honest gap, because it stops people looking.
 
 ## 10 · Net effect of the KVRocks migration
 

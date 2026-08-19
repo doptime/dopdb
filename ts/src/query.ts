@@ -170,15 +170,50 @@ function matchIn(val: unknown, present: boolean, arg: unknown): boolean {
   return arg.some((w) => valueMatches(val, present, w));
 }
 
+/** Bounds a caller-supplied pattern.
+ *
+ * JavaScript's regex engine backtracks, so an attacker-supplied pattern is a
+ * denial-of-service primitive in a way Go's RE2 is not: `(a+)+$` against a long
+ * non-matching string is exponential, and `find` evaluates the filter against
+ * EVERY document. One request would freeze the event loop for the whole process,
+ * taking every other request and every watch stream with it. The length cap and
+ * the nested-quantifier check are cheap, conservative guards; they reject some
+ * legitimate patterns, which is the right trade for a shared event loop. */
+const MAX_REGEX_LEN = 512;
+
+/** A quantifier applied to an already-quantified group — the classic catastrophic
+ * backtracking shape. */
+const NESTED_QUANTIFIER = /\([^)]*[+*][^)]*\)\s*[+*{]/;
+
+const regexCache = new Map<string, RegExp | null>();
+
+/** Compile a filter pattern once and reuse it.
+ *
+ * This used to compile inside the per-document loop, so a $regex filter over a
+ * 20k-document collection built the same RegExp 20,000 times. */
+function compileRegex(pattern: string, flags: string): RegExp | null {
+  const key = `${flags}\u0000${pattern}`;
+  const hit = regexCache.get(key);
+  if (hit !== undefined) return hit;
+
+  let re: RegExp | null = null;
+  if (pattern.length <= MAX_REGEX_LEN && !NESTED_QUANTIFIER.test(pattern)) {
+    try {
+      re = new RegExp(pattern, flags);
+    } catch {
+      re = null;
+    }
+  }
+  if (regexCache.size > 1000) regexCache.clear(); // crude bound; patterns are few
+  regexCache.set(key, re);
+  return re;
+}
+
 function matchRegex(val: unknown, present: boolean, pattern: unknown, opts: string): boolean {
   if (!present || typeof pattern !== "string") return false;
   const flags = [...opts].filter((c) => c === "i" || c === "m" || c === "s").join("");
-  let re: RegExp;
-  try {
-    re = new RegExp(pattern, flags);
-  } catch {
-    return false;
-  }
+  const re = compileRegex(pattern, flags);
+  if (re === null) return false;
   const test = (v: unknown) => typeof v === "string" && re.test(v);
   if (test(val)) return true;
   return Array.isArray(val) && val.some(test);
@@ -320,6 +355,71 @@ export function sortKeysFromMap(sort: Record<string, unknown>): SortKey[] {
     const asc = typeof v === "number" ? v >= 0 : v !== false;
     return { field, asc };
   });
+}
+
+/** The comparison a result set is ordered by: the requested sort keys, with the
+ * document id as the final tiebreak so the order is total and stable. */
+export function rowLess(a: Doc, b: Doc, keys: SortKey[]): boolean {
+  for (const k of keys) {
+    const [x] = lookupPath(a, k.field);
+    const [y] = lookupPath(b, k.field);
+    const c = compareValues(x, y);
+    if (c === null || c === 0) continue;
+    return k.asc ? c < 0 : c > 0;
+  }
+  return String(a._id ?? "") < String(b._id ?? "");
+}
+
+/** Keeps only the best n rows seen, in O(n) memory and O(log n) per row.
+ *
+ * Without it a query materialised every matching document and only then applied
+ * skip/limit — so `find({}, {limit: 10})` against a million-document collection
+ * held a million decoded documents to return ten. The scan is still
+ * O(collection) (KVRocks has no index to consult), but the memory is now bounded
+ * by what the caller actually asked for. */
+export class TopN {
+  private readonly rows: Doc[] = [];
+  constructor(private readonly n: number, private readonly keys: SortKey[]) {}
+
+  /** true when rows[i] should be evicted before rows[j] — it sorts AFTER rows[j]
+   * and so is further from the answer. */
+  private worse(i: number, j: number): boolean {
+    return rowLess(this.rows[j], this.rows[i], this.keys);
+  }
+
+  /** Keeps the WORST retained row at the root, so that is the one evicted when
+   * the heap is over capacity. */
+  push(r: Doc): void {
+    this.rows.push(r);
+    let i = this.rows.length - 1;
+    while (i > 0) {
+      const p = (i - 1) >> 1;
+      if (!this.worse(i, p)) break; // child no worse than parent
+      [this.rows[p], this.rows[i]] = [this.rows[i], this.rows[p]];
+      i = p;
+    }
+    if (this.rows.length > this.n) this.popWorst();
+  }
+
+  private popWorst(): void {
+    const last = this.rows.length - 1;
+    this.rows[0] = this.rows[last];
+    this.rows.pop();
+    let i = 0;
+    for (;;) {
+      const l = 2 * i + 1, r = 2 * i + 2;
+      let worst = i;
+      if (l < this.rows.length && this.worse(l, worst)) worst = l;
+      if (r < this.rows.length && this.worse(r, worst)) worst = r;
+      if (worst === i) return;
+      [this.rows[i], this.rows[worst]] = [this.rows[worst], this.rows[i]];
+      i = worst;
+    }
+  }
+
+  sorted(): Doc[] {
+    return this.rows.sort((a, b) => (rowLess(a, b, this.keys) ? -1 : rowLess(b, a, this.keys) ? 1 : 0));
+  }
 }
 
 export function sortDocs(rows: Doc[], keys: SortKey[]): void {

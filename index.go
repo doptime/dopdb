@@ -87,16 +87,31 @@ func (b *kvBackend) claimUnique(ctx context.Context, coll, id string, doc map[st
 			continue
 		}
 		idxKey := b.uniqKey(coll, f)
-		holder, err := b.rdb.HGet(ctx, idxKey, slot).Result()
-		if err == nil && holder != id {
-			return taken, fmt.Errorf("%w: %s.%s", ErrDuplicate, coll, f)
-		}
-		if err != nil && !isRedisNil(err) {
+		// HSETNX, not HGET-then-HSET. A read followed by a write is a
+		// check-then-act: two writers inserting the SAME unique value both see
+		// the slot empty, both take it, and both commit — the constraint is
+		// satisfied for neither. HSETNX makes taking the slot the same operation
+		// as finding it free.
+		fresh, err := b.rdb.HSetNX(ctx, idxKey, slot, id).Result()
+		if err != nil {
 			return taken, err
 		}
-		fresh := isRedisNil(err) // nobody held this value before
-		if err := b.rdb.HSet(ctx, idxKey, slot, id).Err(); err != nil {
-			return taken, err
+		if !fresh {
+			holder, herr := b.rdb.HGet(ctx, idxKey, slot).Result()
+			if herr != nil && !isRedisNil(herr) {
+				return taken, herr
+			}
+			if herr == nil && holder != id {
+				return taken, fmt.Errorf("%w: %s.%s", ErrDuplicate, coll, f)
+			}
+			// already ours (a rewrite of the same document), or it vanished
+			// between the two calls — either way we hold it now
+			if isRedisNil(herr) {
+				if err := b.rdb.HSet(ctx, idxKey, slot, id).Err(); err != nil {
+					return taken, err
+				}
+				fresh = true
+			}
 		}
 		taken = append(taken, takenSlot{field: f, slot: slot, fresh: fresh})
 	}

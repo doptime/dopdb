@@ -2,6 +2,7 @@ package dopdb
 
 import (
 	"context"
+	"errors"
 	"strings"
 
 	"github.com/redis/go-redis/v9"
@@ -160,6 +161,9 @@ func (l *ListCollection[K, E]) HttpLPop(ctx context.Context, ds, key string, sco
 	}
 	raw, err := b.rdb.LPop(ctx, rk).Result()
 	if isRedisNil(err) {
+		// nothing to pop: the claim this call just made backs no data, so it
+		// must not be left behind holding the key name against everyone else
+		b.releaseIfEmpty(ctx, l.k.coll, key, scope)
 		return nil, ErrNoDoc
 	}
 	if err != nil {
@@ -177,6 +181,7 @@ func (l *ListCollection[K, E]) HttpRPop(ctx context.Context, ds, key string, sco
 	}
 	raw, err := b.rdb.RPop(ctx, rk).Result()
 	if isRedisNil(err) {
+		b.releaseIfEmpty(ctx, l.k.coll, key, scope)
 		return nil, ErrNoDoc
 	}
 	if err != nil {
@@ -190,7 +195,10 @@ func (l *ListCollection[K, E]) HttpRPop(ctx context.Context, ds, key string, sco
 func (l *ListCollection[K, E]) HttpLRange(ctx context.Context, ds, key string, start, stop int, scope M) (any, error) {
 	b, rk, err := l.ro(ctx, ds, key, scope)
 	if err != nil {
-		return []any{}, nil
+		if errors.Is(err, ErrForbidden) {
+			return []any{}, nil // someone else's key looks absent
+		}
+		return nil, err // a real failure must not read as "no data"
 	}
 	raws, err := b.rdb.LRange(ctx, rk, int64(start), int64(stop)).Result()
 	if err != nil {
@@ -209,7 +217,10 @@ func (l *ListCollection[K, E]) HttpLRange(ctx context.Context, ds, key string, s
 func (l *ListCollection[K, E]) HttpLLen(ctx context.Context, ds, key string, scope M) (int64, error) {
 	b, rk, err := l.ro(ctx, ds, key, scope)
 	if err != nil {
-		return 0, nil
+		if errors.Is(err, ErrForbidden) {
+			return 0, nil
+		}
+		return 0, err
 	}
 	return b.rdb.LLen(ctx, rk).Result()
 }
@@ -217,7 +228,10 @@ func (l *ListCollection[K, E]) HttpLLen(ctx context.Context, ds, key string, sco
 func (l *ListCollection[K, E]) HttpLIndex(ctx context.Context, ds, key string, index int, scope M) (any, error) {
 	b, rk, err := l.ro(ctx, ds, key, scope)
 	if err != nil {
-		return nil, nil
+		if errors.Is(err, ErrForbidden) {
+			return nil, nil
+		}
+		return nil, err
 	}
 	raw, err := b.rdb.LIndex(ctx, rk, int64(index)).Result()
 	if isRedisNil(err) {
@@ -239,8 +253,11 @@ func (l *ListCollection[K, E]) HttpLSet(ctx context.Context, ds, key string, ind
 		return err
 	}
 	err = b.rdb.LSet(ctx, rk, int64(index), raw).Err()
-	if err != nil && isOutOfRange(err) {
-		return ErrNoDoc // index outside the list, or no such key
+	if err != nil {
+		b.releaseIfEmpty(ctx, l.k.coll, key, scope)
+		if isOutOfRange(err) {
+			return ErrNoDoc // index outside the list, or no such key
+		}
 	}
 	return err
 }
@@ -292,7 +309,11 @@ func (l *ListCollection[K, E]) HttpLInsert(ctx context.Context, ds, key string, 
 	}
 	// LINSERT answers -1 when the pivot is absent; that is not an error here,
 	// matching the previous "pivot not found -> no change" behaviour.
-	return b.rdb.LInsert(ctx, rk, op, praw, iraw).Err()
+	if lerr := b.rdb.LInsert(ctx, rk, op, praw, iraw).Err(); lerr != nil {
+		return lerr
+	}
+	b.releaseIfEmpty(ctx, l.k.coll, key, scope)
+	return nil
 }
 
 // isOutOfRange recognises the LSET index error without string-matching every

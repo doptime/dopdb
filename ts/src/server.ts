@@ -52,6 +52,7 @@ import {
   ValidationError,
 } from "./errors.js";
 import type { Db, DbApi, FindOpt, WatchEvent, WatchHandler, Unsubscribe } from "./client.js";
+import { PayloadTooLargeError } from "./errors.js";
 import { Permissions } from "./permission.js";
 export { Permissions } from "./permission.js";
 
@@ -66,34 +67,93 @@ function b64url(s: string): Buffer {
   return Buffer.from(s.replace(/-/g, "+").replace(/_/g, "/"), "base64");
 }
 
+/** Exported for tests only: the JWT verifier is a security boundary and needs
+ * direct unit coverage, not just end-to-end coverage through a live server. */
+export function _verifyJWTForTests(token: string, secret: string): Record<string, unknown> {
+  return verifyJWT(token, secret);
+}
+
+/** Which algorithm this deployment accepts, decided ONCE from the configured
+ * secret and cached. */
+const keyKindCache = new Map<string, { rsa: ReturnType<typeof createPublicKey> | null }>();
+
+function classifySecret(secret: string): { rsa: ReturnType<typeof createPublicKey> | null } {
+  const hit = keyKindCache.get(secret);
+  if (hit) return hit;
+  let kind: { rsa: ReturnType<typeof createPublicKey> | null } = { rsa: null };
+  try {
+    const k = createPublicKey(secret);
+    kind = { rsa: k };
+  } catch {
+    kind = { rsa: null };
+  }
+  keyKindCache.set(secret, kind);
+  return kind;
+}
+
+/** Verify a compact JWS.
+ *
+ * THE ALGORITHM IS PINNED BY THE CONFIGURED SECRET, not by the token header.
+ * Reading `alg` from the token is the classic confusion attack: an RS256
+ * deployment's key is a PUBLIC key — published in JWKS, often shipped to the
+ * frontend — so an attacker who takes that PEM text and uses it as an HMAC
+ * secret can mint {"alg":"HS256"} tokens carrying any claims, including the
+ * `uid` that owner-scoping trusts. A header-driven verifier accepts them, which
+ * is a complete authentication and row-isolation bypass from public material.
+ * The header only gets to AGREE with the configured key kind.
+ *
+ * Every parse failure in here becomes a 401. Letting a JSON.parse throw would
+ * surface a malformed token as a 500 — a client error reported as a server
+ * fault, and a divergence from the Go engine. */
 function verifyJWT(token: string, secret: string): Claims {
   const parts = token.split(".");
   if (parts.length !== 3) throw new UnauthorizedError("malformed token");
   const [h, p, sig] = parts;
-  const header = JSON.parse(b64url(h).toString("utf8")) as { alg?: string };
-  const signed = `${h}.${p}`;
-  const signature = b64url(sig);
-  switch (header.alg) {
-    case "HS256": {
-      const expected = createHmac("sha256", secret).update(signed).digest();
-      if (expected.length !== signature.length || !timingSafeEqual(expected, signature)) {
-        throw new UnauthorizedError("bad signature");
-      }
-      break;
-    }
-    case "RS256": {
-      // `secret` carries the RSA public key in PEM (SPKI/PKIX) form.
-      const ok = createVerify("RSA-SHA256").update(signed).verify(createPublicKey(secret), signature);
-      if (!ok) throw new UnauthorizedError("bad signature");
-      break;
-    }
-    default:
-      throw new UnauthorizedError("unsupported JWT alg"); // incl. "none"
+
+  let header: { alg?: string };
+  let signature: Buffer;
+  try {
+    header = JSON.parse(b64url(h).toString("utf8")) as { alg?: string };
+    signature = b64url(sig);
+  } catch {
+    throw new UnauthorizedError("malformed token");
   }
-  const claims = JSON.parse(b64url(p).toString("utf8")) as Claims;
-  const exp = claims["exp"];
-  if (typeof exp === "number" && Date.now() / 1000 > exp) {
-    throw new UnauthorizedError("token expired");
+  const signed = `${h}.${p}`;
+
+  const alg = (header.alg ?? "").toLowerCase();
+  if (alg === "none" || alg === "") throw new UnauthorizedError("unsupported JWT alg");
+
+  const kind = classifySecret(secret);
+  if (kind.rsa) {
+    if (header.alg !== "RS256") throw new UnauthorizedError("token alg does not match the configured key");
+    const ok = createVerify("RSA-SHA256").update(signed).verify(kind.rsa, signature);
+    if (!ok) throw new UnauthorizedError("bad signature");
+  } else {
+    if (header.alg !== "HS256") throw new UnauthorizedError("token alg does not match the configured key");
+    const expected = createHmac("sha256", secret).update(signed).digest();
+    if (expected.length !== signature.length || !timingSafeEqual(expected, signature)) {
+      throw new UnauthorizedError("bad signature");
+    }
+  }
+
+  let claims: Claims;
+  try {
+    claims = JSON.parse(b64url(p).toString("utf8")) as Claims;
+  } catch {
+    throw new UnauthorizedError("malformed token");
+  }
+  if (!claims || typeof claims !== "object" || Array.isArray(claims)) {
+    throw new UnauthorizedError("malformed token");
+  }
+
+  // exp accepts number or numeric string (Go does too). Present-but-unreadable
+  // is a malformed token, not an unlimited one; exp<=now is expired. Both used
+  // to fail open on one engine or the other.
+  const rawExp = claims["exp"];
+  if (rawExp !== undefined) {
+    const exp = typeof rawExp === "number" ? rawExp : typeof rawExp === "string" ? Number(rawExp) : NaN;
+    if (!Number.isFinite(exp)) throw new UnauthorizedError("malformed token");
+    if (Date.now() / 1000 >= exp) throw new UnauthorizedError("token expired");
   }
   return claims;
 }
@@ -205,10 +265,25 @@ function zRender(ms: ZM[], withScores: boolean): unknown {
 
 /** Shape a matched result set: sort, skip, limit, project. The in-process
  * stand-in for the cursor options the driver used to send. */
-function shape(rows: Doc[], opt: FindOpt | undefined, sortKeys?: SortKey[]): Doc[] {
+/** The sort directives a FindOpt asks for. */
+function effectiveSortKeys(opt: FindOpt | undefined, explicit?: SortKey[]): SortKey[] {
+  if (explicit && explicit.length > 0) return explicit;
+  if (opt?.sort) return sortKeysFromMap(opt.sort as Record<string, unknown>);
+  return [];
+}
+
+/** How many rows a query must retain to answer it; 0 means "everything". */
+function retainCap(opt: FindOpt | undefined): number {
+  const lim = opt?.limit;
+  if (lim == null || lim <= 0) return 0;
+  const capped = Math.min(Math.max(lim, 0), MAX_LIMIT) || DEFAULT_LIMIT;
+  const skip = opt?.skip && opt.skip > 0 ? opt.skip : 0;
+  const n = capped + skip;
+  return n > 1 << 20 ? 0 : n;
+}
+
+function shape(rows: Doc[], opt: FindOpt | undefined, _sortKeys?: SortKey[]): Doc[] {
   let out = rows;
-  if (sortKeys && sortKeys.length > 0) sortDocs(out, sortKeys);
-  else if (opt?.sort) sortDocs(out, sortKeysFromMap(opt.sort as Record<string, unknown>));
   if (opt?.skip != null && opt.skip > 0) out = out.slice(opt.skip);
   const lim = opt?.limit;
   const cap = lim != null ? Math.min(Math.max(lim, 0), MAX_LIMIT) || DEFAULT_LIMIT : DEFAULT_LIMIT;
@@ -298,8 +373,8 @@ async function exec(b: KvBackend, coll: string, cmd: string, a: ExecArgs, scope:
       return await b.findDocs(coll, scope);
     }
     case "hlen": {
-      if (!scoped) return { len: await b.count(coll) };
-      return { len: (await b.findDocs(coll, scope)).length };
+      // unscoped is a single HLEN; scoped still has to look at each document
+      return { len: await b.countDocs(coll, scope) };
     }
     case "hrandfield": {
       // Redis HRANDFIELD — the native command when unscoped; a filtered scan
@@ -365,13 +440,15 @@ async function exec(b: KvBackend, coll: string, cmd: string, a: ExecArgs, scope:
       const q = parseSql(a.sql ?? "");
       checkTable(q, coll);
       const merged = mergeScope(scope, sanitizeFilter(q.filter));
-      if (q.count) return { count: (await b.findDocs(coll, merged)).length };
-      return shape(await b.findDocs(coll, merged), {
+      if (q.count) return { count: await b.countDocs(coll, merged) };
+      const opt = {
         sort: undefined,
         skip: q.offset,
         limit: q.limit,
         projection: q.projection,
-      } as FindOpt, q.sortKeys);
+      } as FindOpt;
+      const rows = await b.findDocs(coll, merged, q.sortKeys, retainCap(opt));
+      return shape(rows, opt, q.sortKeys);
     }
     case "findone": {
       const safe = sanitizeFilter(a.filter);
@@ -399,11 +476,14 @@ async function exec(b: KvBackend, coll: string, cmd: string, a: ExecArgs, scope:
       const keys = a.keys ?? [];
       const owned: string[] = [];
       for (const k of keys) {
+        // reject reserved names BEFORE anything is deleted: `strdel f=__owner`
+        // would otherwise remove the collection's isolation index outright
+        b.entryKey(coll, k);
         if (scoped && !(await b.checkOwner(coll, k, scope))) continue;
         owned.push(k);
       }
       if (owned.length > 0) {
-        await b.redis.del(...owned.map((k) => b.memberKey(coll, k)));
+        await b.redis.del(...owned.map((k) => b.entryKey(coll, k)));
         await b.releaseOwner(coll, owned);
       }
       return { ok: true };
@@ -420,9 +500,13 @@ async function exec(b: KvBackend, coll: string, cmd: string, a: ExecArgs, scope:
       const entries = Object.entries(a.entries ?? {});
       if (entries.length === 0) return { ok: true };
       const pipe = b.redis.pipeline();
+      // Validate every key first: on KVRocks a SET over an existing hash key
+      // converts the type instead of raising WRONGTYPE, so one entry named
+      // "__owner" in a batch would destroy the collection's isolation index.
+      for (const [k] of entries) b.entryKey(coll, k);
       for (const [k, v] of entries) {
         if (scoped && !(await b.claimOwner(coll, k, scope))) throw new ForbiddenError();
-        pipe.set(b.memberKey(coll, k), encodeValue(v));
+        pipe.set(b.entryKey(coll, k), encodeValue(v));
       }
       await pipe.exec();
       return { ok: true };
@@ -761,7 +845,10 @@ async function subscribeChanges(
       if (!doc) return; // deletes carry no document to scope on
       if (!matchFilter({ ...doc, _id: ev.id }, scope)) return;
     }
-    onEvent({ type: op, key: String(ev.id ?? ""), doc: doc ? { ...doc, _id: ev.id } : null });
+    // `key` is canonical; `id` is emitted too so anything reading the older
+    // field keeps working. The Go engine sends both for the same reason.
+    const id = String(ev.id ?? "");
+    onEvent({ type: op, key: id, id, doc: doc ? { ...doc, _id: ev.id } : null } as WatchEvent<Doc>);
   });
   return async () => {
     try { await sub.unsubscribe(); } catch { /* already gone */ }
@@ -795,6 +882,30 @@ const DATA_COMMANDS = new Set([
 ]);
 const STREAM_COMMANDS = new Set(["watch"]);
 const ROUTED_COMMANDS = new Set([...DATA_COMMANDS, ...STREAM_COMMANDS]);
+
+/** Commands that address a single entry and therefore require ?f=. */
+const KEYED_COMMANDS = new Set([
+  "hget", "hset", "hsetnx", "hexists", "hincrby", "hincrbyfloat",
+  "strget", "strset",
+  "sadd", "srem", "smembers", "sismember", "scard",
+  "lpush", "rpush", "lpop", "rpop", "lrange", "llen", "lindex", "lset", "lrem", "ltrim",
+  "linsertbefore", "linsertafter",
+  "zadd", "zrem", "zscore", "zcard", "zcount", "zincrby", "zrange", "zrevrange",
+  "zrangebyscore", "zrevrangebyscore", "zrank", "zrevrank", "zpopmin", "zpopmax",
+  "zremrangebyrank", "zremrangebyscore",
+]);
+
+/** Commands that take one or more ?f= keys. */
+const MULTIKEY_COMMANDS = new Set(["hdel", "del", "hmget", "strdel"]);
+
+/** The mutating commands; POST-only. Mirrors Go's writeCommands. */
+const WRITE_COMMANDS = new Set([
+  "hset", "hsetnx", "hdel", "del", "hmset", "hincrby", "hincrbyfloat",
+  "strset", "strsetall", "strdel",
+  "sadd", "srem",
+  "lpush", "rpush", "lpop", "rpop", "lset", "lrem", "ltrim", "linsertbefore", "linsertafter",
+  "zadd", "zrem", "zincrby", "zpopmin", "zpopmax", "zremrangebyrank", "zremrangebyscore",
+]);
 
 /** A datasource: either an already-open backend, or the connection details to
  * open one. `namespace` is the KVRocks stand-in for a Mongo database name — it
@@ -904,7 +1015,7 @@ function readBody(req: IncomingMessage): Promise<string> {
     req.on("data", (c) => {
       size += (c as Buffer).length;
       if (size > MAX_BODY) {
-        reject(new DopdbError("request body too large", 413, "too_large"));
+        reject(new PayloadTooLargeError());
         req.destroy();
         return;
       }
@@ -1074,10 +1185,29 @@ async function buildRuntime(cfg: ServeConfig): Promise<Runtime> {
     }
 
     if (!ROUTED_COMMANDS.has(r.cmd)) return { kind: "json", status: 400, body: { error: `unknown command: ${r.cmd}`, code: "validation" } };
+
+    // Method enforcement. The protocol has always said reads are GET and writes
+    // are POST; nothing enforced it, so `GET /api/del/notes?f=n1` deleted data.
+    // That matters beyond tidiness: a write reachable by GET is reachable by a
+    // link — mail scanners, browser prefetch, CDN prefetch and shared proxies all
+    // follow those, carrying whatever Authorization header the client attached,
+    // and the URL lands in caches and access logs.
+    if (WRITE_COMMANDS.has(r.cmd) && method !== "POST") {
+      return { kind: "json", status: 405, body: { error: `${r.cmd.toUpperCase()} is a write; use POST`, code: "method_not_allowed" } };
+    }
+    if (method !== "GET" && method !== "POST") {
+      return { kind: "json", status: 405, body: { error: `unsupported method ${method}`, code: "method_not_allowed" } };
+    }
+    // The permission gate runs BEFORE the registration lookup, as it does in Go.
+    // Answering "no such collection" to a caller who was never granted anything
+    // on it turns the endpoint into a collection-name oracle; "not permitted" is
+    // both the safer answer and the one the other engine gives.
+    if (!httpAllows(r.cmd, r.coll) && !gate(r.cmd, r.coll, claims)) {
+      throw new ForbiddenError(`not permitted: ${r.cmd}::${r.coll}`);
+    }
     const entry = byName.get(r.coll);
     if (!entry) return { kind: "json", status: 404, body: { error: `collection not registered: ${r.coll}`, code: "not_found" } };
     const coll = entry.coll;
-    if (!httpAllows(r.cmd, r.coll) && !gate(r.cmd, r.coll, claims)) throw new ForbiddenError(`not permitted: ${r.cmd}::${r.coll}`);
 
     const scope = ownerScope(coll, claims);
     const ds = input.url.searchParams.get("ds") || "default";
@@ -1110,6 +1240,16 @@ async function buildRuntime(cfg: ServeConfig): Promise<Runtime> {
     const rawKey = input.url.searchParams.get("f");
     const key = rawKey != null ? resolveKey(rawKey) : undefined;
     const keys = input.url.searchParams.getAll("f").map(resolveKey);
+
+    // A missing ?f= used to leave key === undefined, which ioredis serialises to
+    // the empty string — so the write landed under field "" and was invisible to
+    // every later read by key, while Go answered 400 for the same request.
+    if (KEYED_COMMANDS.has(r.cmd) && (key === undefined || key === "")) {
+      return { kind: "json", status: 400, body: { error: `${r.cmd} requires ?f=`, code: "validation" } };
+    }
+    if (MULTIKEY_COMMANDS.has(r.cmd) && keys.length === 0) {
+      return { kind: "json", status: 400, body: { error: `${r.cmd} requires at least one ?f=`, code: "validation" } };
+    }
     if (key !== undefined) ctx.field = key; // @field default → the record key
 
     const stripForged = (o: Record<string, unknown>): Record<string, unknown> => {
@@ -1436,13 +1576,36 @@ async function webHandle(
 
   const url = new URL(req.url);
   const method = req.method.toUpperCase();
-  if (Number(req.headers.get("content-length") ?? "0") > MAX_BODY) {
-    return new Response(JSON.stringify({ error: "request body too large", code: "too_large" }), {
+  const tooLarge = () =>
+    new Response(JSON.stringify({ error: "request body too large", code: "payload_too_large" }), {
       status: 413,
       headers: { "Content-Type": "application/json", ...cors },
     });
+
+  // Content-Length is a hint, not a limit. A chunked request (or HTTP/2, or a
+  // proxy that re-frames the body) carries no Content-Length at all, so the
+  // header check alone read `0`, waved the request through, and then buffered
+  // the whole body — an unbounded allocation from an unauthenticated request.
+  // The bytes are counted as they arrive, which is what the Node adapter has
+  // always done.
+  if (Number(req.headers.get("content-length") ?? "0") > MAX_BODY) return tooLarge();
+  let bodyText = "";
+  if (method !== "GET" && method !== "HEAD" && req.body) {
+    const reader = req.body.getReader();
+    const chunks: Buffer[] = [];
+    let seen = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      seen += value.byteLength;
+      if (seen > MAX_BODY) {
+        await reader.cancel().catch(() => {});
+        return tooLarge();
+      }
+      chunks.push(Buffer.from(value));
+    }
+    bodyText = Buffer.concat(chunks).toString("utf8");
   }
-  const bodyText = method === "GET" || method === "HEAD" ? "" : await req.text();
   const input: ReqInput = {
     method,
     url,

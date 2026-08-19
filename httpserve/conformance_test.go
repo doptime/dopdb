@@ -2,6 +2,7 @@ package httpserve
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -75,7 +76,9 @@ func setupConformance(t *testing.T) *tsConformance {
 	dopdb.SetOwnerScope("notes", "owner", "uid")
 	perms := NewPermissions()
 	for _, c := range []string{
-		"HGET", "HSET", "HSETNX", "HDEL", "HEXISTS", "FIND", "HKEYS", "HLEN",
+		"HGET", "HSET", "HSETNX", "HDEL", "DEL", "HEXISTS", "FIND", "HKEYS", "HLEN",
+		"HGETALL", "HVALS", "HMGET", "HMSET", "COUNT", "FINDONE", "WATCH",
+		"HINCRBY", "HINCRBYFLOAT",
 		"HSCAN", "HSCANNOVALUES", "HRANDFIELD", "SQL",
 	} {
 		perms.Grant(c, "notes")
@@ -406,7 +409,7 @@ func TestConformanceHDelThen404(t *testing.T) {
 		if st, _ := httpCall(t, base, "POST", "/api/hset/notes?f=del1", tok, `{"text":"temp"}`); st != 200 {
 			t.Fatalf("seed %s: status=%d", base, st)
 		}
-		if st, _ := httpCall(t, base, "GET", "/api/hdel/notes?f=del1", tok, ""); st != 200 {
+		if st, _ := httpCall(t, base, "POST", "/api/hdel/notes?f=del1", tok, ""); st != 200 {
 			t.Fatalf("hdel %s: status=%d", base, st)
 		}
 		st, _ := httpCall(t, base, "GET", "/api/hget/notes?f=del1", tok, "")
@@ -624,7 +627,7 @@ func TestConformanceString(t *testing.T) {
 		if st, _ := httpCall(t, base, "POST", "/api/strsetall/strvals", tok, `{"m1":"x","m2":"y"}`); st != 200 {
 			t.Errorf("strsetall %s: status=%d", base, st)
 		}
-		if st, _ := httpCall(t, base, "GET", "/api/strdel/strvals?f=m1", tok, ""); st != 200 {
+		if st, _ := httpCall(t, base, "POST", "/api/strdel/strvals?f=m1", tok, ""); st != 200 {
 			t.Errorf("strdel %s: status=%d", base, st)
 		}
 		// after del, m1 is gone (STRGETALL no longer has it).
@@ -783,13 +786,13 @@ func TestConformanceList(t *testing.T) {
 	}
 
 	// LPOP -> a, RPOP -> c (atomic; both engines return the popped head/tail).
-	_, gb = httpCall(t, c.goBase, "GET", "/api/lpop/listvals?f=l1", tok, "")
-	_, tb = httpCall(t, c.tsBase, "GET", "/api/lpop/listvals?f=l1", tok, "")
+	_, gb = httpCall(t, c.goBase, "POST", "/api/lpop/listvals?f=l1", tok, "")
+	_, tb = httpCall(t, c.tsBase, "POST", "/api/lpop/listvals?f=l1", tok, "")
 	if gb != "a" || gb != tb {
 		t.Errorf("lpop: Go=%v TS=%v", gb, tb)
 	}
-	_, gb = httpCall(t, c.goBase, "GET", "/api/rpop/listvals?f=l1", tok, "")
-	_, tb = httpCall(t, c.tsBase, "GET", "/api/rpop/listvals?f=l1", tok, "")
+	_, gb = httpCall(t, c.goBase, "POST", "/api/rpop/listvals?f=l1", tok, "")
+	_, tb = httpCall(t, c.tsBase, "POST", "/api/rpop/listvals?f=l1", tok, "")
 	if gb != "c" || gb != tb {
 		t.Errorf("rpop: Go=%v TS=%v", gb, tb)
 	}
@@ -932,8 +935,8 @@ func TestConformanceZSet(t *testing.T) {
 	}
 
 	// ZPOPMIN 1 -> [{b 2}] (lowest score).
-	_, gb = httpCall(t, c.goBase, "GET", "/api/zpopmin/zsetvals?f=z1&count=1", tok, "")
-	_, tb = httpCall(t, c.tsBase, "GET", "/api/zpopmin/zsetvals?f=z1&count=1", tok, "")
+	_, gb = httpCall(t, c.goBase, "POST", "/api/zpopmin/zsetvals?f=z1&count=1", tok, "")
+	_, tb = httpCall(t, c.tsBase, "POST", "/api/zpopmin/zsetvals?f=z1&count=1", tok, "")
 	if gm, ok := gb.([]any); ok && len(gm) == 1 {
 		pair := gm[0].(map[string]any)
 		if pair["m"] != "b" || pair["score"] != 2.0 {
@@ -1031,8 +1034,8 @@ func TestConformanceZSet(t *testing.T) {
 	}
 
 	// ZPOPMAX 1 -> [{c,3}] (highest); empties the key.
-	_, gb = httpCall(t, c.goBase, "GET", "/api/zpopmax/zsetvals?f=z2&count=1", tok, "")
-	_, tb = httpCall(t, c.tsBase, "GET", "/api/zpopmax/zsetvals?f=z2&count=1", tok, "")
+	_, gb = httpCall(t, c.goBase, "POST", "/api/zpopmax/zsetvals?f=z2&count=1", tok, "")
+	_, tb = httpCall(t, c.tsBase, "POST", "/api/zpopmax/zsetvals?f=z2&count=1", tok, "")
 	if gm, ok := gb.([]any); ok && len(gm) == 1 {
 		pair := gm[0].(map[string]any)
 		if pair["m"] != "c" || pair["score"] != 3.0 {
@@ -1136,4 +1139,230 @@ func labelsOf(body any) []string {
 		}
 	}
 	return out
+}
+
+// ---- coverage the two engines were missing -----------------------------------
+//
+// The commands below had NO cross-engine case, and that is exactly where the
+// engines had drifted: hgetall returned an array on Go and a Record on TS, and a
+// hash command against a non-hash collection panicked on Go while answering 200
+// on TS. Neither could have survived a diff test. These are those diff tests.
+
+func TestConformanceHashReadShapes(t *testing.T) {
+	c := setupConformance(t)
+	defer c.close()
+	tok := tokenFor(t, "alice")
+
+	for i, label := range []string{"alpha", "beta"} {
+		body := fmt.Sprintf(`{"label":%q}`, label)
+		for _, base := range []string{c.goBase, c.tsBase} {
+			if st, _ := httpCall(t, base, "POST", fmt.Sprintf("/api/hset/items?f=s%d", i), tok, body); st != 200 {
+				t.Fatalf("seed: %d", st)
+			}
+		}
+	}
+
+	same := func(label, method, path, body string) {
+		t.Helper()
+		gs, gb := httpCall(t, c.goBase, method, path, tok, body)
+		ts, tb := httpCall(t, c.tsBase, method, path, tok, body)
+		assertSame(t, label, gs, gb, ts, tb)
+	}
+
+	// hgetall is {id: doc} on both engines — the client types it as
+	// Record<id, T> and the docs show all[id]
+	for _, base := range []string{c.goBase, c.tsBase} {
+		_, body := httpCall(t, base, "GET", "/api/hgetall/items", tok, "")
+		m, ok := body.(map[string]any)
+		if !ok {
+			t.Fatalf("hgetall on %s returned %T, want an object keyed by id", base, body)
+		}
+		if _, ok := m["s0"]; !ok {
+			t.Errorf("hgetall on %s: missing key s0 in %v", base, m)
+		}
+	}
+
+	// hvals is an array on both
+	for _, base := range []string{c.goBase, c.tsBase} {
+		_, body := httpCall(t, base, "GET", "/api/hvals/items", tok, "")
+		if _, ok := body.([]any); !ok {
+			t.Errorf("hvals on %s returned %T, want an array", base, body)
+		}
+	}
+
+	same("hkeys", "GET", "/api/hkeys/items", "")
+	same("hlen", "GET", "/api/hlen/items", "")
+	same("hmget", "GET", "/api/hmget/items?f=s0&f=missing&f=s1", "")
+	same("count all", "POST", "/api/count/items", `{}`)
+	same("count filtered", "POST", "/api/count/items", `{"label":"alpha"}`)
+	same("findone hit", "POST", "/api/findone/items", `{"label":"alpha"}`)
+	same("findone miss", "POST", "/api/findone/items", `{"label":"nobody"}`)
+}
+
+// A hash command against a String/List/Set/ZSet collection.
+//
+// This is a STRUCTURAL difference between the engines, not drift, and it is
+// pinned here rather than papered over. In Go a collection has a type —
+// NewList/NewSet/... produce different Go types — so the dispatcher knows the
+// command does not apply and refuses it. In TypeScript every collection is
+// `collection()`; the key layout is chosen by the command, so there is nothing
+// to check against, and a hash command simply reads the (empty) hash key beside
+// the list's own keys.
+//
+// What was fixed is the Go side, which dereferenced a nil accessor and panicked
+// once per request — reachable by anyone, because the default HttpOn() bitmask
+// grants every command including the ones a collection cannot serve. Aligning
+// the two would mean giving TypeScript collections a declared kind, which is an
+// API change rather than a bug fix; it is written up in docs/04-typescript.md.
+func TestConformanceHashCommandOnNonHashCollection(t *testing.T) {
+	c := setupConformance(t)
+	defer c.close()
+	tok := tokenFor(t, "alice")
+
+	for _, cmd := range []string{"hgetall", "hkeys", "hlen"} {
+		// Go: refused, and above all NOT a panic
+		gs, _ := httpCall(t, c.goBase, "GET", "/api/"+cmd+"/listvals", tok, "")
+		if gs != 404 {
+			t.Errorf("Go %s on a list collection = %d, want 404", cmd, gs)
+		}
+		// TS: answers from the empty hash key; the point is that it is empty and
+		// does not touch the list's data
+		ts, tb := httpCall(t, c.tsBase, "GET", "/api/"+cmd+"/listvals", tok, "")
+		if ts != 200 {
+			t.Errorf("TS %s on a list collection = %d, want 200 (see the comment above)", cmd, ts)
+		}
+		switch v := tb.(type) {
+		case map[string]any:
+			if cmd == "hlen" {
+				if n, _ := v["len"].(float64); n != 0 {
+					t.Errorf("TS hlen on a list collection = %v, want 0", v["len"])
+				}
+			} else if len(v) != 0 {
+				t.Errorf("TS %s on a list collection returned data: %v", cmd, v)
+			}
+		case []any:
+			if len(v) != 0 {
+				t.Errorf("TS %s on a list collection returned data: %v", cmd, v)
+			}
+		}
+	}
+}
+
+// Writes must be POST-only on both engines: a write reachable by GET is reachable
+// by a link, and links get prefetched, logged and cached along with the token.
+func TestConformanceMethodEnforcement(t *testing.T) {
+	c := setupConformance(t)
+	defer c.close()
+	tok := tokenFor(t, "alice")
+
+	writes := []string{
+		"/api/hset/items?f=m1",
+		"/api/hdel/items?f=m1",
+		"/api/del/items?f=m1",
+		"/api/strset/strvals?f=m1",
+		"/api/lpush/listvals?f=m1",
+		"/api/zadd/zsetvals?f=m1",
+		"/api/sadd/setvals?f=m1",
+	}
+	for _, path := range writes {
+		gs, gb := httpCall(t, c.goBase, "GET", path, tok, "")
+		ts, tb := httpCall(t, c.tsBase, "GET", path, tok, "")
+		assertSame(t, "GET "+path, gs, gb, ts, tb)
+		if gs != 405 {
+			t.Errorf("GET %s = %d, want 405", path, gs)
+		}
+	}
+	// and the POST form still works
+	if st, _ := httpCall(t, c.goBase, "POST", "/api/hset/items?f=m1", tok, `{"label":"ok"}`); st != 200 {
+		t.Errorf("POST hset = %d", st)
+	}
+}
+
+// Error-status parity across the classes the two engines resolve independently.
+func TestConformanceErrorStatusParity(t *testing.T) {
+	c := setupConformance(t)
+	defer c.close()
+	tok := tokenFor(t, "alice")
+
+	same := func(label, method, path, body, token string) {
+		t.Helper()
+		gs, gb := httpCall(t, c.goBase, method, path, token, body)
+		ts, tb := httpCall(t, c.tsBase, method, path, token, body)
+		assertSame(t, label, gs, gb, ts, tb)
+	}
+
+	same("missing ?f=", "POST", "/api/hset/items", `{"label":"x"}`, tok)
+	same("missing ?f= on read", "GET", "/api/hget/items", "", tok)
+	same("unknown collection", "GET", "/api/hget/nope?f=k", "", tok)
+	same("unknown command", "GET", "/api/nosuchcmd/items?f=k", "", tok)
+	same("reserved key name", "POST", "/api/strset/strvals?f=__owner", `{"v":"x"}`, tok)
+	same("bad token", "GET", "/api/hget/items?f=s0", "", "not.a.token")
+	same("no token on a scoped collection", "GET", "/api/hgetall/notes", "", "")
+	same("bad json filter", "POST", "/api/find/items", `{`, tok)
+}
+
+// watch had NO cross-engine coverage at all, which is how the two engines ended
+// up disagreeing on the event's key field: Go emitted only `id` while the
+// TypeScript client type declares `key`, so a typed client pointed at a Go
+// server read `ev.key` as undefined.
+func TestConformanceWatchEventShape(t *testing.T) {
+	c := setupConformance(t)
+	defer c.close()
+	tok := tokenFor(t, "alice")
+
+	for _, base := range []string{c.goBase, c.tsBase} {
+		events := make(chan map[string]any, 8)
+		ctx, stop := context.WithCancel(context.Background())
+		defer stop()
+		go func(base string) {
+			// the context is what actually tears the stream down; a plain flag
+			// would leave the scanner blocked on a connection that never closes
+			req, _ := http.NewRequestWithContext(ctx, "GET", base+"/api/watch/items", nil)
+			req.Header.Set("Authorization", "Bearer "+tok)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				close(events)
+				return
+			}
+			defer resp.Body.Close()
+			sc := bufio.NewScanner(resp.Body)
+			for sc.Scan() {
+				line := sc.Text()
+				if !strings.HasPrefix(line, "data: ") {
+					continue
+				}
+				var ev map[string]any
+				if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &ev); err == nil {
+					select {
+					case events <- ev:
+					default:
+					}
+				}
+			}
+		}(base)
+
+		time.Sleep(400 * time.Millisecond)
+		if st, _ := httpCall(t, base, "POST", "/api/hset/items?f=w1", tok, `{"label":"watched"}`); st != 200 {
+			t.Fatalf("%s: seed hset = %d", base, st)
+		}
+
+		select {
+		case ev := <-events:
+			if ev == nil {
+				t.Fatalf("%s: watch stream closed without an event", base)
+			}
+			if ev["key"] != "w1" {
+				t.Errorf("%s: event key = %v, want w1 (event=%v)", base, ev["key"], ev)
+			}
+			if ev["type"] != "insert" && ev["type"] != "replace" {
+				t.Errorf("%s: event type = %v", base, ev["type"])
+			}
+			if _, ok := ev["doc"]; !ok {
+				t.Errorf("%s: event has no doc field: %v", base, ev)
+			}
+		case <-time.After(3 * time.Second):
+			t.Errorf("%s: no watch event within 3s", base)
+		}
+		stop()
+	}
 }

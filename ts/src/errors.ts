@@ -68,6 +68,13 @@ export class ConflictError extends DopdbError {
   }
 }
 
+/** 405 — a write command was sent with a method other than POST. */
+export class MethodNotAllowedError extends DopdbError {
+  constructor(message = "method not allowed") {
+    super(message, 405, "method_not_allowed");
+  }
+}
+
 /** 413 — request body exceeded the size limit (transport guard). */
 export class PayloadTooLargeError extends DopdbError {
   constructor(message = "request body too large") {
@@ -81,6 +88,8 @@ const byCode: Record<string, (msg: string) => DopdbError> = {
   forbidden: (m) => new ForbiddenError(m),
   not_found: (m) => new NotFoundError(m),
   conflict: (m) => new ConflictError(m),
+  payload_too_large: (m) => new PayloadTooLargeError(m),
+  method_not_allowed: (m) => new MethodNotAllowedError(m),
 };
 
 const byStatus: Record<number, (msg: string) => DopdbError> = {
@@ -89,6 +98,8 @@ const byStatus: Record<number, (msg: string) => DopdbError> = {
   403: (m) => new ForbiddenError(m),
   404: (m) => new NotFoundError(m),
   409: (m) => new ConflictError(m),
+  405: (m) => new MethodNotAllowedError(m),
+  413: (m) => new PayloadTooLargeError(m),
 };
 
 /** Reconstruct a typed error from an HTTP response (client side). */

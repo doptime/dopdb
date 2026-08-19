@@ -20,7 +20,7 @@ import type { Redis as RedisClient } from "ioredis";
 
 import { decodeDoc, encodeValue, uniqueSlot } from "./codec.js";
 import { ConflictError, ForbiddenError, ValidationError } from "./errors.js";
-import { matchFilter, type Doc } from "./query.js";
+import { matchFilter, rowLess, TopN, type Doc, type SortKey } from "./query.js";
 import type { Filter } from "./sanitize.js";
 
 /** How many hash fields one HSCAN round trip asks for while walking a whole
@@ -38,6 +38,26 @@ export interface KvConn {
   /** Optional auth token. On KVRocks the password also selects the server-side
    * namespace when namespace tokens are configured. */
   password?: string;
+}
+
+/** One unique-value slot a write took, so a write that never lands can give it
+ * back. */
+interface TakenSlot {
+  field: string;
+  slot: string;
+  /** true when this call created the claim (nobody held it before) */
+  fresh: boolean;
+}
+
+/** How a unique-constrained write can end. Exactly one of these must run:
+ * commit() when the document was written (releases the values it no longer
+ * holds), rollback() when it was not (gives back the values this call claimed).
+ * Without rollback, a write that fails after claiming leaves the value reserved
+ * for a document that does not have it, and the next writer of that value gets a
+ * spurious 409 until the process restarts. */
+interface UniqueOutcome {
+  commit: () => Promise<void>;
+  rollback: () => Promise<void>;
 }
 
 export interface ChangeEvent {
@@ -150,27 +170,62 @@ export class KvBackend {
    * write are separate commands, so a crash between them can leave a stale claim
    * (self-healing on the next write of the same id); and an absent value is not
    * claimed, so several documents may omit a unique field. */
-  async enforceUnique(coll: string, id: string, newDoc: Doc): Promise<() => Promise<void>> {
+  async enforceUnique(coll: string, id: string, newDoc: Doc): Promise<UniqueOutcome> {
+    const noop = async () => {};
     const fields = this.uniqueOf(coll);
-    if (fields.length === 0) return async () => {};
+    if (fields.length === 0) return { commit: noop, rollback: noop };
 
     const prev = await this.redis.hgetBuffer(this.hashKey(coll), id);
     const oldDoc = prev ? decodeDoc(prev) : null;
+    const taken: TakenSlot[] = [];
 
     for (const f of fields) {
       const slot = uniqueSlot(newDoc[f]);
       if (slot === null) continue;
-      const holder = await this.redis.hget(this.uniqKey(coll, f), slot);
-      if (holder !== null && holder !== id) {
-        // A ConflictError, not a bare Error: it must surface as 409/"conflict",
-        // which is what Go's ErrDuplicate maps to. A plain Error would fall
-        // through the HTTP error mapper as a 500.
-        throw new ConflictError(`dopdb: duplicate key: ${coll}.${f}`);
+      try {
+      // HSETNX, not HGET-then-HSET. A read followed by a write is a
+      // check-then-act: two writers inserting the SAME unique value both see the
+      // slot empty, both take it, and both commit — the constraint holds for
+      // neither. HSETNX makes taking the slot the same operation as finding it
+      // free.
+      let fresh = (await this.redis.hsetnx(this.uniqKey(coll, f), slot, id)) === 1;
+      if (!fresh) {
+        const holder = await this.redis.hget(this.uniqKey(coll, f), slot);
+        if (holder !== null && holder !== id) {
+          // A ConflictError, not a bare Error: it must surface as 409/"conflict",
+          // which is what Go's ErrDuplicate maps to. A plain Error would fall
+          // through the HTTP error mapper as a 500.
+          throw new ConflictError(`dopdb: duplicate key: ${coll}.${f}`);
+        }
+        if (holder === null) {
+          await this.redis.hset(this.uniqKey(coll, f), slot, id);
+          fresh = true;
+        }
       }
-      await this.redis.hset(this.uniqKey(coll, f), slot, id);
+      taken.push({ field: f, slot, fresh });
+      } catch (e) {
+        // a rejected claim must not leave the earlier fields of the same
+        // document claimed either
+        await this.unclaim(coll, id, taken);
+        throw e;
+      }
     }
 
-    return async () => { await this.releaseUnique(coll, id, oldDoc, newDoc, fields); };
+    return {
+      commit: async () => { await this.releaseUnique(coll, id, oldDoc, newDoc, fields); },
+      rollback: async () => { await this.unclaim(coll, id, taken); },
+    };
+  }
+
+  /** Give back the slots a call took when its write did not land. Only the slots
+   * this call CREATED are dropped: one found already pointing at the same id
+   * belongs to the stored document and must survive. */
+  private async unclaim(coll: string, id: string, taken: TakenSlot[]): Promise<void> {
+    for (const t of taken) {
+      if (!t.fresh) continue;
+      const holder = await this.redis.hget(this.uniqKey(coll, t.field), t.slot);
+      if (holder === id) await this.redis.hdel(this.uniqKey(coll, t.field), t.slot);
+    }
   }
 
   private async releaseUnique(coll: string, id: string, oldDoc: Doc | null, newDoc: Doc | null, fields: string[]): Promise<void> {
@@ -217,10 +272,16 @@ export class KvBackend {
   }
 
   async put(coll: string, id: string, doc: Doc): Promise<void> {
-    const release = await this.enforceUnique(coll, id, doc);
-    const existed = (await this.redis.hexists(this.hashKey(coll), id)) === 1;
-    await this.redis.hset(this.hashKey(coll), id, encodeValue(doc));
-    await release();
+    const u = await this.enforceUnique(coll, id, doc);
+    let existed: boolean;
+    try {
+      existed = (await this.redis.hexists(this.hashKey(coll), id)) === 1;
+      await this.redis.hset(this.hashKey(coll), id, encodeValue(doc));
+    } catch (e) {
+      await u.rollback();
+      throw e;
+    }
+    await u.commit();
     await this.publish(coll, existed ? "replace" : "insert", id, doc);
   }
 
@@ -230,39 +291,64 @@ export class KvBackend {
    * upsert). Returns false when the row belongs to someone else. */
   async putScoped(coll: string, id: string, doc: Doc, ownerField: string, ownerVal: unknown): Promise<boolean> {
     const hk = this.hashKey(coll);
-    const release = await this.enforceUnique(coll, id, doc);
-    const ok = await this.tx(hk, async (r) => {
-      for (let attempt = 0; attempt < WATCH_ATTEMPTS; attempt++) {
-        await r.watch(hk);
-        const prev = await r.hgetBuffer(hk, id);
-        if (prev) {
-          const cur = decodeDoc(prev)[ownerField];
-          if (cur !== undefined && String(cur) !== String(ownerVal)) {
-            await r.unwatch();
-            return false;
+    const u = await this.enforceUnique(coll, id, doc);
+    let existed = false;
+    let ok: boolean;
+    try {
+      ok = await this.tx(hk, async (r) => {
+        for (let attempt = 0; attempt < WATCH_ATTEMPTS; attempt++) {
+          await r.watch(hk);
+          const prev = await r.hgetBuffer(hk, id);
+          existed = prev !== null;
+          if (prev) {
+            const cur = decodeDoc(prev)[ownerField];
+            if (cur !== undefined && String(cur) !== String(ownerVal)) {
+              await r.unwatch();
+              return false;
+            }
           }
+          const res = await r.multi().hset(hk, id, encodeValue(doc)).exec();
+          if (res !== null) return true;
+          await backoff(attempt);
         }
-        const res = await r.multi().hset(hk, id, encodeValue(doc)).exec();
-        if (res !== null) return true;
-        await backoff(attempt);
-      }
-      throw new Error(`dopdb: write contention on ${coll}:${id}`);
-    });
-    if (ok) {
-      await release();
-      await this.publish(coll, "replace", id, doc);
+        await r.unwatch();
+        throw new Error(`dopdb: write contention on ${coll}:${id}`);
+      });
+    } catch (e) {
+      await u.rollback();
+      throw e;
     }
-    return ok;
+    if (!ok) {
+      // refused on ownership: nothing was written, so nothing stays claimed
+      await u.rollback();
+      return false;
+    }
+    await u.commit();
+    // Report what actually happened. Announcing "replace" for a first write means
+    // a subscriber waiting on insert never hears about a newly created document.
+    await this.publish(coll, existed ? "replace" : "insert", id, doc);
+    return true;
   }
 
   async putIfAbsent(coll: string, id: string, doc: Doc): Promise<boolean> {
-    const release = await this.enforceUnique(coll, id, doc);
-    const inserted = (await this.redis.hsetnx(this.hashKey(coll), id, encodeValue(doc))) === 1;
-    if (inserted) {
-      await release();
-      await this.publish(coll, "insert", id, doc);
+    const u = await this.enforceUnique(coll, id, doc);
+    let inserted: boolean;
+    try {
+      inserted = (await this.redis.hsetnx(this.hashKey(coll), id, encodeValue(doc))) === 1;
+    } catch (e) {
+      await u.rollback();
+      throw e;
     }
-    return inserted;
+    if (!inserted) {
+      // the id was taken, so nothing was written — releasing the values this
+      // call claimed is what keeps a no-op insert from blocking a later,
+      // legitimate writer of the same unique value
+      await u.rollback();
+      return false;
+    }
+    await u.commit();
+    await this.publish(coll, "insert", id, doc);
+    return true;
   }
 
   async putMany(coll: string, entries: Record<string, Doc>): Promise<void> {
@@ -272,18 +358,33 @@ export class KvBackend {
       for (const id of ids) await this.put(coll, id, entries[id]);
       return;
     }
+    // which ids already exist, so the events say insert vs replace truthfully
+    const existing = await this.redis.hmget(this.hashKey(coll), ...ids);
     const flat: (string | Buffer)[] = [];
     for (const id of ids) flat.push(id, encodeValue(entries[id]));
     await this.redis.hset(this.hashKey(coll), ...flat);
-    for (const id of ids) await this.publish(coll, "replace", id, entries[id]);
+    for (let i = 0; i < ids.length; i++) {
+      await this.publish(coll, existing[i] !== null ? "replace" : "insert", ids[i], entries[ids[i]]);
+    }
   }
 
   async del(coll: string, ids: string[]): Promise<number> {
     if (ids.length === 0) return 0;
     await this.dropUnique(coll, ids);
-    const n = await this.redis.hdel(this.hashKey(coll), ...ids);
-    // Only announce a deletion when something was actually removed (mirrors Go).
-    if (n > 0) for (const id of ids) await this.publish(coll, "delete", id, null);
+    // One HDEL per id, pipelined: the same single round trip as a batched HDEL,
+    // but each reply says whether THAT id existed, so the change events are exact
+    // rather than announcing a deletion for every id in a mixed batch.
+    const pipe = this.redis.pipeline();
+    for (const id of ids) pipe.hdel(this.hashKey(coll), id);
+    const res = (await pipe.exec()) ?? [];
+    let n = 0;
+    for (let i = 0; i < ids.length; i++) {
+      const removed = Number(res[i]?.[1] ?? 0);
+      if (removed > 0) {
+        n += removed;
+        await this.publish(coll, "delete", ids[i], null);
+      }
+    }
     return n;
   }
 
@@ -318,17 +419,36 @@ export class KvBackend {
   /** The find/findone/count path: scan the collection, evaluate the (already
    * sanitized) filter in-process. `_id` is injected because the id lives in the
    * hash field, not in the document. */
-  async findDocs(coll: string, filter: Filter): Promise<Doc[]> {
+  async findDocs(coll: string, filter: Filter, keys: SortKey[] = [], retain = 0): Promise<Doc[]> {
+    // With a limit, only the best `retain` rows are ever held; without one there
+    // is nothing to bound and every match is kept, as before.
+    const heap = retain > 0 ? new TopN(retain, keys) : null;
     const out: Doc[] = [];
     await this.walk(coll, (id, doc) => {
       doc._id = id;
-      if (matchFilter(doc, filter)) out.push(doc);
+      if (!matchFilter(doc, filter)) return true;
+      if (heap) heap.push(doc);
+      else out.push(doc);
       return true;
     });
-    // A stable base order keeps paging and sorting reproducible; HSCAN order is
+    if (heap) return heap.sorted();
+    // A total order with the id as the final tiebreak: HSCAN order is
     // unspecified and may differ between two servers holding the same data.
-    out.sort((a, b) => (String(a._id) < String(b._id) ? -1 : String(a._id) > String(b._id) ? 1 : 0));
+    out.sort((a, b) => (rowLess(a, b, keys) ? -1 : rowLess(b, a, keys) ? 1 : 0));
     return out;
+  }
+
+  /** Count matching documents. An empty filter is a single HLEN, not a scan:
+   * "how many documents are there" does not need every document decoded. */
+  async countDocs(coll: string, filter: Filter): Promise<number> {
+    if (Object.keys(filter).length === 0) return await this.count(coll);
+    let n = 0;
+    await this.walk(coll, (id, doc) => {
+      doc._id = id;
+      if (matchFilter(doc, filter)) n++;
+      return true;
+    });
+    return n;
   }
 
   /** Atomically add delta to a numeric field (dot path) of a document.
@@ -446,7 +566,9 @@ export class KvBackend {
     const want = this.scopeOwner(scope);
     if (want === null) return true;
     const got = await this.redis.hget(this.ownerKey(coll), key);
-    return got === null || got === want;
+    if (got === null) return true;
+    const [owner] = parseClaim(got);
+    return owner === want;
   }
 
   /** Take ownership of key for the caller, atomically. False when already held by
@@ -461,10 +583,13 @@ export class KvBackend {
   async claimOwner(coll: string, key: string, scope: Filter): Promise<boolean> {
     const want = this.scopeOwner(scope);
     if (want === null) return true;
-    const claimed = await this.redis.hsetnx(this.ownerKey(coll), key, want);
+    const claimed = await this.redis.hsetnx(this.ownerKey(coll), key, formatClaim(want));
     if (claimed === 1) return true;
     const got = await this.redis.hget(this.ownerKey(coll), key);
-    if (got === want) return true;
+    const [owner, at] = parseClaim(got ?? "");
+    if (owner === want) return true;
+    // a young claim's write may still be on the wire — it is not stale
+    if (claimIsInFlight(at)) return false;
     return await this.takeOverStaleClaim(coll, key, got, want);
   }
 
@@ -478,9 +603,13 @@ export class KvBackend {
       for (let attempt = 0; attempt < WATCH_ATTEMPTS; attempt++) {
         await r.watch(ok, mk);
         const cur = await r.hget(ok, key);
-        if (cur !== null && cur !== holder && cur !== want) { await r.unwatch(); return false; }
+        if (cur !== null) {
+          const [curOwner, curAt] = parseClaim(cur);
+          if (cur !== holder && curOwner !== want) { await r.unwatch(); return false; }
+          if (curOwner !== want && claimIsInFlight(curAt)) { await r.unwatch(); return false; }
+        }
         if ((await r.exists(mk)) > 0) { await r.unwatch(); return false; }
-        const res = await r.multi().hset(ok, key, want).exec();
+        const res = await r.multi().hset(ok, key, formatClaim(want)).exec();
         if (res !== null) return true;
         await backoff(attempt);
       }
@@ -524,7 +653,11 @@ export class KvBackend {
     const want = this.scopeOwner(scope);
     if (want === null) return out;
     const owners = await this.redis.hgetall(this.ownerKey(coll));
-    return out.filter((k) => !(k in owners) || owners[k] === want);
+    return out.filter((k) => {
+      if (!(k in owners)) return true;
+      const [owner] = parseClaim(owners[k]);
+      return owner === want;
+    });
   }
 }
 
@@ -540,6 +673,38 @@ export class KvBackend {
 // transaction never writes.
 
 const WATCH_ATTEMPTS = 64;
+
+// ---- ownership claims -------------------------------------------------------
+//
+// A claim is stored as "<owner>\x1f<unixMillis>". The timestamp exists because
+// reclaiming a claim whose data has vanished is necessary (Redis drops an emptied
+// list, a String key expires, a process crashes between claim and write) but "the
+// data is not there yet" is ALSO what a legitimate first write looks like for the
+// one round trip between claiming and writing. Taking over on absence alone lets a
+// second writer seize a claim that is merely in flight: the first writer has
+// already passed its check, so its data lands under the second writer's ownership.
+//
+// So a claim is only reclaimable once it has been unbacked for longer than any
+// in-flight write could plausibly take.
+const CLAIM_GRACE_MS = 30_000;
+const CLAIM_SEP = "\x1f";
+
+function formatClaim(owner: string): string {
+  return `${owner}${CLAIM_SEP}${Date.now()}`;
+}
+
+/** Split a stored claim. A value with no timestamp was written by an older build;
+ * it is treated as arbitrarily old, which is right — it cannot be in flight. */
+function parseClaim(v: string): [string, number] {
+  const i = v.indexOf(CLAIM_SEP);
+  if (i < 0) return [v, 0];
+  const ms = Number(v.slice(i + CLAIM_SEP.length));
+  return [v.slice(0, i), Number.isFinite(ms) ? ms : 0];
+}
+
+function claimIsInFlight(at: number): boolean {
+  return at > 0 && Date.now() - at < CLAIM_GRACE_MS;
+}
 
 /** How many dedicated transaction connections a backend keeps. Small: the point
  * is to stop unrelated collections queueing behind each other, not to make every

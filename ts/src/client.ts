@@ -47,7 +47,11 @@ export type WatchOp = "insert" | "update" | "replace" | "delete";
  * scope on) — see the README. */
 export interface WatchEvent<T> {
   type: WatchOp;
+  /** The document key. This is the canonical field on both engines. */
   key: string;
+  /** Alias of `key`. The Go engine originally emitted only this name; both are
+   * sent now so either spelling works. Prefer `key`. */
+  id?: string;
   doc: T | null;
 }
 

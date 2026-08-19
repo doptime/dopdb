@@ -26,7 +26,7 @@ export const schema = {
 
 `.named()` sets both the public and storage name; `.inDb("analytics")` binds a data source (the client then adds `?ds=analytics`); `.ownerScope("owner")` declares isolation; `.httpOn(...)` exposes + authorizes (same meaning as Go). The `Perm` constants are exported from `@kequnyang/dopdb` as **BigInt** (the bitmask exceeds 32 bits across all types); bit values match Go.
 
-> The TS **server** handles the full command vocabulary of `02-http` (Hash + String/List/Set/ZSet), conformance-verified against Go. The typed **client** today exposes the Hash family; for String/List/Set/ZSet, drive the wire commands directly (typed client wrappers are a follow-up).
+> The TS **server** handles the full command vocabulary of `02-http` (Hash + String/List/Set/ZSet), conformance-verified against Go. The typed **client** today exposes the Hash family; for String/List/Set/ZSet, drive the wire commands directly (typed client wrappers are a follow-up). See "Known differences from the Go engine" at the end of this page.
 
 ## Taking over API routing in Next.js (primary deployment, zero config)
 
@@ -50,7 +50,7 @@ Key points:
 - **Takeover is immediate**: `GET/POST/OPTIONS` handle `/api/hget/users`, `/api/find/orders`, `/api/<fn-name>`, etc.
 - **Prefix is configurable**: the handler reads Next.js's catch-all segment (the part after the mount point), so the prefix is whatever folder you place it in — rename `app/api/[...slug]` to `app/db/[...slug]` for `/db/*`, **no code change**; set the client's `apiBase: "/db"` to match.
 - **Lazy connect**: KVRocks connects on the first request and is reused; the CORS preflight (OPTIONS) does not touch the DB.
-- **watch (SSE)**: `GET /api/watch/<coll>` returns `text/event-stream`, pushed via `ReadableStream` (needs a replica set).
+- **watch (SSE)**: `GET /api/watch/<coll>` returns `text/event-stream`, pushed via `ReadableStream`. No replica set — see "watch, accurately" below.
 - Multiple sources: replace `kvrocks` with `datasources: [{ name, kvrocks }, ...]`; select per request with `?ds=`.
 - From a config file: `nextHandlerFromConfig("config.toml", { schema })`.
 
@@ -92,7 +92,7 @@ const all = await db.users.find({ age: { $gte: 18 } }, { limit: 20 });
 const unsub = await db.users.watch((ev) => console.log(ev.type, ev.key, ev.doc));
 ```
 
-The client assembles `/<apiBase>/<cmd>/<coll>`; a non-default source adds `?ds=`; keys use `?f=`. `watch` reads SSE via `fetch` streaming (it can send a Bearer token, which `EventSource` cannot) and resumes via `Last-Event-ID`.
+The client assembles `/<apiBase>/<cmd>/<coll>`; a non-default source adds `?ds=`; keys use `?f=`. `watch` reads SSE via `fetch` streaming (it can send a Bearer token, which `EventSource` cannot). It does **not** resume: the server sends no `id:` line, so no `Last-Event-ID` is ever sent — see "watch, accurately" below.
 
 ## Functional API (`/api/<name>`)
 
@@ -113,3 +113,34 @@ make ts            # cd ts && npm install && npm run build
 make ts-test       # node --import tsx --test test/*.test.ts
 make ts-typecheck  # tsc -p tsconfig.json --noEmit (strict)
 ```
+
+
+## Known differences from the Go engine
+
+Two behaviours differ structurally rather than by accident. Both are pinned by
+tests so they cannot drift further, and neither is a security difference.
+
+**A collection has no declared kind.** In Go, `NewList`/`NewSet`/`NewZSet`/
+`NewString` produce distinct types, so the dispatcher knows a hash command does
+not apply to a list collection and answers `404`. In TypeScript every collection
+is `collection()` and the key layout is chosen by the command, so there is
+nothing to check against: `hgetall` on a list collection reads the (empty) hash
+key beside the list's own keys and returns `{}`. It does not touch the list's
+data. Aligning the two means giving TypeScript collections a declared kind, which
+is an API addition rather than a fix.
+
+**The typed client covers the Hash family.** For String/List/Set/ZSet, drive the
+wire commands directly.
+
+## watch, accurately
+
+`watch` on KVRocks is dopdb's own pub/sub channel, not a change stream:
+
+- **No replica set and no server configuration** are needed.
+- **No replay.** There is no resume token, the server sends no SSE `id:` line,
+  and `Last-Event-ID` is ignored — a reconnect starts fresh and events during the
+  gap are gone. The client still parses `id:` lines, which is inert today and
+  kept only so a future replay buffer needs no client change.
+- Events carry `{type, id, doc}`. The id field is `id`, not `key`.
+- Only writes made **through dopdb** are visible; a process writing the same keys
+  with `redis-cli` is not.

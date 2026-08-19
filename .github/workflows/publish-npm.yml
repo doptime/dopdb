@@ -46,6 +46,15 @@ concurrency:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    services:
+      kvrocks:
+        image: apache/kvrocks:latest
+        ports: ["6666:6666"]
+        options: >-
+          --health-cmd "redis-cli -p 6666 ping || exit 1"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
     environment: NPM_TOKEN # the NPM_TOKEN secret lives in this environment (not at repo scope)
     defaults:
       run:
@@ -67,7 +76,9 @@ jobs:
       - name: Build
         run: npm run build
 
-      - name: Test (KVRocks-dependent tests auto-skip without DOPDB_TEST_KVROCKS_URI)
+      - name: Test (against a real server — a skipped suite must not gate a release)
+        env:
+          DOPDB_TEST_KVROCKS_URI: redis://127.0.0.1:6666
         run: npm test
 
       - name: Pack (always — artifact + dry-run visibility)
@@ -82,8 +93,22 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
-          TAG="${{ inputs.npm_tag || 'alpha' }}"
-          # Releases published from a GitHub Release default to the chosen tag.
+          # `inputs.*` is empty on a `release:` event, so `inputs.npm_tag ||
+          # 'alpha'` made EVERY GitHub Release publish under the alpha tag —
+          # `npm i @kequnyang/dopdb` kept installing whatever `latest` pointed at.
+          # A release now picks its tag from the version: prereleases get the
+          # prerelease name, everything else gets `latest`.
+          TAG="${{ inputs.npm_tag }}"
+          if [ -z "$TAG" ]; then
+            VERSION=$(node -p "require('./package.json').version")
+            case "$VERSION" in
+              *-alpha*) TAG=alpha ;;
+              *-beta*)  TAG=beta ;;
+              *-rc*)    TAG=rc ;;
+              *)        TAG=latest ;;
+            esac
+            echo "::notice::derived dist-tag '$TAG' from version '$VERSION'"
+          fi
           # Provenance needs a public repo; npm itself fails cleanly on private,
           # so we attempt it and fall back without --provenance if npm complains.
           if npm publish --access public --tag "$TAG" --provenance 2>&1 | tee /tmp/pub.log; then

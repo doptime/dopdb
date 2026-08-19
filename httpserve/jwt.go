@@ -31,13 +31,46 @@ var (
 	errBadSignature  = errors.New("dopdb/jwt: signature invalid")
 	errNoneAlg       = errors.New("dopdb/jwt: alg \"none\" is not allowed")
 	errUnsupported   = errors.New("dopdb/jwt: unsupported alg")
+	errAlgMismatch   = errors.New("dopdb/jwt: token alg does not match the configured key")
 	errExpired       = errors.New("dopdb/jwt: token expired")
 	errMissingSecret = errors.New("dopdb/jwt: no secret configured")
 )
 
+// keyKind classifies the configured secret so the verifier can PIN the algorithm
+// instead of taking it from the token.
+type keyKind struct {
+	rsa *rsa.PublicKey // non-nil => this deployment is RS256
+}
+
+var keyKindCache sync.Map // secret -> keyKind
+
+// classifySecret decides, once per distinct secret, which algorithm this
+// deployment accepts. A PEM-encoded public key means RS256; anything else is an
+// HMAC key and means HS256.
+func classifySecret(secret string) keyKind {
+	if v, ok := keyKindCache.Load(secret); ok {
+		return v.(keyKind)
+	}
+	k := keyKind{}
+	if pub, err := parseRSAPublicKey(secret); err == nil {
+		k.rsa = pub
+	}
+	keyKindCache.Store(secret, k)
+	return k
+}
+
 // VerifyJWT validates a compact JWS and returns its claims. HS256 uses secret as
 // the raw HMAC key; RS256 expects secret to be a PEM-encoded PKIX public key.
 // The "none" algorithm is rejected. exp (if present) is enforced.
+//
+// THE ALGORITHM IS PINNED BY THE CONFIGURED SECRET, not by the token header.
+// Reading `alg` from the token is the classic confusion attack: an RS256
+// deployment's key is a PUBLIC key — published in JWKS, often shipped to the
+// frontend — so an attacker who takes that PEM text and uses it as an HMAC
+// secret can mint `{"alg":"HS256"}` tokens with any claims they like, including
+// the `uid` that owner-scoping trusts. A header-driven verifier accepts them.
+// That is a complete authentication and row-isolation bypass from public
+// material, so the header only gets to AGREE with the configured key kind.
 func VerifyJWT(token, secret string) (Claims, error) {
 	if secret == "" {
 		return nil, errMissingSecret
@@ -62,26 +95,31 @@ func VerifyJWT(token, secret string) (Claims, error) {
 	}
 	signingInput := []byte(parts[0] + "." + parts[1])
 
-	switch hdr.Alg {
-	case "HS256":
+	switch strings.ToLower(hdr.Alg) {
+	case "none", "":
+		return nil, errNoneAlg
+	}
+
+	kind := classifySecret(secret)
+	if kind.rsa != nil {
+		// RS256 deployment: an HS256 token is the confusion attack, not a
+		// downgrade to support.
+		if hdr.Alg != "RS256" {
+			return nil, errAlgMismatch
+		}
+		sum := sha256.Sum256(signingInput)
+		if err := rsa.VerifyPKCS1v15(kind.rsa, crypto.SHA256, sum[:], sig); err != nil {
+			return nil, errBadSignature
+		}
+	} else {
+		if hdr.Alg != "HS256" {
+			return nil, errAlgMismatch
+		}
 		mac := hmac.New(sha256.New, []byte(secret))
 		mac.Write(signingInput)
 		if !hmac.Equal(sig, mac.Sum(nil)) {
 			return nil, errBadSignature
 		}
-	case "RS256":
-		pub, err := parseRSAPublicKey(secret)
-		if err != nil {
-			return nil, err
-		}
-		sum := sha256.Sum256(signingInput)
-		if err := rsa.VerifyPKCS1v15(pub, crypto.SHA256, sum[:], sig); err != nil {
-			return nil, errBadSignature
-		}
-	case "none", "None", "NONE":
-		return nil, errNoneAlg
-	default:
-		return nil, errUnsupported
 	}
 
 	claimBytes, err := base64.RawURLEncoding.DecodeString(parts[1])
@@ -121,16 +159,27 @@ func checkExp(claims Claims) error {
 	if !ok {
 		return nil
 	}
-	var exp int64
+	var (
+		exp int64
+		err error
+	)
 	switch n := v.(type) {
 	case json.Number:
-		exp, _ = n.Int64()
+		exp, err = n.Int64()
 	case float64:
 		exp = int64(n)
 	case string:
-		exp, _ = strconv.ParseInt(n, 10, 64)
+		exp, err = strconv.ParseInt(n, 10, 64)
+	default:
+		err = errBadToken
 	}
-	if exp > 0 && exp < time.Now().Unix() {
+	// An exp that is present but unreadable is a malformed token, not an
+	// unlimited one; and exp<=0 is in the past, not "no expiry". Both used to
+	// fail open.
+	if err != nil {
+		return errBadToken
+	}
+	if exp <= time.Now().Unix() {
 		return errExpired
 	}
 	return nil

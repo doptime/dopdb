@@ -2,6 +2,7 @@ package dopdb
 
 import (
 	"context"
+	"errors"
 	"math"
 	"strconv"
 
@@ -123,12 +124,14 @@ func (z *ZSetCollection[K]) ro(ctx context.Context, ds, key string, scope M) (*k
 }
 
 func (z *ZSetCollection[K]) HttpZAdd(ctx context.Context, ds, key string, pairs map[string]float64, scope M) (int, error) {
+	// checked BEFORE rw(): claiming ownership for a request that writes nothing
+	// leaves the key name owned with no data behind it
+	if len(pairs) == 0 {
+		return 0, nil
+	}
 	b, rk, err := z.rw(ctx, ds, key, scope)
 	if err != nil {
 		return 0, err
-	}
-	if len(pairs) == 0 {
-		return 0, nil
 	}
 	zs := make([]redis.Z, 0, len(pairs))
 	for m, s := range pairs {
@@ -139,12 +142,12 @@ func (z *ZSetCollection[K]) HttpZAdd(ctx context.Context, ds, key string, pairs 
 }
 
 func (z *ZSetCollection[K]) HttpZRem(ctx context.Context, ds, key string, members []string, scope M) (int, error) {
+	if len(members) == 0 {
+		return 0, nil
+	}
 	b, rk, err := z.rw(ctx, ds, key, scope)
 	if err != nil {
 		return 0, err
-	}
-	if len(members) == 0 {
-		return 0, nil
 	}
 	args := make([]any, len(members))
 	for i, m := range members {
@@ -161,7 +164,10 @@ func (z *ZSetCollection[K]) HttpZRem(ctx context.Context, ds, key string, member
 func (z *ZSetCollection[K]) HttpZScore(ctx context.Context, ds, key, member string, scope M) (float64, error) {
 	b, rk, err := z.ro(ctx, ds, key, scope)
 	if err != nil {
-		return 0, ErrNoDoc
+		if errors.Is(err, ErrForbidden) {
+			return 0, ErrNoDoc // someone else's key looks absent
+		}
+		return 0, err // a real failure must not read as "no data"
 	}
 	s, err := b.rdb.ZScore(ctx, rk, member).Result()
 	if isRedisNil(err) {
@@ -173,7 +179,10 @@ func (z *ZSetCollection[K]) HttpZScore(ctx context.Context, ds, key, member stri
 func (z *ZSetCollection[K]) HttpZCard(ctx context.Context, ds, key string, scope M) (int64, error) {
 	b, rk, err := z.ro(ctx, ds, key, scope)
 	if err != nil {
-		return 0, nil
+		if errors.Is(err, ErrForbidden) {
+			return 0, nil
+		}
+		return 0, err
 	}
 	return b.rdb.ZCard(ctx, rk).Result()
 }
@@ -181,7 +190,10 @@ func (z *ZSetCollection[K]) HttpZCard(ctx context.Context, ds, key string, scope
 func (z *ZSetCollection[K]) HttpZCount(ctx context.Context, ds, key string, min, max float64, scope M) (int64, error) {
 	b, rk, err := z.ro(ctx, ds, key, scope)
 	if err != nil {
-		return 0, nil
+		if errors.Is(err, ErrForbidden) {
+			return 0, nil
+		}
+		return 0, err
 	}
 	return b.rdb.ZCount(ctx, rk, scoreArg(min), scoreArg(max)).Result()
 }
@@ -197,6 +209,9 @@ func (z *ZSetCollection[K]) HttpZIncrBy(ctx context.Context, ds, key, member str
 func (z *ZSetCollection[K]) HttpZRange(ctx context.Context, ds, key string, start, stop int, rev, withScores bool, scope M) (any, error) {
 	b, rk, err := z.ro(ctx, ds, key, scope)
 	if err != nil {
+		if !errors.Is(err, ErrForbidden) {
+			return nil, err
+		}
 		return zrender(nil, withScores), nil
 	}
 	var (
@@ -217,6 +232,9 @@ func (z *ZSetCollection[K]) HttpZRange(ctx context.Context, ds, key string, star
 func (z *ZSetCollection[K]) HttpZRangeByScore(ctx context.Context, ds, key string, min, max float64, rev, withScores bool, scope M) (any, error) {
 	b, rk, err := z.ro(ctx, ds, key, scope)
 	if err != nil {
+		if !errors.Is(err, ErrForbidden) {
+			return nil, err
+		}
 		return zrender(nil, withScores), nil
 	}
 	by := &redis.ZRangeBy{Min: scoreArg(min), Max: scoreArg(max)}
@@ -240,7 +258,10 @@ func (z *ZSetCollection[K]) HttpZRangeByScore(ctx context.Context, ds, key strin
 func (z *ZSetCollection[K]) HttpZRank(ctx context.Context, ds, key, member string, rev bool, scope M) (int, error) {
 	b, rk, err := z.ro(ctx, ds, key, scope)
 	if err != nil {
-		return -1, nil
+		if errors.Is(err, ErrForbidden) {
+			return -1, nil
+		}
+		return -1, err
 	}
 	var (
 		n    int64

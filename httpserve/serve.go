@@ -89,7 +89,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 	c, status, err := h.parse(r)
 	if err != nil {
-		writeErr(w, status, "validation", err)
+		// The error class has to follow the status. A 401 carrying code
+		// "validation" tells a client that its input was malformed when what
+		// actually happened is that its credentials were rejected, and no client
+		// can branch on that. A 401 also says nothing about WHY beyond "invalid
+		// token": distinguishing "bad signature" from "no secret configured" from
+		// "expired" only helps someone probing the deployment.
+		switch status {
+		case http.StatusUnauthorized:
+			writeErr(w, status, "unauthorized", errors.New("invalid token"))
+		case http.StatusRequestEntityTooLarge:
+			writeErr(w, status, "payload_too_large", err)
+		default:
+			writeErr(w, status, "validation", err)
+		}
 		return
 	}
 
@@ -107,6 +120,25 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Method enforcement. The protocol has always said reads are GET and writes
+	// are POST; nothing enforced it, so `GET /api/del/notes?f=n1` deleted data.
+	// That matters beyond tidiness: a write reachable by GET is reachable by a
+	// link — mail scanners, browser prefetch, CDN prefetch and shared proxies all
+	// follow those, carrying whatever Authorization header the client attached,
+	// and the URL lands in caches and access logs.
+	if writeCommands[c.Cmd] && r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		writeErr(w, http.StatusMethodNotAllowed, "method_not_allowed",
+			errors.New(c.Cmd+" is a write; use POST"))
+		return
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		w.Header().Set("Allow", "GET, POST")
+		writeErr(w, http.StatusMethodNotAllowed, "method_not_allowed",
+			errors.New("unsupported method "+r.Method))
+		return
+	}
+
 	// Permission gate: command :: collection. A collection's HttpOn(...) bitmask
 	// is the primary source of truth (debug default = all on); the legacy
 	// Perms grant/deny map still works for back-compat and runtime overrides.
@@ -118,6 +150,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	acc, ok := dopdb.LookupHttp(c.Coll)
 	if !ok {
 		writeErr(w, http.StatusNotFound, "not_found", errors.New("collection not registered: "+c.Coll))
+		return
+	}
+
+	// An unknown ?ds= used to fall back to "default" silently, so a typo or a
+	// datasource nobody remembered to configure sent every read and write into
+	// the wrong namespace with no error anywhere.
+	if c.DB != "" && !dopdb.HasDatasource(c.DB) {
+		writeErr(w, http.StatusBadRequest, "validation", errors.New("unknown datasource: "+c.DB))
 		return
 	}
 
@@ -133,8 +173,19 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx, acc dopdb.HttpKey, scope dopdb.M, scoped bool) {
-	ha, _ := acc.(dopdb.HttpAccessor) // nil for non-Hash collections; Hash cases use ha
+	ha, _ := acc.(dopdb.HttpAccessor) // nil for non-Hash collections
 	key := c.Field()                  // ?f= is the document key for per-key commands
+
+	// Every Hash-family command dereferences ha. A List/Set/ZSet/String
+	// collection does not implement HttpAccessor, so without this guard
+	// `GET /api/hgetall/<listColl>` was a nil dereference — a panic per request,
+	// reachable by anyone with the default `HttpOn()` bitmask (which grants
+	// every command, including ones the collection cannot serve).
+	if hashCommands[c.Cmd] && ha == nil {
+		writeErr(w, http.StatusNotFound, "not_found",
+			errors.New(c.Cmd+" is only available on hash collections: "+c.Coll))
+		return
+	}
 
 	switch c.Cmd {
 	case "HGET":
@@ -217,8 +268,13 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 		}
 		writeResult(w, map[string]any{"exists": ex}, err)
 
-	case "HGETALL", "HVALS":
+	case "HGETALL":
+		// {id: document} — the shape the client types and the docs promise
 		v, err := ha.HttpGetAll(ctx, c.DB, scope) // scope nil for unscoped collections
+		writeResult(w, v, err)
+
+	case "HVALS":
+		v, err := ha.HttpVals(ctx, c.DB, scope)
 		writeResult(w, v, err)
 
 	case "HKEYS":
@@ -241,7 +297,12 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 
 	case "HRANDFIELD":
 		count := 1
+		// clamped like FIND's ?limit=: an unbounded ?count= is a single-request
+		// full scan with an unbounded response
 		if n, e := strconv.Atoi(c.Queries.Get("count")); e == nil {
+			if n > int(maxLimit) {
+				n = int(maxLimit)
+			}
 			count = n
 		}
 		v, err := ha.HttpRandField(ctx, c.DB, count, scope)
@@ -342,12 +403,8 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 		writeResult(w, v, err)
 
 	case "SQL":
-		// SQL is a Hash-only surface: a Hash collection is a table, the other
-		// four key types are not (see dopdb/sql.go for the reasoning).
-		if ha == nil {
-			writeErr(w, http.StatusNotFound, "not_found", errors.New("SQL is only available on hash collections: "+c.Coll))
-			return
-		}
+		// SQL is a Hash-only surface (see dopdb/sql.go); the nil-accessor guard
+		// above already refused non-Hash collections.
 		stmt := c.Queries.Get("q")
 		if stmt == "" {
 			stmt = sqlFromBody(c.Body)
@@ -526,7 +583,11 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 			writeErr(w, http.StatusNotFound, "not_found", errors.New("not a list collection: "+c.Coll))
 			return
 		}
-		idx, _ := strconv.Atoi(c.Queries.Get("index"))
+		idx, iok := intParam(c, "index", 0)
+		if !iok {
+			writeErr(w, http.StatusBadRequest, "validation", errors.New("invalid ?index="))
+			return
+		}
 		v, err := la.HttpLIndex(ctx, c.DB, key, idx, scope)
 		writeResult(w, v, err)
 
@@ -536,7 +597,11 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 			writeErr(w, http.StatusNotFound, "not_found", errors.New("not a list collection: "+c.Coll))
 			return
 		}
-		idx, _ := strconv.Atoi(c.Queries.Get("index"))
+		idx, iok := intParam(c, "index", 0)
+		if !iok {
+			writeErr(w, http.StatusBadRequest, "validation", errors.New("invalid ?index="))
+			return
+		}
 		var body map[string]any
 		if err := json.Unmarshal(c.Body, &body); err != nil || body["item"] == nil {
 			writeErr(w, http.StatusBadRequest, "validation", errors.New(`LSET body needs {"item":<value>}`))
@@ -550,7 +615,11 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 			writeErr(w, http.StatusNotFound, "not_found", errors.New("not a list collection: "+c.Coll))
 			return
 		}
-		count, _ := strconv.Atoi(c.Queries.Get("count"))
+		count, cok := intParam(c, "count", 0)
+		if !cok {
+			writeErr(w, http.StatusBadRequest, "validation", errors.New("invalid ?count="))
+			return
+		}
 		var body map[string]any
 		if err := json.Unmarshal(c.Body, &body); err != nil || body["item"] == nil {
 			writeErr(w, http.StatusBadRequest, "validation", errors.New(`LREM body needs {"item":<value>}`))
@@ -811,7 +880,11 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 			writeErr(w, http.StatusBadRequest, "validation", errors.New(c.Cmd+" requires ?f="))
 			return
 		}
-		count, _ := strconv.Atoi(c.Queries.Get("count"))
+		count, cok := intParam(c, "count", 0)
+		if !cok {
+			writeErr(w, http.StatusBadRequest, "validation", errors.New("invalid ?count="))
+			return
+		}
 		v, err := za.HttpZPop(ctx, c.DB, key, count, c.Cmd == "ZPOPMAX", scope)
 		writeResult(w, v, err)
 
@@ -860,9 +933,14 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 		// Go one did not, so a quiet collection lost its watchers to timeouts.
 		// The ticker writes from another goroutine, hence the mutex.
 		var mu sync.Mutex
+		var pingDone sync.WaitGroup
 		pingCtx, stopPing := context.WithCancel(ctx)
 		defer stopPing()
+		pingDone.Add(1)
 		go func() {
+			// joined before the handler returns: a ping racing a recycled
+			// keep-alive connection would write bytes into someone else's response
+			defer pingDone.Done()
 			t := time.NewTicker(25 * time.Second)
 			defer t.Stop()
 			for {
@@ -880,7 +958,12 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 		}()
 
 		emit := func(op, id string, doc any) error {
-			payload, _ := json.Marshal(map[string]any{"type": op, "id": id, "doc": doc})
+			// `key` is the canonical field — it is what the TypeScript client
+			// type declares and what the docs show. Go emitted only `id`, so a
+			// typed client pointed at a Go server read `ev.key` as undefined.
+			// Both are sent: `key` to be correct, `id` so anything already
+			// reading it keeps working.
+			payload, _ := json.Marshal(map[string]any{"type": op, "key": id, "id": id, "doc": doc})
 			mu.Lock()
 			defer mu.Unlock()
 			if _, err := w.Write([]byte("data: " + string(payload) + "\n\n")); err != nil {
@@ -889,7 +972,17 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 			flusher.Flush()
 			return nil
 		}
-		_ = ha.HttpWatch(ctx, c.DB, scope, emit)
+		// A dropped error here is worse than a 500: the SSE headers are already
+		// out, so the client sits on a stream that will never deliver anything
+		// and never learns why. Report it in-band instead.
+		if werr := ha.HttpWatch(ctx, c.DB, scope, emit); werr != nil && ctx.Err() == nil {
+			mu.Lock()
+			_, _ = w.Write([]byte("event: error\ndata: {\"code\":\"watch_error\"}\n\n"))
+			flusher.Flush()
+			mu.Unlock()
+		}
+		stopPing()
+		pingDone.Wait()
 	}
 }
 
@@ -902,6 +995,44 @@ func soleScopePair(scope dopdb.M) (string, string, bool) {
 		return k, fmt.Sprint(v), true
 	}
 	return "", "", false
+}
+
+// writeCommands are the mutating commands; they are POST-only.
+var writeCommands = map[string]bool{
+	"HSET": true, "HSETNX": true, "HDEL": true, "DEL": true, "HMSET": true,
+	"HINCRBY": true, "HINCRBYFLOAT": true,
+	"STRSET": true, "STRSETALL": true, "STRDEL": true,
+	"SADD": true, "SREM": true,
+	"LPUSH": true, "RPUSH": true, "LPOP": true, "RPOP": true, "LSET": true,
+	"LREM": true, "LTRIM": true, "LINSERTBEFORE": true, "LINSERTAFTER": true,
+	"ZADD": true, "ZREM": true, "ZINCRBY": true, "ZPOPMIN": true, "ZPOPMAX": true,
+	"ZREMRANGEBYRANK": true, "ZREMRANGEBYSCORE": true,
+}
+
+// hashCommands are the commands only a Hash collection can serve. Anything else
+// registered under that name (String/List/Set/ZSet) must be refused rather than
+// dereferenced.
+var hashCommands = map[string]bool{
+	"HGET": true, "HSET": true, "HSETNX": true, "HDEL": true, "DEL": true,
+	"HEXISTS": true, "HGETALL": true, "HKEYS": true, "HVALS": true, "HLEN": true,
+	"HINCRBY": true, "HINCRBYFLOAT": true, "HMSET": true, "HMGET": true,
+	"COUNT": true, "FIND": true, "FINDONE": true, "WATCH": true,
+	"HSCAN": true, "HSCANNOVALUES": true, "HRANDFIELD": true, "SQL": true,
+}
+
+// intParam reads an integer query parameter. A malformed value is a client error,
+// not zero: `?index=abc` silently meaning index 0 made LSET overwrite the head of
+// the list, and `?count=abc` made LREM remove EVERY match instead of one.
+func intParam(c *ReqCtx, name string, def int) (int, bool) {
+	raw := c.Queries.Get(name)
+	if raw == "" {
+		return def, true
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
 }
 
 // sqlFromBody accepts either a JSON object {"sql":"..."} or the raw statement as

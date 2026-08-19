@@ -2,7 +2,9 @@ package httpserve
 
 import (
 	"context"
+	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/doptime/dopdb"
 	"github.com/doptime/dopdb/config"
@@ -58,6 +60,9 @@ func Serve(cfg *config.Config, opts ...ServeOption) error {
 type ServeHandle struct {
 	Server *http.Server
 	Close  func(ctx context.Context) error
+	// ListenErr receives a listener failure that happens after startup, and is
+	// closed when the server stops. Reading it is optional.
+	ListenErr <-chan error
 }
 
 // ServeWithHandle is like Serve but returns a *ServeHandle so the caller can
@@ -97,16 +102,44 @@ func ServeWithHandle(cfg *config.Config, opts ...ServeOption) (*ServeHandle, err
 		handler = withCORS(handler, cfg.HTTP.CORSOrigins)
 	}
 
-	srv := &http.Server{Addr: cfg.HTTP.Addr, Handler: handler}
+	// Timeouts. Without ReadHeaderTimeout a client that opens a connection and
+	// never finishes its headers holds a file descriptor indefinitely — the
+	// Slowloris shape, and cheap to run out of descriptors with. WriteTimeout
+	// stays zero on purpose: watch streams are long-lived by design and a write
+	// deadline would cut them.
+	srv := &http.Server{
+		Addr:              cfg.HTTP.Addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 
+	// A listener error used to be swallowed by an empty if-body, so a port
+	// collision left a process that was alive, silent, and serving nothing.
+	listenErr := make(chan error, 1)
 	go func() {
-		if err := srv.ListenAndServe(); err != http.ErrServerClosed {
-			// listener error (e.g. port in use) — log but don't panic
+		err := srv.ListenAndServe()
+		if err != nil && err != http.ErrServerClosed {
+			listenErr <- err
 		}
+		close(listenErr)
 	}()
 
+	// Give the listener a moment to fail loudly rather than reporting success on
+	// a server that never bound its port.
+	select {
+	case err, open := <-listenErr:
+		if open && err != nil {
+			_ = ds.Close()
+			return nil, fmt.Errorf("httpserve: listen on %s: %w", cfg.HTTP.Addr, err)
+		}
+	case <-time.After(50 * time.Millisecond):
+	}
+
 	return &ServeHandle{
-		Server: srv,
+		Server:    srv,
+		ListenErr: listenErr,
 		Close: func(ctx context.Context) error {
 			// Shut the listener down first, then hand back the KVRocks
 			// connections this call opened. Closing only the HTTP server left
