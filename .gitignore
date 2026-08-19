@@ -2,6 +2,7 @@
 .DS_Store
 
 # Go
+bin/
 *.test
 *.out
 coverage.txt
@@ -19,4 +20,8 @@ node_modules/
 *.tar.gz
 *.toml
 **/dist/
+# Round-tracking scratch: the tracked round docs live at workrounds/Round*/,
+# but the per-round `files/` working copies are stale source snapshots that
+# break `go build ./...` if committed. Never track them.
+workrounds/**/files/
 _packs/**

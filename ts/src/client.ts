@@ -132,10 +132,11 @@ export interface DbApi<C> {
   hmget(keys: string[]): Promise<(Infer<C> | null)[]>;
   /** Random field keys (Redis HRANDFIELD). */
   hrandfield(count?: number): Promise<string[]>;
-  /** Paginate keys+values by cursor (Redis HSCAN). nextCursor 0 = done. */
-  hscan(cursor?: number, match?: string, count?: number): Promise<{ cursor: number; keys: string[]; values: Infer<C>[] }>;
-  /** Paginate keys only (Redis HSCAN NOVALUES). nextCursor 0 = done. */
-  hscannovalues(cursor?: number, match?: string, count?: number): Promise<{ cursor: number; keys: string[] }>;
+  /** Paginate keys+values by cursor (Redis HSCAN). The cursor is the server's
+   * own opaque string; "0" starts a scan and is returned when it is complete. */
+  hscan(cursor?: string, match?: string, count?: number): Promise<{ cursor: string; keys: string[]; values: Infer<C>[] }>;
+  /** Paginate keys only (Redis HSCAN NOVALUES). Opaque string cursor; "0" = done. */
+  hscannovalues(cursor?: string, match?: string, count?: number): Promise<{ cursor: string; keys: string[] }>;
   /** Count documents matching a filter (owner-scoped on the server). */
   count(filter?: Filter): Promise<number>;
   find(filter?: Filter, opt?: FindOpt): Promise<Infer<C>[]>;
@@ -245,17 +246,17 @@ function makeDbApi<C extends Collection<any>>(key: string, c: C, o: ReturnType<t
       if (count) p.count = String(count);
       return (await getJSON("hrandfield", Object.keys(p).length ? q(p) : "")) as string[];
     },
-    hscan: async (cursor = 0, match, count) => {
-      const p: Record<string, string> = { cursor: String(cursor) };
+    hscan: async (cursor = "0", match, count) => {
+      const p: Record<string, string> = { cursor };
       if (match) p.match = match;
       if (count) p.count = String(count);
-      return (await getJSON("hscan", q(p))) as { cursor: number; keys: string[]; values: Infer<C>[] };
+      return (await getJSON("hscan", q(p))) as { cursor: string; keys: string[]; values: Infer<C>[] };
     },
-    hscannovalues: async (cursor = 0, match, count) => {
-      const p: Record<string, string> = { cursor: String(cursor) };
+    hscannovalues: async (cursor = "0", match, count) => {
+      const p: Record<string, string> = { cursor };
       if (match) p.match = match;
       if (count) p.count = String(count);
-      return (await getJSON("hscannovalues", q(p))) as { cursor: number; keys: string[] };
+      return (await getJSON("hscannovalues", q(p))) as { cursor: string; keys: string[] };
     },
     count: async (filter = {}) => {
       sanitizeFilter(filter);

@@ -653,33 +653,35 @@ func (c *Collection[K, V]) HRandField(count int) ([]K, error) {
 	return c.keysFromIDs(ids)
 }
 
-// HScan paginates field keys with their values (Redis HSCAN). cursor 0 starts
-// iteration; the returned cursor is 0 when complete. match is a Redis glob,
-// applied by the server. As with real HSCAN a page may be short or empty while
-// the cursor is still non-zero — only cursor 0 means "done".
-func (c *Collection[K, V]) HScan(cursor uint64, match string, count int64) ([]K, []V, uint64, error) {
+// HScan paginates field keys with their values (Redis HSCAN). The cursor is the
+// server's own opaque string (a field name on KVRocks), not a number: pass "0"
+// to start iteration; the returned cursor is "0" when the scan is complete. As
+// with real HSCAN a page may be short or empty while the cursor is still
+// non-zero — only a "0" cursor means "done". match is a Redis glob, applied by
+// the server.
+func (c *Collection[K, V]) HScan(cursor, match string, count int64) ([]K, []V, string, error) {
 	ids, docs, next, err := c.backend("").scan(context.Background(), c.coll, match, cursor, count, nil)
 	if err != nil {
-		return nil, nil, 0, err
+		return nil, nil, "", err
 	}
 	keys, err := c.keysFromIDs(ids)
 	if err != nil {
-		return nil, nil, 0, err
+		return nil, nil, "", err
 	}
 	vals := make([]V, len(docs))
 	for i := range docs {
 		if vals[i], err = c.decodeAt(docs[i], ids[i]); err != nil {
-			return nil, nil, 0, fmt.Errorf("dopdb: decode %s[%s]: %w", c.coll, ids[i], err)
+			return nil, nil, "", fmt.Errorf("dopdb: decode %s[%s]: %w", c.coll, ids[i], err)
 		}
 	}
 	return keys, vals, next, nil
 }
 
 // HScanNoValues paginates field keys only (Redis HSCAN NOVALUES).
-func (c *Collection[K, V]) HScanNoValues(cursor uint64, match string, count int64) ([]K, uint64, error) {
+func (c *Collection[K, V]) HScanNoValues(cursor, match string, count int64) ([]K, string, error) {
 	ids, _, next, err := c.backend("").scan(context.Background(), c.coll, match, cursor, count, nil)
 	if err != nil {
-		return nil, 0, err
+		return nil, "", err
 	}
 	keys, err := c.keysFromIDs(ids)
 	return keys, next, err

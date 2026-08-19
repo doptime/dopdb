@@ -713,13 +713,80 @@ func (b *kvBackend) count(ctx context.Context, coll string) (int64, error) {
 	return b.rdb.HLen(ctx, b.hashKey(coll)).Result()
 }
 
-// walk streams the whole collection hash through visit, page by page, so a large
-// collection never materialises twice. visit returning false stops the walk.
+// rawHscan is one raw HSCAN round trip. The cursor is the server's own opaque
+// value — on KVRocks it is a field name (a string), not a number — so it is
+// passed through as a string and never parsed as a uint. go-redis's typed
+// HScan hard-codes ReadUint on the cursor and errors on KVRocks, so this uses
+// the raw Do. Returns the flat [field0, value0, field1, value1, ...] pairs and
+// the next cursor; next == "0" means the iteration is done.
+func (b *kvBackend) rawHscan(ctx context.Context, key, cursor, match string, count int64) ([]string, string, error) {
+	args := []interface{}{"HSCAN", key, cursor}
+	if match != "" {
+		args = append(args, "MATCH", match)
+	}
+	args = append(args, "COUNT", count)
+	val, err := b.rdb.Do(ctx, args...).Result()
+	if err != nil {
+		return nil, "", err
+	}
+	parts, ok := val.([]interface{})
+	if !ok || len(parts) != 2 {
+		return nil, "", fmt.Errorf("dopdb: HSCAN reply %T, want [cursor, pairs]", val)
+	}
+	cur, ok := parts[0].(string)
+	if !ok {
+		return nil, "", fmt.Errorf("dopdb: HSCAN cursor %T is not a string", parts[0])
+	}
+	raw, ok := parts[1].([]interface{})
+	if !ok {
+		return nil, "", fmt.Errorf("dopdb: HSCAN pairs %T is not a list", parts[1])
+	}
+	pairs := make([]string, 0, len(raw))
+	for _, e := range raw {
+		s, ok := e.(string)
+		if !ok {
+			return nil, "", fmt.Errorf("dopdb: HSCAN pair %T is not a string", e)
+		}
+		pairs = append(pairs, s)
+	}
+	return pairs, cur, nil
+}
+
+// rawScan is one raw keyspace SCAN round trip. As with HSCAN the cursor is an
+// opaque string (a key name on KVRocks), so it is passed through unparsed.
+func (b *kvBackend) rawScan(ctx context.Context, cursor, pattern string, count int64) ([]string, string, error) {
+	val, err := b.rdb.Do(ctx, "SCAN", cursor, "MATCH", pattern, "COUNT", count).Result()
+	if err != nil {
+		return nil, "", err
+	}
+	parts, ok := val.([]interface{})
+	if !ok || len(parts) != 2 {
+		return nil, "", fmt.Errorf("dopdb: SCAN reply %T, want [cursor, keys]", val)
+	}
+	cur, ok := parts[0].(string)
+	if !ok {
+		return nil, "", fmt.Errorf("dopdb: SCAN cursor %T is not a string", parts[0])
+	}
+	raw, ok := parts[1].([]interface{})
+	if !ok {
+		return nil, "", fmt.Errorf("dopdb: SCAN keys %T is not a list", parts[1])
+	}
+	keys := make([]string, 0, len(raw))
+	for _, e := range raw {
+		s, ok := e.(string)
+		if !ok {
+			return nil, "", fmt.Errorf("dopdb: SCAN key %T is not a string", e)
+		}
+		keys = append(keys, s)
+	}
+	return keys, cur, nil
+}
+
 func (b *kvBackend) walk(ctx context.Context, coll string, visit func(id string, raw []byte) (bool, error)) error {
-	var cursor uint64
+	cursor := "0"
 	hk := b.hashKey(coll)
 	for {
-		vals, next, err := b.rdb.HScan(ctx, hk, cursor, "", scanPage).Result()
+		vals, next, err := b.rawHscan(ctx, hk, cursor, "", scanPage)
 		if err != nil {
 			return err
 		}
@@ -733,7 +800,7 @@ func (b *kvBackend) walk(ctx context.Context, coll string, visit func(id string,
 			}
 		}
 		cursor = next
-		if cursor == 0 {
+		if cursor == "0" {
 			return nil
 		}
 	}
@@ -907,19 +974,19 @@ func (b *kvBackend) sample(ctx context.Context, coll string, count int, scope M)
 
 // scan paginates a Hash collection (Redis HSCAN). match is a Redis glob applied
 // to the document id by the server. The cursor is the server's own opaque
-// cursor, so — exactly as with real HSCAN — a page may come back short (or
-// empty) with a non-zero cursor, and only cursor 0 means the iteration is done.
+// string, so — exactly as with real HSCAN — a page may come back short (or
+// empty) with a non-"0" cursor, and only cursor "0" means the iteration is done.
 // scope, when non-nil, filters the page by owner after it arrives.
-func (b *kvBackend) scan(ctx context.Context, coll, match string, cursor uint64, count int64, scope M) ([]string, [][]byte, uint64, error) {
+func (b *kvBackend) scan(ctx context.Context, coll, match string, cursor string, count int64, scope M) ([]string, [][]byte, string, error) {
 	if count <= 0 {
 		count = 10
 	}
 	if match == "" {
 		match = "*"
 	}
-	vals, next, err := b.rdb.HScan(ctx, b.hashKey(coll), cursor, match, count).Result()
+	vals, next, err := b.rawHscan(ctx, b.hashKey(coll), cursor, match, count)
 	if err != nil {
-		return nil, nil, 0, err
+		return nil, nil, "", err
 	}
 	type kv struct {
 		id  string
@@ -937,7 +1004,7 @@ func (b *kvBackend) scan(ctx context.Context, coll, match string, cursor uint64,
 		if len(scope) > 0 {
 			doc, derr := decodeDoc(e.raw)
 			if derr != nil {
-				return nil, nil, 0, derr
+				return nil, nil, "", derr
 			}
 			doc["_id"] = e.id
 			if !matchFilter(doc, scope) {
@@ -1159,11 +1226,11 @@ func (b *kvBackend) ownedKeys(ctx context.Context, coll, glob string, scope M) (
 	pattern := b.memberPattern(coll, glob)
 	trim := b.prefix() + coll + ":"
 	var (
-		cursor uint64
+		cursor = "0"
 		out    []string
 	)
 	for {
-		keys, next, err := b.rdb.Scan(ctx, cursor, pattern, scanPage).Result()
+		keys, next, err := b.rawScan(ctx, cursor, pattern, scanPage)
 		if err != nil {
 			return nil, err
 		}
@@ -1174,7 +1241,7 @@ func (b *kvBackend) ownedKeys(ctx context.Context, coll, glob string, scope M) (
 			out = append(out, strings.TrimPrefix(k, trim))
 		}
 		cursor = next
-		if cursor == 0 {
+		if cursor == "0" {
 			break
 		}
 	}

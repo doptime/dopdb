@@ -201,7 +201,7 @@ interface ExecArgs {
   filter?: Filter;
   field?: string;
   n?: number;
-  cursor?: number;
+  cursor?: string;
   count?: number;
   match?: string;
   members?: unknown[];
@@ -348,12 +348,16 @@ async function exec(b: KvBackend, coll: string, cmd: string, a: ExecArgs, scope:
         await b.del(coll, keys);
         return { ok: true };
       }
-      const mine: string[] = [];
+      // Sequential per-key ownership check, mirroring the Go engine exactly:
+      // the first key not owned by the caller (foreign OR absent — the two are
+      // deliberately indistinguishable) aborts with 403, after the keys before
+      // it were already deleted. hdel is a write; an unowned target is
+      // forbidden, not a silent no-op.
       for (const k of keys) {
         const d = await b.get(coll, k);
-        if (d && matchFilter(withId(k, d), scope)) mine.push(k);
+        if (!d || !matchFilter(withId(k, d), scope)) throw new ForbiddenError();
+        await b.del(coll, [k]);
       }
-      await b.del(coll, mine);
       return { ok: true };
     }
     case "hexists": {
@@ -383,9 +387,9 @@ async function exec(b: KvBackend, coll: string, cmd: string, a: ExecArgs, scope:
     }
     case "hscan":
     case "hscannovalues": {
-      // Redis HSCAN, natively. The cursor is the server's own, so a page may be
-      // short (or empty) with a non-zero cursor; only cursor 0 means done.
-      const r = await b.scan(coll, a.match ?? "*", a.cursor ?? 0, a.count && a.count > 0 ? a.count : 10, scope);
+      // Redis HSCAN, natively. The cursor is the server's own opaque string
+      // (a field name on KVRocks), passed through verbatim; "0" = start/done.
+      const r = await b.scan(coll, a.match ?? "*", a.cursor ?? "0", a.count && a.count > 0 ? a.count : 10, scope);
       if (cmd === "hscannovalues") return { cursor: r.cursor, keys: r.ids };
       return { cursor: r.cursor, keys: r.ids, values: r.docs };
     }
@@ -763,8 +767,8 @@ function makeServerApi<C extends Collection<any>>(coll: C, b: KvBackend, storage
     },
     hmget: async (keys) => (await run("hmget", { keys })) as any,
     hrandfield: async (count) => (await run("hrandfield", count ? { count } : {})) as string[],
-    hscan: async (cursor = 0, match, count) => (await run("hscan", { cursor, match, count })) as any,
-    hscannovalues: async (cursor = 0, match, count) => (await run("hscannovalues", { cursor, match, count })) as any,
+    hscan: async (cursor = "0", match, count) => (await run("hscan", { cursor, match, count })) as any,
+    hscannovalues: async (cursor = "0", match, count) => (await run("hscannovalues", { cursor, match, count })) as any,
     count: async (filter = {}) => ((await run("count", { filter })) as any).count ?? 0,
     find: async (filter = {}, opt = {}) => (await run("find", { filter, opt })) as any,
     sql: async (statement: string) => (await run("sql", { sql: statement })) as any,
@@ -1391,7 +1395,7 @@ async function buildRuntime(cfg: ServeConfig): Promise<Runtime> {
       n: input.url.searchParams.has("n") ? Number(input.url.searchParams.get("n"))
         : input.url.searchParams.has("expiration") ? Number(input.url.searchParams.get("expiration"))
         : undefined,
-      cursor: input.url.searchParams.has("cursor") ? Number(input.url.searchParams.get("cursor")) : undefined,
+      cursor: input.url.searchParams.has("cursor") ? input.url.searchParams.get("cursor") ?? undefined : undefined,
       count: input.url.searchParams.has("count") ? Number(input.url.searchParams.get("count")) : undefined,
       match: input.url.searchParams.get("match") ?? undefined,
       members,

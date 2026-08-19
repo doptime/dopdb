@@ -90,8 +90,8 @@ type HttpAccessor interface {
 	// Hash scan/sample (Redis HSCAN / HSCANNOVALUES / HRANDFIELD). scope, when
 	// non-nil, restricts to the caller's own rows (owner-scope).
 	HttpRandField(ctx context.Context, ds string, count int, scope M) (any, error)
-	HttpScan(ctx context.Context, ds, match string, cursor uint64, count int64, scope M) (any, error)
-	HttpScanNoValues(ctx context.Context, ds, match string, cursor uint64, count int64, scope M) (any, error)
+	HttpScan(ctx context.Context, ds, match string, cursor string, count int64, scope M) (any, error)
+	HttpScanNoValues(ctx context.Context, ds, match string, cursor string, count int64, scope M) (any, error)
 }
 
 // HttpKey is the minimal registration interface — any collection reachable
@@ -376,29 +376,59 @@ func (c *Collection[K, V]) HttpSQL(ctx context.Context, ds, sqlText string, scop
 }
 
 // ---- scoped per-key operations ----
-//
 // For an owner-scoped collection, a per-key request must not trust the key
-// alone: knowing another user's document id must not grant access. These methods
-// intersect {_id: key} with the owner predicate. Writes use the atomic
-// putScoped (a WATCH/MULTI compare-and-set) so there is no check-then-act window.
+// alone: knowing another user's document id must not grant access. Per-key
+// reads evaluate the owner predicate on the one fetched row (O(1), one HGET +
+// one decode — mirroring the TS engine's b.get + matchFilter); writes use the
+// atomic putScoped (a WATCH/MULTI compare-and-set) so there is no
+// check-then-act window.
+//
+// Note the asymmetry with whole-collection reads (hgetall/find/count/hkeys):
+// those scan the collection by design (the only enforceable index is unique),
+// and the scan is where O(collection) is unavoidable. A per-key read is not —
+// routing it through findDS made hget/hexists/hdel/hsetnx cost a full
+// collection scan + N CBOR decodes (measured ~10ms p50 at 2,500 rows vs ~1ms
+// for the atomic write path).
+
+// scopedDoc fetches the row stored under key and applies the owner predicate
+// to it. Absent and foreign-owned are deliberately indistinguishable: both
+// report ok=false, so no caller can probe another tenant's ids. The scope is
+// the server-derived {ownerField: claim} — never client input.
+func (c *Collection[K, V]) scopedDoc(ctx context.Context, ds, key string, scope M) (v V, ok bool, err error) {
+	raw, err := c.backend(ds).get(ctx, c.coll, key)
+	if err != nil {
+		if errors.Is(err, ErrNoDoc) {
+			return v, false, nil
+		}
+		return v, false, err
+	}
+	m, err := decodeDoc(raw)
+	if err != nil {
+		return v, false, err
+	}
+	for k, want := range scope {
+		if fmt.Sprint(m[k]) != fmt.Sprint(want) {
+			return v, false, nil // foreign-owned: same as absent
+		}
+	}
+	v, err = c.decodeAt(raw, key)
+	return v, err == nil, err
+}
 
 func (c *Collection[K, V]) HttpGetScoped(ctx context.Context, ds, key string, scope M) (any, error) {
-	vs, err := c.findDS(ctx, ds, mergeScope(M{"_id": key}, scope), FindOpt{Limit: 1})
+	v, ok, err := c.scopedDoc(ctx, ds, key, scope)
 	if err != nil {
 		return nil, err
 	}
-	if len(vs) == 0 {
+	if !ok {
 		return nil, ErrNoDoc
 	}
-	return vs[0], nil
+	return v, nil
 }
 
 func (c *Collection[K, V]) HttpExistsScoped(ctx context.Context, ds, key string, scope M) (bool, error) {
-	vs, err := c.findDS(ctx, ds, mergeScope(M{"_id": key}, scope), FindOpt{Limit: 1})
-	if err != nil {
-		return false, err
-	}
-	return len(vs) > 0, nil
+	_, ok, err := c.scopedDoc(ctx, ds, key, scope)
+	return ok, err
 }
 
 func (c *Collection[K, V]) HttpSetScoped(ctx context.Context, ds, key string, params M, scope M) error {
@@ -423,11 +453,11 @@ func (c *Collection[K, V]) HttpSetScoped(ctx context.Context, ds, key string, pa
 }
 
 func (c *Collection[K, V]) HttpDelScoped(ctx context.Context, ds, key string, scope M) error {
-	mine, err := c.findDS(ctx, ds, mergeScope(M{"_id": key}, scope), FindOpt{Limit: 1})
+	_, ok, err := c.scopedDoc(ctx, ds, key, scope)
 	if err != nil {
 		return err
 	}
-	if len(mine) == 0 {
+	if !ok {
 		return ErrForbidden // not owned by caller (or absent)
 	}
 	_, err = c.backend(ds).del(ctx, c.coll, []string{key})
@@ -522,38 +552,32 @@ func (c *Collection[K, V]) HttpMSet(ctx context.Context, ds string, items map[st
 }
 
 func (c *Collection[K, V]) HttpMGet(ctx context.Context, ds string, scope M, keys ...string) (any, error) {
-	if len(scope) > 0 {
-		// scoped: return only the caller's own rows among those requested.
-		safe, err := SanitizeFilter(mergeScope(M{"_id": M{"$in": keys}}, scope))
-		if err != nil {
-			return nil, err
-		}
-		ids, docs, err := c.backend(ds).find(ctx, c.coll, safe, FindOpt{})
-		if err != nil {
-			return nil, err
-		}
-		byID := make(map[string]V, len(ids))
-		for i, id := range ids {
-			if v, derr := c.decodeAt(docs[i], id); derr == nil {
-				byID[id] = v
-			}
-		}
-		out := make([]any, len(keys))
-		for i, k := range keys {
-			if v, ok := byID[k]; ok {
-				out[i] = v
-			}
-		}
-		return out, nil
-	}
 	docs, err := c.backend(ds).getMany(ctx, c.coll, keys)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]any, len(docs))
+	out := make([]any, len(keys))
 	for i, raw := range docs {
 		if raw == nil {
 			continue // missing -> null
+		}
+		if len(scope) > 0 {
+			// scoped: a requested row the caller does not own reads as null,
+			// exactly like a missing one (same non-leakage rule as hget).
+			m, derr := decodeDoc(raw)
+			if derr != nil {
+				return nil, derr
+			}
+			owned := true
+			for k, want := range scope {
+				if fmt.Sprint(m[k]) != fmt.Sprint(want) {
+					owned = false
+					break
+				}
+			}
+			if !owned {
+				continue // foreign -> null
+			}
 		}
 		if v, derr := c.decodeAt(raw, keys[i]); derr == nil {
 			out[i] = v
@@ -677,7 +701,7 @@ func (c *Collection[K, V]) HttpRandField(ctx context.Context, ds string, count i
 }
 
 // HttpScan paginates keys + values (Redis HSCAN). Returns {cursor, keys, values}.
-func (c *Collection[K, V]) HttpScan(ctx context.Context, ds, match string, cursor uint64, count int64, scope M) (any, error) {
+func (c *Collection[K, V]) HttpScan(ctx context.Context, ds, match string, cursor string, count int64, scope M) (any, error) {
 	ids, docs, next, err := c.backend(ds).scan(ctx, c.coll, match, cursor, count, scope)
 	if err != nil {
 		return nil, err
@@ -696,7 +720,7 @@ func (c *Collection[K, V]) HttpScan(ctx context.Context, ds, match string, curso
 }
 
 // HttpScanNoValues paginates keys only (Redis HSCAN NOVALUES). Returns {cursor, keys}.
-func (c *Collection[K, V]) HttpScanNoValues(ctx context.Context, ds, match string, cursor uint64, count int64, scope M) (any, error) {
+func (c *Collection[K, V]) HttpScanNoValues(ctx context.Context, ds, match string, cursor string, count int64, scope M) (any, error) {
 	ids, _, next, err := c.backend(ds).scan(ctx, c.coll, match, cursor, count, scope)
 	if err != nil {
 		return nil, err

@@ -1,0 +1,92 @@
+{
+  "host": "http://127.0.0.1:8092",
+  "scenario": "set",
+  "users": 50,
+  "docs_per_user": 50,
+  "concurrency": 4,
+  "duration_ms": 10000.148583,
+  "started_at": "2026-08-19T13:22:52Z",
+  "total": {
+    "requests": 108663,
+    "errors": 0,
+    "ops_per_sec": 10866.138547653618
+  },
+  "per_op": {
+    "sadd": {
+      "requests": 27041,
+      "errors_5xx": 0,
+      "net_errors": 0,
+      "status": {
+        "200": 27041
+      },
+      "ops_per_sec": 2704.0598222679428,
+      "latency": {
+        "min_us": 120.333,
+        "avg_us": 355797.3701046559,
+        "p50_us": 292.583,
+        "p90_us": 488.083,
+        "p95_us": 644.209,
+        "p99_us": 1413,
+        "p999_us": 3106.292,
+        "max_us": 38329.167
+      }
+    },
+    "scard": {
+      "requests": 27213,
+      "errors_5xx": 0,
+      "net_errors": 0,
+      "status": {
+        "200": 27213
+      },
+      "ops_per_sec": 2721.25956670898,
+      "latency": {
+        "min_us": 104.5,
+        "avg_us": 344665.4294638592,
+        "p50_us": 278.708,
+        "p90_us": 458.25,
+        "p95_us": 606.5,
+        "p99_us": 1358.166,
+        "p999_us": 2856.375,
+        "max_us": 71744.709
+      }
+    },
+    "sismember": {
+      "requests": 27325,
+      "errors_5xx": 0,
+      "net_errors": 0,
+      "status": {
+        "200": 27325
+      },
+      "ops_per_sec": 2732.4594002984927,
+      "latency": {
+        "min_us": 108.084,
+        "avg_us": 349134.4717291857,
+        "p50_us": 282.25,
+        "p90_us": 468.708,
+        "p95_us": 622.833,
+        "p99_us": 1367.291,
+        "p999_us": 3092.875,
+        "max_us": 71484.833
+      }
+    },
+    "smembers": {
+      "requests": 27084,
+      "errors_5xx": 0,
+      "net_errors": 0,
+      "status": {
+        "200": 27084
+      },
+      "ops_per_sec": 2708.359758378202,
+      "latency": {
+        "min_us": 124.125,
+        "avg_us": 393220.59404076205,
+        "p50_us": 324.417,
+        "p90_us": 531.958,
+        "p95_us": 709.041,
+        "p99_us": 1472.958,
+        "p999_us": 3010.167,
+        "max_us": 71686.084
+      }
+    }
+  }
+}

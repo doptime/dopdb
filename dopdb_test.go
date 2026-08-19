@@ -314,7 +314,7 @@ func TestIntegrationIDFieldIsFilledOnRead(t *testing.T) {
 	if len(found) != 1 || found[0].ID != "k1" {
 		t.Errorf("Find _id = %+v", found)
 	}
-	_, fvals, _, _ := c.HScan(0, "*", 10)
+	_, fvals, _, _ := c.HScan("0", "*", 10)
 	if len(fvals) != 1 || fvals[0].ID != "k1" {
 		t.Errorf("HScan _id = %+v", fvals)
 	}
@@ -331,7 +331,7 @@ func TestIntegrationScanAndRandField(t *testing.T) {
 
 	// walk the whole collection, honouring the cursor protocol
 	seen := map[string]bool{}
-	var cursor uint64
+	var cursor = "0"
 	for i := 0; i < 20; i++ {
 		keys, vals, next, err := users.HScan(cursor, "*", 2)
 		if err != nil {
@@ -344,7 +344,7 @@ func TestIntegrationScanAndRandField(t *testing.T) {
 			seen[k] = true
 		}
 		cursor = next
-		if cursor == 0 {
+		if cursor == "0" {
 			break
 		}
 	}
@@ -353,7 +353,7 @@ func TestIntegrationScanAndRandField(t *testing.T) {
 	}
 
 	// glob match is applied by the server
-	keys, _, err := users.HScanNoValues(0, "k1", 10)
+	keys, _, err := users.HScanNoValues("0", "k1", 10)
 	if err != nil {
 		t.Fatalf("HScanNoValues: %v", err)
 	}

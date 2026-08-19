@@ -12,7 +12,7 @@
 GO ?= go
 export GOFLAGS = -mod=mod
 
-.PHONY: help test test-kvrocks bench vet fmt fmt-check build tidy ts ts-test ts-typecheck clean
+.PHONY: help test test-kvrocks bench vet fmt fmt-check build tidy ts ts-test ts-typecheck clean stress stress-all
 
 help:
 	@echo "make test          - go test ./...  (integration tests skip without DOPDB_TEST_KVROCKS_URI)"
@@ -26,6 +26,8 @@ help:
 	@echo "make ts            - build the TypeScript implementation (ts)"
 	@echo "make ts-test       - run the TypeScript test suite"
 	@echo "make ts-typecheck  - strict typecheck the TypeScript implementation"
+	@echo "make stress        - build the load/latency harness (bin/stress)"
+	@echo "make stress-all    - run the full Go-vs-TS load matrix vs local KVRocks (bench/run-all.sh)"
 
 test:
 	$(GO) test -count=1 ./...
@@ -37,6 +39,15 @@ test-kvrocks:
 bench:
 	@if [ -z "$(DOPDB_TEST_KVROCKS_URI)" ]; then echo "set DOPDB_TEST_KVROCKS_URI=redis://localhost:6666"; exit 1; fi
 	$(GO) test -run XXX -bench . -benchmem -benchtime=5x .
+
+stress:
+	$(GO) build -o bin/stress ./cmd/stress
+
+# Full engine comparison: Go server, then TS server, same local KVRocks.
+# Needs KVRocks on KVROCKS (default redis://127.0.0.1:6666). Results ->
+# bench/results/{go,ts}_<scenario>_c<conc>.json; see bench/REPORT.md.
+stress-all:
+	./bench/run-all.sh
 
 vet:
 	$(GO) vet ./...

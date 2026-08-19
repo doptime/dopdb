@@ -524,13 +524,14 @@ export class KvBackend {
     return docs.slice(0, n).map((d) => String(d._id));
   }
 
-  /** Redis HSCAN. The cursor is the server's own opaque cursor, so — exactly as
-   * with real HSCAN — a page may come back short (or empty) with a non-zero
-   * cursor, and only cursor 0 means the iteration is done. */
-  async scan(coll: string, match: string, cursor: number, count: number, scope: Filter): Promise<{ cursor: number; ids: string[]; docs: Doc[] }> {
+  /** Redis HSCAN. The cursor is the server's own opaque string (a field name
+   * on KVRocks), not a number: pass "0" to start; the returned cursor is "0"
+   * when the scan is complete. As with real HSCAN a page may be short (or
+   * empty) while the cursor is still non-"0" — only "0" means done. */
+  async scan(coll: string, match: string, cursor: string, count: number, scope: Filter): Promise<{ cursor: string; ids: string[]; docs: Doc[] }> {
     const n = count > 0 ? count : 10;
     const pattern = match || "*";
-    const [next, flat] = await this.redis.hscanBuffer(this.hashKey(coll), String(cursor), "MATCH", pattern, "COUNT", n);
+    const [next, flat] = await this.redis.hscanBuffer(this.hashKey(coll), cursor, "MATCH", pattern, "COUNT", n);
     const page: { id: string; doc: Doc }[] = [];
     for (let i = 0; i + 1 < flat.length; i += 2) {
       page.push({ id: flat[i].toString(), doc: decodeDoc(flat[i + 1]) });
@@ -545,7 +546,7 @@ export class KvBackend {
       ids.push(e.id);
       docs.push(e.doc);
     }
-    return { cursor: Number(next.toString()), ids, docs };
+    return { cursor: next.toString(), ids, docs };
   }
 
   // ---- owner index for the non-Hash collection types ----

@@ -21,7 +21,6 @@
 | `bench_test.go` / `mem_test.go` | query-engine benchmarks and the retained-memory bound | **yes** |
 
 `query_test.go` and `codec_test.go` are new with the KVRocks migration, and they matter: MongoDB used to *be* the reference implementation of the filter dialect, and now dopdb is. They run on a bare checkout with no server.
-
 ## TypeScript test files (`ts/test/`)
 
 `schema` `client` `permission` `sanitize` `prepare` `indexes` `config` `hardening` `browser-safety` `spec-export` `next-handler` `types.test-d` `watch-reconnect` — no server needed.
@@ -29,6 +28,34 @@
 `query` `codec` `sql` `topn` `jwt` `exports` — the twins of the Go files above; no server needed.
 
 `server` `watch-e2e` — need a real server and auto-skip without `DOPDB_TEST_KVROCKS_URI`. `server.test.ts` used to run against a ~180-line in-memory fake Mongo; that fake is gone, because on KVRocks the commands **are** Redis commands (LPUSH, ZADD, HSCAN, WATCH/MULTI, pub/sub) and a hand-rolled fake of those would be testing the fake, not the engine.
+
+## Stress / load harness (`cmd/stress` + `ts/stress`)
+
+Throughput and latency live in their own harness, separate from the conformance
+suite: a single binary, `bin/stress`, with two subcommands.
+
+| Piece | Role |
+|---|---|
+| `cmd/stress/serve.go` | boots a real dopdb **Go** server on `--addr` (default `:8091`) against `--kvrocks`, owner-scoped `notes` + `kv`/`queue`/`tags`/`board` collections, all `.HttpOn()`, then seeds `--users x --docs-per-user` notes and prints `DOPDB_GO_READY` |
+| `ts/stress/server.ts` | the exact TS mirror: same schema/seed/JWT, `DOPDB_TS_READY` marker (run with `ts/node_modules/.bin/tsx ts/stress/server.ts` from `ts/`; `bench/run-all.sh` does this for you — avoid `node --import tsx`, which breaks on Node < 20) |
+| `cmd/stress/load.go` | the **engine-neutral** client: mints a real HS256 token per user, drives N concurrent workers over HTTP for a fixed wall time, and writes a per-run JSON report (total ops, ops/s, errors, per-op p50/p90/p99) |
+| `bench/run.sh` | runs one full scenario matrix (9 scenarios × 3 concurrency levels) against a single running server |
+| `bench/run-all.sh` | the whole comparison: flush the namespace, start the Go server, matrix, start the TS server, matrix — results in `bench/results/{go,ts}_<scenario>_c<conc>.json` |
+
+Scenarios: `crud` (hget/hset/hsetnx/hexists mix on a user's own rows),
+`find` (owner-scoped FIND with a selective filter), `fanout` (unscoped
+collection-wide reads), `list` (lpush/rpush/lrange), `zset` (zadd/zrange),
+`set` (sadd/smembers), `str` (strset/strget), `incr` (HINCRBY on a dedicated
+counter row), and `mix` (all of the above in one window).
+
+```bash
+# KVRocks (or any Redis-protocol server) on :6666, then:
+make stress-all        # ~5 min per engine, 9×3 runs each -> bench/results/
+```
+
+Both engines are driven by the same client over the same HTTP contract, so the
+reports are directly comparable. **The load harness measures performance; it
+does not prove equivalence** — that remains `conformance_test.go`'s job.
 
 ## Running
 

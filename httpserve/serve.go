@@ -309,9 +309,12 @@ func (h *Handler) dispatch(ctx context.Context, w http.ResponseWriter, c *ReqCtx
 		writeResult(w, v, err)
 
 	case "HSCAN", "HSCANNOVALUES":
-		var cursor uint64
-		if cu, e := strconv.ParseUint(c.Queries.Get("cursor"), 10, 64); e == nil {
-			cursor = cu
+		// The cursor is the server's own opaque string (a field name on
+		// KVRocks), so it is passed through verbatim — never parsed as a
+		// number. Absent means "0" (start).
+		cursor := c.Queries.Get("cursor")
+		if cursor == "" {
+			cursor = "0"
 		}
 		count := int64(10)
 		if cn, e := strconv.ParseInt(c.Queries.Get("count"), 10, 64); e == nil && cn > 0 {

@@ -327,6 +327,67 @@ func TestConformanceHSetNXCrossTenant(t *testing.T) {
 	}
 }
 
+// Cross-tenant per-key ops on an owner-scoped collection. This is the exact
+// surface the O(1) scoped-read rewrite (scopedDoc) touched, so it pins the
+// contract that rewrite promised to preserve: reads never leak existence
+// (hget 404 / hexists false / hmget null — foreign is indistinguishable from
+// absent), while hdel — a WRITE against an unowned target — is 403 on BOTH
+// engines (Go's documented semantics; TS was silently returning ok:true until
+// the stress session's probe caught the divergence).
+func TestConformanceCrossTenantPerKey(t *testing.T) {
+	c := setupConformance(t)
+	defer c.close()
+	tokA := tokenFor(t, "alice")
+	tokB := tokenFor(t, "bob")
+
+	for _, base := range []string{c.goBase, c.tsBase} {
+		// Alice owns "xr1"; bob touches it every way a client can.
+		if st, _ := httpCall(t, base, "POST", "/api/hset/notes?f=xr1", tokA, `{"text":"alice's"}`); st != 200 {
+			t.Fatalf("seed hset %s: status=%d", base, st)
+		}
+		// Reads: foreign reads as absent — no 403, no existence leak.
+		if st, body := httpCall(t, base, "GET", "/api/hget/notes?f=xr1", tokB, ""); st != 404 || bodyField(t, body, "code") != "not_found" {
+			t.Errorf("cross hget %s: status/code=%d/%v want 404/not_found", base, st, bodyField(t, body, "code"))
+		}
+		if st, body := httpCall(t, base, "GET", "/api/hexists/notes?f=xr1", tokB, ""); st != 200 || bodyField(t, body, "exists") != false {
+			t.Errorf("cross hexists %s: status=%d exists=%v want 200/false", base, st, bodyField(t, body, "exists"))
+		}
+		st, body := httpCall(t, base, "GET", "/api/hmget/notes?f=xr1&f=xr_absent", tokB, "")
+		arr, ok := body.([]any)
+		if st != 200 || !ok || len(arr) != 2 || arr[0] != nil || arr[1] != nil {
+			t.Errorf("cross hmget %s: status=%d body=%v want 200 [null,null]", base, st, body)
+		}
+		// Deletes: an unowned target is forbidden — foreign and absent alike
+		// (indistinguishable), and alice's doc must survive bob's attempt.
+		if st, body := httpCall(t, base, "POST", "/api/hdel/notes?f=xr1", tokB, ""); st != 403 || bodyField(t, body, "code") != "forbidden" {
+			t.Errorf("cross hdel %s: status/code=%d/%v want 403/forbidden", base, st, bodyField(t, body, "code"))
+		}
+		if st, body := httpCall(t, base, "POST", "/api/hdel/notes?f=xr_absent", tokB, ""); st != 403 || bodyField(t, body, "code") != "forbidden" {
+			t.Errorf("absent hdel %s: status/code=%d/%v want 403/forbidden (same as foreign)", base, st, bodyField(t, body, "code"))
+		}
+		if st, body := httpCall(t, base, "GET", "/api/hget/notes?f=xr1", tokA, ""); st != 200 || bodyField(t, body, "text") != "alice's" {
+			t.Errorf("survive %s: alice's doc damaged (status=%d)", base, st)
+		}
+		// Multi-key hdel is sequential: keys before the unowned one ARE
+		// deleted, then the 403 aborts the rest. Both engines, same shape.
+		if st, _ := httpCall(t, base, "POST", "/api/hset/notes?f=xr_mine", tokA, `{"text":"mine"}`); st != 200 {
+			t.Fatalf("seed xr_mine %s: status=%d", base, st)
+		}
+		if st, _ := httpCall(t, base, "POST", "/api/hset/notes?f=xr_bob", tokB, `{"text":"bob's"}`); st != 200 {
+			t.Fatalf("seed xr_bob %s: status=%d", base, st)
+		}
+		if st, _ := httpCall(t, base, "POST", "/api/hdel/notes?f=xr_mine&f=xr_bob", tokA, ""); st != 403 {
+			t.Errorf("partial hdel %s: status=%d want 403", base, st)
+		}
+		if st, _ := httpCall(t, base, "GET", "/api/hget/notes?f=xr_mine", tokA, ""); st != 404 {
+			t.Errorf("partial hdel %s: xr_mine should be deleted before the 403 (hget status=%d)", base, st)
+		}
+		if st, _ := httpCall(t, base, "GET", "/api/hget/notes?f=xr_bob", tokB, ""); st != 200 {
+			t.Errorf("partial hdel %s: bob's doc must be intact (hget status=%d)", base, st)
+		}
+	}
+}
+
 // F13: sort/projection with $-operator → 400 on BOTH engines.
 func TestConformanceSortProjDollarReject(t *testing.T) {
 	c := setupConformance(t)
@@ -457,14 +518,15 @@ func TestConformanceUnknownCommand(t *testing.T) {
 	}
 }
 
-// scanFields pulls {cursor, keys} from an HSCAN/HSCANNOVALUES body.
-func scanFields(t *testing.T, body any) (float64, []string) {
+// scanFields pulls {cursor, keys} from an HSCAN/HSCANNOVALUES body. The cursor
+// is the server's own opaque string (a field name on KVRocks), not a number.
+func scanFields(t *testing.T, body any) (string, []string) {
 	t.Helper()
 	m, ok := body.(map[string]any)
 	if !ok {
 		t.Fatalf("scan body not an object: %v", body)
 	}
-	cur, _ := m["cursor"].(float64)
+	cur, _ := m["cursor"].(string)
 	raw, _ := m["keys"].([]any)
 	out := make([]string, len(raw))
 	for i, k := range raw {

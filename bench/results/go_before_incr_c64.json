@@ -1,0 +1,36 @@
+{
+  "host": "http://127.0.0.1:8091",
+  "scenario": "incr",
+  "users": 50,
+  "docs_per_user": 50,
+  "concurrency": 64,
+  "duration_ms": 10042.546,
+  "started_at": "2026-08-19T13:06:27Z",
+  "total": {
+    "requests": 8393,
+    "errors": 56,
+    "ops_per_sec": 835.7442425456652
+  },
+  "per_op": {
+    "hincrby": {
+      "requests": 8393,
+      "errors_5xx": 56,
+      "net_errors": 0,
+      "status": {
+        "200": 8337,
+        "500": 56
+      },
+      "ops_per_sec": 835.7442425456652,
+      "latency": {
+        "min_us": 282.375,
+        "avg_us": 76362216.15608245,
+        "p50_us": 29031.541,
+        "p90_us": 207455.042,
+        "p95_us": 326181.625,
+        "p99_us": 617690.792,
+        "p999_us": 839793.5,
+        "max_us": 906879.042
+      }
+    }
+  }
+}
